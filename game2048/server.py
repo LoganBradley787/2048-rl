@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
@@ -13,7 +14,7 @@ from typing import Callable, Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from . import evaluators
 from .agents import AGENTS, Agent, make_agent
@@ -75,6 +76,13 @@ class AgentStepRequest(BaseModel):
     agent: str
 
 
+class AgentRunRequest(BaseModel):
+    """Play as many agent steps as fit in `ms` milliseconds (at most `max_steps`)."""
+    agent: str
+    ms: int = Field(100, ge=1, le=5000)
+    max_steps: int = Field(5000, ge=1, le=200_000)
+
+
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -131,6 +139,27 @@ def list_agents():
     return sorted(AGENTS)
 
 
+def _agent_one_step(agent: Agent, game: Game) -> dict:
+    """One agent decision on the game: a move (plus the tile in cool mode), or just
+    the tile when a human moved and left it to the agent."""
+    if game.awaiting_tile:
+        return {"moved": False, "reward": 0, "direction": None, "placed": _agent_place(agent, game)}
+    placed = None
+    chooser = getattr(agent, "choose", None)
+    if chooser is not None and game.spawn_mode == "choose":
+        direction, placement = chooser(game)
+        moved, reward = game.move(direction)
+        if moved:
+            game.place(*placement)
+            placed = {"row": placement[0], "col": placement[1], "value": placement[2]}
+    else:
+        direction = agent.act(game)
+        moved, reward = game.move(direction)
+        if game.awaiting_tile:
+            placed = _agent_place(agent, game)
+    return {"moved": moved, "reward": reward, "direction": int(direction), "placed": placed}
+
+
 @app.post("/api/agent/step")
 def agent_step(req: AgentStepRequest):
     agent = get_agent(req.agent)
@@ -138,24 +167,30 @@ def agent_step(req: AgentStepRequest):
         game = state.game
         if game.is_over():
             raise HTTPException(status_code=409, detail="game is over")
-        placed = None
-        if game.awaiting_tile:  # a human moved and left the tile to the agent
-            placed = _agent_place(agent, game)
-            return {**game.to_dict(), "moved": False, "reward": 0, "direction": None, "placed": placed}
-        chooser = getattr(agent, "choose", None)
-        if chooser is not None and game.spawn_mode == "choose":
-            direction, placement = chooser(game)
-            moved, reward = game.move(direction)
-            if moved:
-                game.place(*placement)
-                placed = {"row": placement[0], "col": placement[1], "value": placement[2]}
-        else:
-            direction = agent.act(game)
-            moved, reward = game.move(direction)
-            if game.awaiting_tile:
-                placed = _agent_place(agent, game)
-        return {**game.to_dict(), "moved": moved, "reward": reward,
-                "direction": int(direction), "placed": placed}
+        result = _agent_one_step(agent, game)          # step first, then read the state
+        return {**game.to_dict(), **result}
+
+
+@app.post("/api/agent/run")
+def agent_run(req: AgentRunRequest):
+    """Max-speed play: many steps per request, so the browser is not the bottleneck.
+    Returns the state after the batch plus `steps` and the batch's total `reward`."""
+    agent = get_agent(req.agent)
+    with state.lock:
+        game = state.game
+        if game.is_over():
+            raise HTTPException(status_code=409, detail="game is over")
+        deadline = time.monotonic() + req.ms / 1000
+        steps, total, last = 0, 0, {"moved": False, "reward": 0, "direction": None, "placed": None}
+        while steps < req.max_steps and not game.is_over():
+            last = _agent_one_step(agent, game)
+            steps += 1
+            total += last["reward"]
+            if not last["moved"] and last["placed"] is None:
+                break                                    # the agent could not act; do not spin
+            if time.monotonic() >= deadline:
+                break
+        return {**game.to_dict(), **last, "steps": steps, "reward": total}
 
 
 def _agent_place(agent: Agent, game: Game) -> dict:

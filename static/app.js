@@ -31,6 +31,7 @@
   const autoBtn = $("agent-auto");
   const speedEl = $("speed");
   const speedValEl = $("speed-value");
+  const turboEl = $("turbo");
 
   let prevBoard = null;
   let lastState = null;
@@ -155,14 +156,30 @@
     showDelta(s.reward);
   });
 
+  // Max speed: the server plays ~100 ms of moves per request and we render once per batch,
+  // so a whole game takes minutes instead of the better part of an hour.
+  const agentRun = () => guarded(async () => {
+    const t0 = performance.now();
+    const s = await api("/api/agent/run", { agent: agentSel.value, ms: 100 });
+    render(s);
+    showDelta(s.reward);
+    const secs = Math.max(0.001, (performance.now() - t0) / 1000);
+    speedValEl.textContent = Math.round(s.steps / secs);
+  });
+
   function startAuto() {
     if (autoTimer) return;
     autoBtn.classList.add("active");
     autoBtn.textContent = "Stop";
     const tick = async () => {
       if (!autoTimer) return;
-      await agentStep();
-      if (autoTimer) autoTimer = setTimeout(tick, 1000 / Number(speedEl.value));
+      if (turboEl.checked) {
+        await agentRun();
+        if (autoTimer) autoTimer = setTimeout(tick, 0);
+      } else {
+        await agentStep();
+        if (autoTimer) autoTimer = setTimeout(tick, 1000 / Number(speedEl.value));
+      }
     };
     autoTimer = setTimeout(tick, 0);
   }
@@ -173,6 +190,7 @@
     autoTimer = null;
     autoBtn.classList.remove("active");
     autoBtn.textContent = "Auto-play";
+    speedValEl.textContent = speedEl.value;
   }
 
   document.addEventListener("keydown", (e) => {
@@ -206,6 +224,7 @@
   $("agent-step").addEventListener("click", agentStep);
   autoBtn.addEventListener("click", () => (autoTimer ? stopAuto() : startAuto()));
   speedEl.addEventListener("input", () => { speedValEl.textContent = speedEl.value; });
+  turboEl.addEventListener("change", () => { turboEl.blur(); if (!turboEl.checked) speedValEl.textContent = speedEl.value; });
   modeSel.addEventListener("change", () => { modeSel.blur(); newGame(); });
   agentSel.addEventListener("change", () => agentSel.blur());
 

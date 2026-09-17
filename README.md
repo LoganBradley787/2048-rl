@@ -25,7 +25,10 @@ uv run uvicorn game2048.server:app --reload --port 8048
 
 Then open http://localhost:8048. Arrow keys or WASD move; swipe on touch.
 The **Step** and **Auto-play** buttons drive the game with the agent chosen
-in the dropdown.
+in the dropdown. **Max speed** makes auto-play batch about 100 ms of moves per
+request (`POST /api/agent/run`) and redraw once per batch, so a full cool-mode
+game takes minutes rather than most of an hour; the speed readout then shows
+the moves per second achieved.
 
 If you would rather not use uv, `pip install -e ".[dev]"` and
 `python -m uvicorn game2048.server:app --port 8048` do the same thing.
@@ -129,6 +132,7 @@ for it (`Game.best_placement`).
 | GET | `/api/modes` | | list of tile modes |
 | GET | `/api/agents` | | list of agent names |
 | POST | `/api/agent/step` | `{"agent": "greedy"}` | state plus `{moved, reward, direction}`, and `placed` in cool mode; 404 unknown agent, 409 if the game is over |
+| POST | `/api/agent/run` | `{"agent": "ntuple-cool", "ms": 100, "max_steps": 5000}` | as many steps as fit in `ms`; state plus `steps` and the batch's total `reward` |
 
 ## Training a network
 

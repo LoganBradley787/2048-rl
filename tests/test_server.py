@@ -141,3 +141,20 @@ def test_agent_step_in_choose_mode_moves_and_places(client):
     assert s["placed"]["value"] in (2, 4)
     r, c = s["placed"]["row"], s["placed"]["col"]
     assert s["board"][r][c] == s["placed"]["value"]
+
+
+def test_agent_run_plays_many_steps_within_a_time_budget(client):
+    body = client.post("/api/agent/run", json={"agent": "greedy", "ms": 50}).json()
+    assert body["steps"] > 1 and body["score"] > 0 and body["reward"] > 0
+    assert body["board"] == client.get("/api/state").json()["board"]
+
+
+def test_agent_run_respects_max_steps_in_cool_mode(client):
+    client.post("/api/new", json={"seed": 1, "mode": "choose"})
+    body = client.post("/api/agent/run", json={"agent": "greedy", "ms": 1000, "max_steps": 5}).json()
+    assert body["steps"] == 5 and body["awaiting_tile"] is False and body["mode"] == "choose"
+
+
+def test_agent_run_on_finished_game_is_409(client):
+    server.state.game.board = [[2, 4, 2, 4], [4, 2, 4, 2], [2, 4, 2, 4], [4, 2, 4, 2]]
+    assert client.post("/api/agent/run", json={"agent": "random"}).status_code == 409

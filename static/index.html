@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2048</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=6">
 </head>
 <body>
 <main class="app">
@@ -29,6 +29,9 @@
         <input id="speed" type="range" min="1" max="30" value="8" aria-label="Moves per second">
         <span id="speed-value">8</span>/s
       </label>
+      <label class="turbo" title="Play hundreds of moves per request; the board updates a few times a second">
+        <input id="turbo" type="checkbox" aria-label="Max speed"> Max speed
+      </label>
     </div>
   </div>
 
@@ -42,6 +45,6 @@
 
   <p class="hint"><span id="mode-hint"></span> Arrow keys or WASD to move. Backend: Python. <span id="status" class="status"></span></p>
 </main>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=6"></script>
 </body>
 </html>

@@ -1,14 +1,15 @@
 # 2048-rl
 
-Self-taught 2048 players. The strong one is an n-tuple network written in C
-that learns by afterstate temporal-difference self-play (tens of billions of
-moves in a few hours on a laptop) and plays with expectimax against random
-spawns, or with beam search in "cool mode", where the AI places its own tiles
-and has built a 65536. A CNN value network trained the same way is kept as a
-baseline. The game rules, a FastAPI server, and a plain HTML/JS board come
-with it, so you can play by hand, play cool mode yourself, or watch the agents.
+2048-rl is a set of self-taught 2048 players. The strong one is an n-tuple
+network written in C. It learns by afterstate temporal-difference self-play,
+tens of billions of moves in a few hours on a laptop, and plays with expectimax
+against random spawns or with beam search in "cool mode", where the AI places
+its own tiles and has built a 65536. A CNN value network trained the same way
+is kept as a baseline. The game rules, a FastAPI server and a plain HTML/JS
+board come with it, so you can play by hand, try cool mode yourself, or watch
+the agents.
 
-The rules and state are entirely in Python; the same code doubles as a
+The rules and state are entirely in Python. The same code doubles as a
 gym-style environment, and any agent with an `act(game)` method shows up in
 the browser.
 
@@ -40,12 +41,13 @@ each new tile is placed:
 | `kind` | random, but never a placement that ends the game while another placement keeps a move |
 | `best` | the placement that maximises your best reply (reward plus the evaluator's value of the resulting board) |
 | `evil` | the placement that minimises it, and ends the game whenever a tile can |
+| `choose` | cool mode: you place it yourself, any empty cell, 2 or 4 |
 
 `best` and `evil` judge boards with the trained n-tuple tables when
-`checkpoints/ntuple/weights.bin` exists, else with a small empty-cells-and-
-merges heuristic. The same modes work for training: `Env2048(spawn_mode=...)`
+`checkpoints/ntuple/weights.bin` exists, else with a small heuristic based on
+empty cells and merges. The same modes work for training: `Env2048(spawn_mode=...)`
 and `Config(spawn_mode=...)` for the CNN trainer (`random` and `kind` in the
-vectorised engine; all four in the Python `Game`).
+vectorised engine; all of them in the Python `Game`).
 
 ## Layout
 
@@ -59,12 +61,13 @@ vectorised engine; all four in the Python `Game`).
 | `game2048/nn.py` | `ValueNet`, checkpoint helpers, and `NNAgent` (the "nn" entry in the UI). |
 | `game2048/train.py` | Afterstate TD(0) trainer; `python -m game2048.train`. |
 | `examples/evaluate.py` | Scores a checkpoint over many games and prints the max-tile histogram. |
-| `game2048/native/ntuple.c` | Bitboard engine, n-tuple network, TD/TC learning, expectimax, all multithreaded. |
-| `game2048/ntuple.py` | ctypes wrapper: `NTupleNet`, `NTupleAgent` (the "ntuple" entry in the UI). |
+| `game2048/native/ntuple.c` | Bitboard engine, n-tuple network, TD/TC learning, expectimax and beam search, all multithreaded. |
+| `game2048/ntuple.py` | ctypes wrapper: `NTupleNet`, `NTupleAgent` (the "ntuple" and "ntuple-cool" entries in the UI). |
 | `game2048/ntuple_train.py` | Training CLI for the n-tuple network; `python -m game2048.ntuple_train`. |
+| `examples/evaluate_ntuple.py` | Evaluates n-tuple weights at several depths, in random mode or cool mode. |
 | `static/` | The browser UI. |
 | `examples/rollout.py` | Runs episodes with a named agent and prints stats. |
-| `tests/` | pytest suite for the rules, env, agents, and API. |
+| `tests/` | pytest suite for the rules, env, agents, API, and the C engine. |
 
 Actions are the same everywhere: `0 = up, 1 = right, 2 = down, 3 = left`.
 
@@ -119,11 +122,13 @@ for it (`Game.best_placement`).
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/state` | | `{board, score, over, legal_moves, max_tile}` |
+| GET | `/api/state` | | `{board, score, over, legal_moves, max_tile, mode, awaiting_tile}` |
 | POST | `/api/move` | `{"direction": 0..3 or "up"/"right"/"down"/"left"}` | state plus `{moved, reward, direction}` |
-| POST | `/api/new` | `{"seed": int}` (optional) | fresh state |
+| POST | `/api/place` | `{"row", "col", "value": 2 or 4}` (cool mode, after a move) | state |
+| POST | `/api/new` | `{"seed": int, "mode": "random"}` (both optional) | fresh state |
+| GET | `/api/modes` | | list of tile modes |
 | GET | `/api/agents` | | list of agent names |
-| POST | `/api/agent/step` | `{"agent": "greedy"}` | state plus `{moved, reward, direction}`; 404 unknown agent, 409 if the game is over |
+| POST | `/api/agent/step` | `{"agent": "greedy"}` | state plus `{moved, reward, direction}`, and `placed` in cool mode; 404 unknown agent, 409 if the game is over |
 
 ## Training a network
 
@@ -138,7 +143,7 @@ uv run python -m game2048.train --minutes 30
 This trains a value network with afterstate TD(0) and writes to `checkpoints/`:
 `best.pt` (highest evaluation mean score), `latest.pt`, and `log.csv` with one
 row per evaluation. Once `best.pt` exists, pick **nn** in the web UI dropdown
-to watch it play (restart is not needed; the server loads it on first use).
+to watch it play (no restart needed; the server loads it on first use).
 
 How it works: the network scores a board *after* a move and *before* the
 random spawn, V(afterstate). To play, it tries the four moves and takes the
@@ -164,15 +169,15 @@ the **nn** agent in the UI also does.
 ## The strong player: n-tuple network + expectimax
 
 The CNN above tops out around 74% at 2048. The strongest known approach to
-2048 is an n-tuple network (a set of lookup tables over fixed cell patterns,
-here four 6-cell patterns under all 8 board symmetries, 67M weights) trained
-with the same afterstate TD(0) idea, plus expectimax search at play time.
-That lives in `game2048/native/ntuple.c` (128-bit bitboards with five bits per
-cell, so tiles go all the way to 131072; lock-free multithreaded
-learning with temporal-coherence learning rates, multi-stage weight tables,
-expectimax with a transposition table) and is driven from Python through
-`game2048/ntuple.py`. It compiles itself with the system C compiler on first
-use.
+2048 is an n-tuple network, a set of lookup tables over fixed cell patterns
+(here four 6-cell patterns under all 8 board symmetries, 136M weights),
+trained with the same afterstate TD(0) idea and searched with expectimax at
+play time. That lives in `game2048/native/ntuple.c` and is driven from Python
+through `game2048/ntuple.py`. The C side has 128-bit bitboards with five bits
+per cell, so tiles go all the way to 131072, lock-free multithreaded learning
+with temporal-coherence learning rates, multi-stage weight tables, expectimax
+with a transposition table, and the cool-mode searches described below. It
+compiles itself with the system C compiler on first use.
 
 ```bash
 uv run python -m game2048.ntuple_train --hours 2 --threads 12
@@ -182,19 +187,19 @@ uv run python -m game2048.ntuple_train --hours 2 --threads 12
 uv run python -m game2048.ntuple_train --hours 6 --threads 12 --resume checkpoints/ntuple/latest.bin --stages 16384,24576,32768 --tc-stages 1 --alpha-plain 0.025 --lock-memory --out checkpoints/ntuple_stages
 ```
 
-Training runs at 6 to 7 million moves per second on an M3 Pro. `--stages`
-gives boards whose tile mass (sum of all tiles) has crossed each boundary
-their own weight tables, the multi-stage trick behind the best published
-32768 rates; `--resume single-stage.bin --stages ...` seeds stage 0 from an
-existing run. Temporal-coherence learning state costs 768 MB per stage, so
-`--tc-stages 1` keeps it on stage 0 only and trains the other stages with
-plain TD at `--alpha-plain` (256 MB each plus a touched bit per entry);
-`--no-tc` drops it everywhere. `--lock-memory` pins the tables in RAM so
-paging cannot stall the lookups. `--patterns 8x6` starts a new network with
-eight 6-cell patterns instead of four (twice the capacity, 512 MB of
-weights). Weights and counters go
-to `--out`; `latest.bin` resumes training, `weights.bin` is the small
-deployment copy the UI loads.
+Training ran at 6 to 7 million moves per second on an M3 Pro with the earlier
+64-bit engine. `--stages` gives boards whose tile mass (sum of all tiles) has
+crossed each boundary their own weight tables, the multi-stage trick behind
+the best published 32768 rates; `--resume single-stage.bin --stages ...` seeds
+stage 0 from an existing run. Temporal-coherence learning state costs about
+1.1 GB per stage on top of the weights, so `--tc-stages 1` keeps it on stage 0
+only and trains the other stages with plain TD at `--alpha-plain` (544 MB each
+plus a touched bit per entry); `--no-tc` drops it everywhere. `--lock-memory`
+pins the tables in RAM so paging cannot stall the lookups. `--patterns 8x6`
+starts a new network with eight 6-cell patterns instead of four (twice the
+capacity, 1.1 GB of weights). Weights and counters go to `--out`; `latest.bin`
+resumes training, `weights.bin` is the smaller deployment copy the UI loads.
+Weight files written before the 128-bit engine are converted when loaded.
 
 Evaluate at several search depths and build the report page:
 
@@ -221,32 +226,36 @@ expectimax of the literature.
 
 ### Cool mode: tables trained for placing the tiles
 
-In cool mode there is no chance node: the search maximises over moves and
+In cool mode there is no chance node, so the search maximises over moves and
 over placements (`NTupleNet.best_choose`, `choose_value`, `play_choose`;
-`depth` counts placement decisions, `topk` placements are kept per node).
+`depth` counts placement decisions and `topk` placements are kept per node).
 Tables trained on random spawns never saw a 32768, so they stall there in
-cool mode; `--choose` trains tables by self-play in the choose game instead
-(TD(0) on afterstates, the policy is the depth-1 choose search):
+cool mode. `--choose` trains tables by self-play in the choose game instead,
+TD(0) on afterstates with the depth-1 choose search as the policy, and
+`--explore 0.02` places a random tile on 2% of steps so the games do not all
+replay one line:
 
 ```bash
-uv run python -m game2048.ntuple_train --choose --patterns 8x6 --hours 3 --threads 12 --lock-memory --out checkpoints/ntuple_choose --chunk 1000
+uv run python -m game2048.ntuple_train --choose --patterns 8x6 --hours 3 --threads 12 --lock-memory --out checkpoints/ntuple_choose --chunk 1000 --explore 0.02
 ```
 
 Choose-mode games run thousands of moves with a small search each, so use a
-small `--chunk`. Leave `--max-moves` at its default: games cut at a cap leave
-their late boards ungrounded, the values inflate and the policy collapses.
+small `--chunk`. Leave `--max-moves` at its default. Games cut at a cap leave
+their late boards ungrounded, the values inflate, and the policy collapses.
 Pick **ntuple-cool** in the web UI (weights from `GAME2048_NTUPLE_COOL`, else
 `checkpoints/ntuple_choose/weights.bin`); it answers 503 until the weights exist.
 
-Because the choose game has no chance nodes it is a puzzle, and a puzzle wants
-beam search rather than a tree: keep the `width` best boards, extend each by a
-move and a placement, repeat `depth` times, then play the first step of the
-best line (`NTupleNet.beam_plan`, `beam_choose`, `beam_value`, `play_beam`).
-An entry is ranked by its rewards so far plus the best next move's reward and
-value; with unlimited width this is exactly the max-max tree of the same depth
-(that is a test). `spread` caps how many survivors may share a parent, and
-`stride` commits several steps of a plan before searching again. On the
-5-minute cool-mode tables, 6 games each, 32768 reached in every game:
+With no chance nodes the choose game is a deterministic puzzle, and beam
+search suits it better than a tree: keep the `width` best boards, extend each
+by a move and a placement, repeat `depth` times, then play the first step of
+the best line (`NTupleNet.beam_plan`, `beam_choose`, `beam_value`,
+`play_beam`). An entry is ranked by its rewards so far plus the best next
+move's reward and value. With unlimited width this is exactly the max-max tree
+of the same depth, and a test checks that. `spread` caps how many survivors
+may share a parent, `stride` commits several steps of a plan before searching
+again, and `snake` adds a weighted bonus for keeping the chain laid out as a
+snake along the board. On the 5-minute cool-mode tables, 6 games each, with
+32768 reached in every game:
 
 | search | mean score | cost per move |
 | --- | --- | --- |
@@ -255,16 +264,16 @@ value; with unlimited width this is exactly the max-max tree of the same depth
 | beam, width 32, depth 12 | 808k | 20 ms |
 
 Width matters more than depth: a narrow beam fills up with variants of one
-line. The **ntuple-cool** agent uses width 32, depth 12. Note that a
-deterministic policy makes the choose game a single canonical line: different
-start tiles, and even a prefix of random spawns (`prefix=`), converge to the
-same game within a few hundred moves, so two evaluation games are as good as
-twelve, and small score differences between search settings are chaotic
-rather than statistical.
+line. The **ntuple-cool** agent uses width 32 and depth 12 and plays four
+steps of each plan before planning again. A deterministic policy makes the
+choose game a single canonical line. Different start tiles, and even a prefix
+of random spawns (`prefix=`), converge to the same game within a few hundred
+moves, so two evaluation games are as good as twelve, and small score
+differences between search settings are chaotic rather than statistical.
 
 ```python
 net = nt.NTupleNet.load("checkpoints/ntuple_choose/weights.bin")
-stats = nt.summarize(net.play_beam(games=6, width=32, depth=12, threads=6))
+stats = nt.summarize(net.play_beam(games=2, width=32, depth=12, stride=4, threads=2))
 ```
 
 ## Results
@@ -300,6 +309,10 @@ only one that reaches 32768; it ships as `checkpoints/ntuple/weights.bin`
 (the 4-pattern weights are kept as `weights_4x6.bin`). A 3-stage run seeded
 from the 4-pattern tables (`--stages 16384,24576`) scored 313,338 at depth 2
 and was dropped.
+
+In cool mode, 8-pattern tables trained for 4 hours on the choose game and
+played with the beam (width 32, depth 12, four steps per plan) scored
+1,299,016 on the canonical game and built a 65536.
 
 Regenerate the report page from the log and an evaluation:
 

@@ -241,10 +241,21 @@ static int snake_cells[8][16];
 static double snake_w[16];
 static pthread_once_t snake_once = PTHREAD_ONCE_INIT;
 
+static double snake_decay = 0.5;
+
 static void snake_init(void) {
     for (int sym = 0; sym < 8; sym++)
         for (int k = 0; k < 16; k++) snake_cells[sym][k] = sym_cell(SNAKE_PATH[k], sym);
-    for (int k = 0; k < 16; k++) snake_w[k] = pow(0.5, k);
+    for (int k = 0; k < 16; k++) snake_w[k] = pow(snake_decay, k);
+}
+
+/* Weight ratio between consecutive cells on the snake path (0.5 by default: the
+ * head dominates; nearer 1 the whole chain's order counts). Not thread-safe
+ * while games are being played. */
+void nt_set_snake_decay(double d) {
+    pthread_once(&snake_once, snake_init);
+    snake_decay = d;
+    for (int k = 0; k < 16; k++) snake_w[k] = pow(d, k);
 }
 
 static double snake_score(board_t b) {

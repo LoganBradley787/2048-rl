@@ -164,6 +164,7 @@ def lib() -> ctypes.CDLL:
                                   P(u64), ctypes.c_long, f64, P(i64), P(i32), P(i32)]
     L.nt_beam_choose.argtypes, L.nt_beam_choose.restype = [vp, u64, u64, i32, i32, i32, f64, P(i32), P(i32)], i32
     L.nt_snake_score.argtypes, L.nt_snake_score.restype = [u64, u64], f64
+    L.nt_set_snake_decay.argtypes = [f64]
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64], f64
     L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, P(i32), P(i32), P(i32)], i32
     L.nt_play_beam.argtypes = [vp, ctypes.c_long, i32, i32, i32, i32, f64, i32, u64, ctypes.c_long, ctypes.c_long,
@@ -272,6 +273,12 @@ def cool_search_settings(weights) -> dict:
         saved = json.loads(meta.read_text())
         settings.update({k: saved[k] for k in settings if k in saved})
     return settings
+
+
+def set_snake_decay(decay: float) -> None:
+    """Weight ratio between consecutive snake cells (default 0.5). Process-wide; set
+    it between games, not while games are being played."""
+    lib().nt_set_snake_decay(float(decay))
 
 
 def snake_score(bits: int) -> float:

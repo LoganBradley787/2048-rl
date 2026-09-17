@@ -848,3 +848,16 @@ def test_harvest_starts_collects_boards_past_a_mass_threshold(tmp_path):
     loaded = nt.load_starts(path)
     assert len(loaded) == len(grids) and all(nt.cell(b, 0) == g[0, 0] for b, g in zip(loaded, grids))
     n.close()
+
+
+def test_snake_decay_is_adjustable():
+    chain = nt.to_bits(np.array([[17, 16, 15, 14], [10, 11, 12, 13], [9, 8, 7, 6], [2, 3, 4, 5]], dtype=np.uint8))
+    tiles = [1 << e for e in [17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2]]
+    try:
+        nt.set_snake_decay(0.9)
+        assert nt.snake_score(chain) == pytest.approx(sum(t * 0.9 ** k for k, t in enumerate(tiles)))
+        nt.set_snake_decay(1.0)
+        assert nt.snake_score(chain) == pytest.approx(sum(tiles))
+    finally:
+        nt.set_snake_decay(0.5)
+    assert nt.snake_score(chain) == pytest.approx(sum(t * 0.5 ** k for k, t in enumerate(tiles)))

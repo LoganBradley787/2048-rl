@@ -760,3 +760,64 @@ def test_train_choose_explore_takes_random_placements_reproducibly():
     assert np.array_equal(sb["scores"], sc["scores"])          # but deterministically
     assert (sb["moves"] > 0).all()
     a.close(); b.close(); c.close()
+
+
+# --- snake-order bonus for the beam --------------------------------------------------
+
+def test_snake_score_rewards_the_snake_layout_under_any_symmetry():
+    assert nt.snake_score(0) == 0.0
+    one = nt.with_cell(0, 0, 10)                                   # 1024 in a corner: head of the snake
+    assert nt.snake_score(one) == pytest.approx(1024.0)
+    inner = nt.with_cell(0, 5, 10)                                 # an inner cell is at best 6th on the path
+    assert nt.snake_score(inner) == pytest.approx(1024.0 * 0.5 ** 5)
+    chain = nt.to_bits(np.array([[17, 16, 15, 14], [10, 11, 12, 13], [9, 8, 7, 6], [2, 3, 4, 5]], dtype=np.uint8))
+    expected = sum((1 << e) * 0.5 ** k for k, e in enumerate([17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2]))
+    assert nt.snake_score(chain) == pytest.approx(expected)
+    rotated = nt.to_bits(np.rot90(nt.from_bits(chain)))
+    assert nt.snake_score(rotated) == pytest.approx(expected)     # the best of the 8 symmetries is taken
+    shuffled = nt.to_bits(np.array([[17, 10, 15, 6], [16, 11, 2, 13], [9, 8, 7, 14], [12, 3, 4, 5]], dtype=np.uint8))
+    assert nt.snake_score(shuffled) < expected
+
+
+def test_beam_snake_bonus_matches_the_reference_at_depth_one():
+    n = nt.NTupleNet()
+    n.train(games=200, threads=2, seed=4)
+    rng = np.random.default_rng(35)
+    lam = 0.7
+    for _ in range(8):
+        bits = nt.to_bits(rand_exps(rng, density=0.85))
+        best = None
+        for m in range(4):
+            a, r = nt.move(bits, m)
+            if a == bits:
+                continue
+            for i in range(16):
+                if nt.cell(a, i):
+                    continue
+                for v in (1, 2):
+                    s2 = nt.with_cell(a, i, v)
+                    nxt = [r2 + n.value(a2) + lam * nt.snake_score(a2) for m2 in range(4)
+                           for a2, r2 in [nt.move(s2, m2)] if a2 != s2]
+                    val = r + (max(nxt) if nxt else 0.0)
+                    best = val if best is None else max(best, val)
+        if best is None:
+            continue
+        assert n.beam_value(bits, width=4096, depth=1, snake=lam) == pytest.approx(best, rel=1e-6, abs=1e-6)
+    assert n.beam_value(bits, width=4096, depth=1) == n.beam_value(bits, width=4096, depth=1, snake=0.0)
+    stats = n.play_beam(games=2, width=4, depth=3, threads=2, seed=3, max_moves=200, snake=1.0)
+    assert (stats["moves"] > 0).all()
+    n.close()
+
+
+def test_ntuple_agent_accepts_a_snake_weight(tmp_path):
+    n = nt.NTupleNet()
+    n.train(games=50, threads=2, seed=7)
+    n.save(tmp_path / "w.bin")
+    n.close()
+    agent = nt.NTupleAgent(weights=tmp_path / "w.bin", beam_width=4, beam_depth=3, beam_snake=1.0)
+    game = Game(seed=2, spawn_mode="choose")
+    for _ in range(5):
+        direction, (row, col, value) = agent.choose(game)
+        game.move(direction)
+        game.place(row, col, value)
+    assert game.score > 0

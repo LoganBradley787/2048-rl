@@ -167,6 +167,23 @@ the value function learns 65536 and 131072:
 `uv run python -m game2048.ntuple_train --resume checkpoints/ntuple_choose/latest.bin --out checkpoints/ntuple_big --hours 3 --threads 12 --lock-memory --chunk 1000 --save-every-min 20 --eval-every-min 30 --eval-games 2 --eval-depth 3 --eval-at-end --seed 8`
 (3.3 GB pinned; run it alone).
 
+## Snake-order bonus, exploration verdict, and the big-engine run (2026-09-16 night)
+
+- **Snake bonus**: `nt.snake_score(bits)` = tiles read along the snake path
+  (0 1 2 3 / 7 6 5 4 / 8 9 10 11 / 15 14 13 12) weighted 0.5^k, best of the 8
+  symmetries; `beam_plan/beam_choose/beam_value/play_beam(..., snake=w)` add
+  `w * snake_score` to every beam leaf; `NTupleAgent(beam_snake=w)`. Motivation:
+  the user watched the endgame die with the chain scattered. Sweep of w on the
+  4-hour tables (canonical game, beam w32 d12 stride 4) is in
+  `scratchpad/snake_sweep.log`; w = 0 scored 1,299,016 with a 65536 on the new
+  engine (1,216,968 with the old cap).
+- **Exploration**: 1 h continuations of the same 2h20m snapshot, 4 threads each,
+  final 2-game depth-3 eval: explore 0.02 -> 802,988; control -> 751,148. One line
+  each, so chaotic, but exploration is on for the next run.
+- **Queued** (`scratchpad/launch_big.sh`, starts when the 4-hour run exits): resume
+  the 4-hour tables on the new engine into `checkpoints/ntuple_big/` for 3 h with
+  `--explore 0.02` (3.3 GB pinned), evals every 30 min at depth 3, 2 games.
+
 ## Machine constraints (important)
 
 - 19 GB RAM, but Docker's VMs hold ~9 GB; swap ran 4-10 GB. Pinned tables above

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "2048",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "uvicorn", "game2048.server:app", "--port", "8048"],
+      "port": 8048
+    }
+  ]
+}

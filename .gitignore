@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+uv.lock
+game2048/native/*.dylib
+game2048/native/*.so
+game2048/native/*.tmp
+checkpoints/
+*.pt
+.claude/settings*.json
+.DS_Store

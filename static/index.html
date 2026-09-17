@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2048</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="app">
+  <header class="top">
+    <h1>2048</h1>
+    <div class="scores">
+      <div class="scorebox"><span class="label">Score</span><span id="score">0</span><span id="score-delta" class="delta"></span></div>
+      <div class="scorebox"><span class="label">Best</span><span id="best">0</span></div>
+    </div>
+  </header>
+
+  <div class="controls">
+    <div class="mode-controls">
+      <button id="new-game" class="btn primary">New game</button>
+      <select id="mode" aria-label="Tile mode" title="How the next tile is chosen"></select>
+    </div>
+    <div class="agent-controls">
+      <select id="agent" aria-label="Agent"></select>
+      <button id="agent-step" class="btn">Step</button>
+      <button id="agent-auto" class="btn">Auto-play</button>
+      <label class="speed">Speed
+        <input id="speed" type="range" min="1" max="30" value="8" aria-label="Moves per second">
+        <span id="speed-value">8</span>/s
+      </label>
+    </div>
+  </div>
+
+  <div class="board-wrap">
+    <div id="board" class="board" role="grid" aria-label="2048 board"></div>
+    <div id="overlay" class="overlay" hidden>
+      <p>Game over</p>
+      <button id="retry" class="btn primary">Try again</button>
+    </div>
+  </div>
+
+  <p class="hint"><span id="mode-hint"></span> Arrow keys or WASD to move. Backend: Python. <span id="status" class="status"></span></p>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

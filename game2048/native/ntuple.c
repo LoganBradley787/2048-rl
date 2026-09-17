@@ -926,7 +926,9 @@ static int beam_cmp(const void *x, const void *y) {
 /* Writes the best line's steps to moves/cells/values (each of size `depth`) and
  * returns its length (0 if the root has no move); *score gets the line's value. */
 /* tiles: bitmask of placements allowed, 1 = a 2, 2 = a 4 (3 = both). Placing only 2s
- * earns every 2+2 merge and approaches the theoretical maximum score. */
+ * earns every 2+2 merge and approaches the theoretical maximum score, but the
+ * 131072 needs one 4 at the very end; bit 4 charges each placed 4 the 4 points it
+ * forfeits (in the ranking only), so 4s are used just where they earn more. */
 static int beam_search(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
                        int *moves, int *cells, int *values, double *score) {
     if (width < 1) width = 1;
@@ -974,7 +976,7 @@ static int beam_search(net_t *net, board_t b, int width, int depth, int spread, 
                         seen[h] = s2;
                         beam_t ne;
                         ne.s = s2;
-                        ne.cum = e->cum + r;
+                        ne.cum = e->cum + r - ((tiles & 4) && v == 2 ? 4 : 0);
                         ne.parent = i;
                         double nv;
                         ne.alive = (int8_t)next_value(net, s2, snake, &nv);

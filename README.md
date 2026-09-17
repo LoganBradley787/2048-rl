@@ -295,8 +295,14 @@ steps ahead, four steps per plan. On the canonical game:
 | snake only, decay 0.9 | 128 x 16 | **3,670,068** | **131072** | 65,544 | 4.2 min |
 
 The theoretical maximum on a 4x4 board is about 3.93M, so the snake player is
-within 7% of perfect play. Pick **snake** in the web UI with Cool mode and Max
-speed to watch it.
+within 7% of perfect play. The gap is the 4s it places: restricted to 2s
+(`tiles=1`) the same beam finds the perfect 2s line, 1,835,012 points for a
+flawless chain from 65536 down to 2, and then stops, because the 131072 needs
+exactly one 4 at the very end. `tiles=7` charges each placed 4 its 4-point
+opportunity cost in the ranking so 4s are used only where they pay. Pick
+**snake** in the web UI with Cool mode and Max speed to watch it. Outside cool
+mode `snake` is weak (the heuristic only lives in the beam); use **ntuple**
+for random spawns.
 
 ```python
 net = nt.NTupleNet.load("checkpoints/ntuple_choose/weights.bin")

@@ -815,10 +815,12 @@ def test_ntuple_agent_accepts_a_snake_weight(tmp_path):
     n.train(games=50, threads=2, seed=7)
     n.save(tmp_path / "w.bin")
     n.close()
+    nt.set_snake_decay(0.5)                                        # the decay is process-wide
     agent = nt.NTupleAgent(weights=tmp_path / "w.bin", beam_width=4, beam_depth=3, beam_snake=1.0)
     game = Game(seed=2, spawn_mode="choose")
-    for _ in range(5):
+    for _ in range(12):
         direction, (row, col, value) = agent.choose(game)
+        assert direction in game.legal_moves() and value in (2, 4)
         game.move(direction)
         game.place(row, col, value)
     assert game.score > 0
@@ -875,4 +877,22 @@ def test_beam_can_be_restricted_to_placing_twos():
         assert plan4 and all(v == 2 for _, _, v in plan4)             # only 4s
     stats = n.play_beam(games=1, width=8, depth=4, threads=1, seed=1, max_moves=300, snake=2.0, tiles=1)
     assert stats["moves"][0] == 300
+    n.close()
+
+
+def test_beam_can_charge_fours_their_opportunity_cost():
+    # With unlimited width the beam is the exhaustive tree, so charging 4s can only
+    # lower the best line's value (a pruned beam need not be monotone in the charge).
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(37)
+    strict, fours_free, fours_charged = False, 0, 0
+    for _ in range(8):
+        bits = nt.to_bits(rand_exps(rng, density=0.6))
+        v3 = n.beam_value(bits, width=4096, depth=2, snake=2.0, tiles=3)
+        v7 = n.beam_value(bits, width=4096, depth=2, snake=2.0, tiles=7)
+        assert v7 <= v3 + 1e-9
+        strict |= v7 < v3 - 1e-9
+        fours_free += sum(v == 2 for _, _, v in n.beam_plan(bits, width=4096, depth=2, snake=2.0, tiles=3))
+        fours_charged += sum(v == 2 for _, _, v in n.beam_plan(bits, width=4096, depth=2, snake=2.0, tiles=7))
+    assert strict and fours_charged <= fours_free                     # 4s only when they earn more than 4 points
     n.close()

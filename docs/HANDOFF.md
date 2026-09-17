@@ -1,6 +1,45 @@
-# Handoff: 2048 project state (updated 2026-09-16, after the cool-mode trainer)
+# Handoff: 2048 project state (shut down for the night on 2026-09-16, ~23:00)
 
-Everything needed to pick this up cold. Read this, then `README.md`.
+Everything needed to pick this up cold. Read this, then `README.md`. Repo:
+https://github.com/LoganBradley787/2048-rl (public, `main` is current).
+
+## Where things stand (short version)
+
+- **Cool mode is solved for practical purposes.** The `snake` agent, which has no
+  trained tables at all (an untouched network contributes value 0), plays the
+  choose game with a beam search ranked by merges plus the snake-order heuristic
+  and reaches the **131072 tile with 3,670,068 points**, 93% of the ~3.93M
+  theoretical maximum, in about 4 minutes per game. Settings: width 128, depth
+  16, stride 4, snake weight 2, snake decay 0.9 (0.75 and a 256-wide beam at
+  decay 0.5 land in the same place). Widths 32/64 or decay 0.5 at width 128 stop
+  at 32768/65536.
+- The remaining 7% is placing 4s: restricted to 2s only (`tiles=1`) the beam finds
+  the *perfect* 2s line (1,835,012 = a flawless chain 65536..2 built from 2s) and
+  then dies, because the 131072 needs exactly one 4 at the end. `tiles=7` (both
+  tiles, each placed 4 charged its 4-point opportunity cost in the ranking) is
+  implemented and unit-tested but NOT yet played through; that is the next
+  experiment (`n.play_beam(games=1, width=128, depth=16, stride=4, snake=2.0,
+  tiles=7)` after `nt.set_snake_decay(0.9)`, expect ~3.9M).
+- The learned cool-mode tables are a liability in the endgame (best tables +
+  snake at width 64: 1.31M vs 1.61M without tables). They still matter for
+  random spawns, where `ntuple` (351k mean, 16384 in 98%) is the strong player
+  and `snake` is terrible (its move choice is a 3-ply expectimax on zero
+  values; the heuristic only lives in the beam).
+- Nothing is running. The 3-hour big-engine training run was stopped with
+  SIGINT at ~109k games (it saved `checkpoints/ntuple_big/latest.bin`, 3.3 GB,
+  and `weights.bin`); it is moot for cool mode now. Docker was stopped by the
+  user for memory; the dev server was stopped.
+
+## Restart checklist
+
+1. `uv run pytest` (expect all green, ~4 min; one Hogwild-margin test is
+   occasionally flaky under heavy CPU load).
+2. UI: preview "2048" in `.claude/launch.json` (or `uv run uvicorn game2048.server:app
+   --port 8048`). Cool mode + agent `snake` + Max speed shows the 131072 game.
+3. Next experiment: the `tiles=7` game above. If it beats 3.67M, make it the
+   `snake` agent's default (`beam_tiles=7` in `agents.py`).
+4. Optional: give `snake` a respectable random-spawn move (snake heuristic at
+   expectimax leaves) or label it cool-mode-only in the dropdown.
 
 ## What exists and works
 

@@ -468,7 +468,9 @@ class NTupleNet:
         move+placement steps; unlimited width equals the full tree of that depth.
         `spread` > 0 caps the survivors per parent so the beam covers distinct lines;
         `snake` adds that weight times `snake_score` to every leaf. `tiles` is a mask of
-        the placements allowed: 1 = 2s only, 2 = 4s only, 3 = both."""
+        the placements allowed: 1 = 2s only, 2 = 4s only, 3 = both; adding 4 charges each
+        placed 4 the 4 points it forfeits (ranking only), so 4s are used only where they
+        earn more, e.g. the final cascade to 131072."""
         return float(self._lib.nt_beam_value(self._h, *_lohi(bits), int(width), int(depth), int(spread), float(snake),
                                              int(tiles)))
 

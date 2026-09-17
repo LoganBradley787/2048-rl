@@ -549,7 +549,8 @@ class NTupleAgent:
 
     def __init__(self, weights=None, depth: int = 3, cutoff: float = 0.0, choose_depth: int = 3,
                  topk: int = 4, beam_width: int = 0, beam_depth: int = 16, beam_stride: int = 1,
-                 beam_spread: int = 0, beam_snake: float = 0.0, net: "NTupleNet | None" = None) -> None:
+                 beam_spread: int = 0, beam_snake: float = 0.0, beam_snake_decay: float | None = None,
+                 net: "NTupleNet | None" = None) -> None:
         if net is not None:                 # a ready network, e.g. an empty one for a heuristic-only player
             self.net = net
         else:
@@ -568,11 +569,14 @@ class NTupleAgent:
         self.beam_stride = beam_stride    # steps of a plan to follow before planning again
         self.beam_spread = beam_spread    # survivors per parent (0 = unlimited)
         self.beam_snake = beam_snake      # weight of the snake-order bonus at the leaves
+        self.beam_snake_decay = beam_snake_decay   # process-wide snake decay applied before each plan (None = leave)
         self._plan: list[tuple[int, int, int]] = []
         self._plan_board = -1             # board the next cached step applies to
 
     def _beam_step(self, bits: int) -> tuple[int, int, int]:
         if not self._plan or self._plan_board != bits:
+            if self.beam_snake_decay is not None:
+                set_snake_decay(self.beam_snake_decay)
             self._plan = self.net.beam_plan(bits, self.beam_width, self.beam_depth, self.beam_spread,
                                             self.beam_snake)[: max(1, self.beam_stride)]
         if not self._plan:

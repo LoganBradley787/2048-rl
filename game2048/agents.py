@@ -71,11 +71,13 @@ def _ntuple_cool_agent() -> Agent:
 def _snake_agent() -> Agent:
     """No training at all: beam search over the choose game scoring boards by their
     merges plus the snake-order heuristic (an untouched network contributes 0).
-    64 lines, 16 steps, snake weight 2: 1.61M with a 65536 on the canonical game."""
+    128 lines, 16 steps, snake weight 2, decay 0.9 so every tile on the path
+    counts: 3,670,068 points and the 131072 tile on the canonical game, about 93%
+    of the theoretical maximum."""
     from .ntuple import NTupleAgent, NTupleNet
 
-    return NTupleAgent(net=NTupleNet(patterns=[[0, 1, 2, 3]], tc=False), beam_width=64, beam_depth=16,
-                       beam_stride=4, beam_snake=2.0)
+    return NTupleAgent(net=NTupleNet(patterns=[[0, 1, 2, 3]], tc=False), beam_width=128, beam_depth=16,
+                       beam_stride=4, beam_snake=2.0, beam_snake_decay=0.9)
 
 
 AGENTS: dict[str, Callable[[], Agent]] = {

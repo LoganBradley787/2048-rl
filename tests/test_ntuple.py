@@ -765,6 +765,7 @@ def test_train_choose_explore_takes_random_placements_reproducibly():
 # --- snake-order bonus for the beam --------------------------------------------------
 
 def test_snake_score_rewards_the_snake_layout_under_any_symmetry():
+    nt.set_snake_decay(0.5)                                        # the decay is process-wide
     assert nt.snake_score(0) == 0.0
     one = nt.with_cell(0, 0, 10)                                   # 1024 in a corner: head of the snake
     assert nt.snake_score(one) == pytest.approx(1024.0)

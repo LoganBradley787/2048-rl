@@ -1,13 +1,14 @@
 # 2048-rl
 
-2048-rl is a set of self-taught 2048 players. The strong one is an n-tuple
-network written in C. It learns by afterstate temporal-difference self-play,
-tens of billions of moves in a few hours on a laptop, and plays with expectimax
-against random spawns or with beam search in "cool mode", where the AI places
-its own tiles and has built a 65536. A CNN value network trained the same way
-is kept as a baseline. The game rules, a FastAPI server and a plain HTML/JS
-board come with it, so you can play by hand, try cool mode yourself, or watch
-the agents.
+2048-rl is a set of 2048 players. The strong one against random spawns is an
+n-tuple network written in C that learns by afterstate temporal-difference
+self-play, tens of billions of moves in a few hours on a laptop, and plays with
+expectimax. In "cool mode", where the player places its own tiles, the game is
+a deterministic puzzle, and a beam search guided by a snake-order heuristic
+plays it to the 131072 tile and 3.67M points, about 93% of the theoretical
+maximum, with no training at all. A CNN value network is kept as a baseline.
+The game rules, a FastAPI server and a plain HTML/JS board come with it, so you
+can play by hand, try cool mode yourself, or watch the agents at max speed.
 
 The rules and state are entirely in Python. The same code doubles as a
 gym-style environment, and any agent with an `act(game)` method shows up in
@@ -274,6 +275,28 @@ choose game a single canonical line. Different start tiles, and even a prefix
 of random spawns (`prefix=`), converge to the same game within a few hundred
 moves, so two evaluation games are as good as twelve, and small score
 differences between search settings are chaotic rather than statistical.
+
+### The snake player: no tables, 131072
+
+The learned tables turned out to be the weak link in the endgame, where a
+16-tile chain has to be collapsed in exact order. The **snake** agent drops
+them entirely: an untouched network (value 0 everywhere) so the beam ranks
+boards by their merges plus the snake heuristic alone, with the decay set to
+0.9 so every tile on the path counts (`nt.set_snake_decay`), 128 lines, 16
+steps ahead, four steps per plan. On the canonical game:
+
+| evaluator | beam | score | max tile | moves | time |
+| --- | --- | --- | --- | --- | --- |
+| best learned tables, snake 0 | 32 x 12 | 1,528,428 | 65536 | 35,686 | 3 min |
+| snake only, decay 0.5 | 32 x 12 | 785,284 | 32768 | 16,405 | 37 s |
+| snake only, decay 0.5 | 64 x 16 | 1,614,376 | 65536 | 30,801 | 2.4 min |
+| snake only, decay 0.5 | 128 x 16 | 1,704,108 | 65536 | 32,806 | 2.3 min |
+| snake only, decay 0.75 | 128 x 16 | 3,670,436 | **131072** | 65,636 | 4.3 min |
+| snake only, decay 0.9 | 128 x 16 | **3,670,068** | **131072** | 65,544 | 4.2 min |
+
+The theoretical maximum on a 4x4 board is about 3.93M, so the snake player is
+within 7% of perfect play. Pick **snake** in the web UI with Cool mode and Max
+speed to watch it.
 
 ```python
 net = nt.NTupleNet.load("checkpoints/ntuple_choose/weights.bin")

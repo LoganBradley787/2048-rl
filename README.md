@@ -1,9 +1,16 @@
-# 2048
+# 2048-rl
 
-A 2048 game with the rules and state entirely in Python, a small FastAPI
-server, and a plain HTML/JS board to play it in the browser. The same Python
-code doubles as a gym-style environment for training an agent, and any agent
-can be plugged into the UI to watch it play.
+Self-taught 2048 players. The strong one is an n-tuple network written in C
+that learns by afterstate temporal-difference self-play (tens of billions of
+moves in a few hours on a laptop) and plays with expectimax against random
+spawns, or with beam search in "cool mode", where the AI places its own tiles
+and has built a 65536. A CNN value network trained the same way is kept as a
+baseline. The game rules, a FastAPI server, and a plain HTML/JS board come
+with it, so you can play by hand, play cool mode yourself, or watch the agents.
+
+The rules and state are entirely in Python; the same code doubles as a
+gym-style environment, and any agent with an `act(game)` method shows up in
+the browser.
 
 ## Run the web UI
 

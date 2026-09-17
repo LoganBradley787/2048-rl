@@ -165,6 +165,8 @@ def lib() -> ctypes.CDLL:
     L.nt_beam_choose.argtypes, L.nt_beam_choose.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32)], i32
     L.nt_snake_score.argtypes, L.nt_snake_score.restype = [u64, u64], f64
     L.nt_set_snake_decay.argtypes = [f64]
+    L.nt_set_leaf_snake.argtypes = [vp, f64]
+    L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
     L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32), P(i32)], i32
     L.nt_play_beam.argtypes = [vp, ctypes.c_long, i32, i32, i32, i32, f64, i32, i32, u64, ctypes.c_long, ctypes.c_long,
@@ -427,6 +429,16 @@ class NTupleNet:
                            scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
 
+    @property
+    def leaf_snake(self) -> float:
+        """Weight of `snake_score` added to the leaves of the random-spawn search
+        (best_move, search_value, play); 0 = the tables alone."""
+        return float(self._lib.nt_leaf_snake(self._h))
+
+    @leaf_snake.setter
+    def leaf_snake(self, weight: float) -> None:
+        self._lib.nt_set_leaf_snake(self._h, float(weight))
+
     def best_move(self, bits: int, depth: int = 1, cutoff: float = 0.0) -> int:
         """Expectimax move for the board, -1 if none is legal. depth = spawn layers searched."""
         return int(self._lib.nt_best_move(self._h, *_lohi(bits), int(depth), float(cutoff)))
@@ -469,8 +481,10 @@ class NTupleNet:
         `spread` > 0 caps the survivors per parent so the beam covers distinct lines;
         `snake` adds that weight times `snake_score` to every leaf. `tiles` is a mask of
         the placements allowed: 1 = 2s only, 2 = 4s only, 3 = both; adding 4 charges each
-        placed 4 the 4 points it forfeits (ranking only), so 4s are used only where they
-        earn more, e.g. the final cascade to 131072."""
+        placed 4 the 4 points it forfeits (ranking only). Adding 8 plans with 2s first and
+        allows 4s only when the best 2s-only line dies within `depth` steps; such a fallback
+        plan is one step long, so the next plan tries 2s again (8 or 12 play a whole game
+        with only the 4s that survival, e.g. the final cascade to 131072, needs)."""
         return float(self._lib.nt_beam_value(self._h, *_lohi(bits), int(width), int(depth), int(spread), float(snake),
                                              int(tiles)))
 
@@ -556,7 +570,7 @@ class NTupleAgent:
     def __init__(self, weights=None, depth: int = 3, cutoff: float = 0.0, choose_depth: int = 3,
                  topk: int = 4, beam_width: int = 0, beam_depth: int = 16, beam_stride: int = 1,
                  beam_spread: int = 0, beam_snake: float = 0.0, beam_snake_decay: float | None = None,
-                 beam_tiles: int = 3, net: "NTupleNet | None" = None) -> None:
+                 beam_tiles: int = 3, leaf_snake: float = 0.0, net: "NTupleNet | None" = None) -> None:
         if net is not None:                 # a ready network, e.g. an empty one for a heuristic-only player
             self.net = net
         else:
@@ -576,7 +590,9 @@ class NTupleAgent:
         self.beam_spread = beam_spread    # survivors per parent (0 = unlimited)
         self.beam_snake = beam_snake      # weight of the snake-order bonus at the leaves
         self.beam_snake_decay = beam_snake_decay   # process-wide snake decay applied before each plan (None = leave)
-        self.beam_tiles = beam_tiles      # placements allowed: 1 = 2s, 2 = 4s, 3 = both
+        self.beam_tiles = beam_tiles      # placement mask, see NTupleNet.beam_value (12 = 2s first)
+        if leaf_snake:                    # snake bonus at the random-spawn search leaves
+            self.net.leaf_snake = leaf_snake
         self._plan: list[tuple[int, int, int]] = []
         self._plan_board = -1             # board the next cached step applies to
 
@@ -605,6 +621,8 @@ class NTupleAgent:
         return Direction(m), (cell // 4, cell % 4, 2 ** value)
 
     def act(self, game: Game) -> Direction:
+        if self.beam_snake_decay is not None and self.net.leaf_snake > 0:
+            set_snake_decay(self.beam_snake_decay)
         d = self.net.best_move(tiles_to_bits(game.board), self.depth, self.cutoff)
         if d < 0:
             raise ValueError("no legal moves")

@@ -1,45 +1,52 @@
-# Handoff: 2048 project state (shut down for the night on 2026-09-16, ~23:00)
+# Handoff: 2048 project state (updated 2026-09-17: cool mode solved at 3,931,768; nothing running)
 
 Everything needed to pick this up cold. Read this, then `README.md`. Repo:
 https://github.com/LoganBradley787/2048-rl (public, `main` is current).
 
 ## Where things stand (short version)
 
-- **Cool mode is solved for practical purposes.** The `snake` agent, which has no
-  trained tables at all (an untouched network contributes value 0), plays the
-  choose game with a beam search ranked by merges plus the snake-order heuristic
-  and reaches the **131072 tile with 3,670,068 points**, 93% of the ~3.93M
-  theoretical maximum, in about 4 minutes per game. Settings: width 128, depth
-  16, stride 4, snake weight 2, snake decay 0.9 (0.75 and a 256-wide beam at
-  decay 0.5 land in the same place). Widths 32/64 or decay 0.5 at width 128 stop
-  at 32768/65536.
-- The remaining 7% is placing 4s: restricted to 2s only (`tiles=1`) the beam finds
-  the *perfect* 2s line (1,835,012 = a flawless chain 65536..2 built from 2s) and
-  then dies, because the 131072 needs exactly one 4 at the end. `tiles=7` (both
-  tiles, each placed 4 charged its 4-point opportunity cost in the ranking) is
-  implemented and unit-tested but NOT yet played through; that is the next
-  experiment (`n.play_beam(games=1, width=128, depth=16, stride=4, snake=2.0,
-  tiles=7)` after `nt.set_snake_decay(0.9)`, expect ~3.9M).
+- **Cool mode is solved.** The `snake` agent, which has no trained tables at all
+  (an untouched network contributes value 0), plays the choose game with a beam
+  search ranked by merges plus the snake-order heuristic and reaches the
+  **131072 tile with 3,931,768 points**, 396 short of the 3,932,164 ceiling
+  (99.99%), in about 4 minutes per game (130,969 moves). Settings: width 128,
+  depth 16, stride 4, snake weight 2, snake decay 0.9, `tiles=12`.
+- The ceiling: score = (final board's value if every tile were built from 2s)
+  - 4 x (placed 4s). The best final board (one each of 131072..4) is worth
+  3,932,164. The old 3,670,068 game placed almost only 4s (costing the board
+  mass, 262,140). `tiles=1` (2s only) reaches the flawless 65536..2 chain,
+  1,835,012, then dies: the next level needs a 4. `tiles=7` (4s charged 4
+  points in the ranking) died at 65536 with 1,742,508, since a 4 still adds
+  twice the mass per step.
+- **2s first** (tiles bit 8, `beam_search` wrapper in `ntuple.c`): plan with 2s
+  only; when the best 2s-only line is dead at the horizon, replan with both tiles
+  (bit 4 still charges them) and cut the plan to its first step. The Python
+  replay (`beam_plan` loop) ended on the best board with 99 fours: 98 placed in
+  bursts of 7 or 8 at each full-chain cascade (moves 65521, 98280, 114656, ...),
+  plus a final 2 where a 4 scores the same. Fewer 4s per cascade is the only
+  gain left, at most a few hundred points.
+- Random spawns: `snake` now plays depth-3 expectimax with the snake bonus at the
+  leaves (`NTupleNet.leaf_snake` = 16, decay 0.9): 66k mean, 2048 in 24/24,
+  8192 in 12% (was 20k with value 0). An empty-cell leaf bonus (per empty cell,
+  scaled by the max tile) hurt at every weight from 0.01 to 64 and was removed.
+  Changing the snake decay now flushes search caches (`snake_epoch`). `ntuple`
+  (351k mean, 16384 in 98%) stays the random-spawn player.
 - The learned cool-mode tables are a liability in the endgame (best tables +
-  snake at width 64: 1.31M vs 1.61M without tables). They still matter for
-  random spawns, where `ntuple` (351k mean, 16384 in 98%) is the strong player
-  and `snake` is terrible (its move choice is a 3-ply expectimax on zero
-  values; the heuristic only lives in the beam).
-- Nothing is running. The 3-hour big-engine training run was stopped with
-  SIGINT at ~109k games (it saved `checkpoints/ntuple_big/latest.bin`, 3.3 GB,
-  and `weights.bin`); it is moot for cool mode now. Docker was stopped by the
-  user for memory; the dev server was stopped.
+  snake at width 64: 1.31M vs 1.61M without tables).
+- Nothing is running. The big-engine training run was stopped with SIGINT at
+  ~109k games (it saved `checkpoints/ntuple_big/latest.bin`, 3.3 GB, and
+  `weights.bin`); it is moot for cool mode now.
 
 ## Restart checklist
 
 1. `uv run pytest` (expect all green, ~4 min; one Hogwild-margin test is
    occasionally flaky under heavy CPU load).
 2. UI: preview "2048" in `.claude/launch.json` (or `uv run uvicorn game2048.server:app
-   --port 8048`). Cool mode + agent `snake` + Max speed shows the 131072 game.
-3. Next experiment: the `tiles=7` game above. If it beats 3.67M, make it the
-   `snake` agent's default (`beam_tiles=7` in `agents.py`).
-4. Optional: give `snake` a respectable random-spawn move (snake heuristic at
-   expectimax leaves) or label it cool-mode-only in the dropdown.
+   --port 8048`). Cool mode + agent `snake` + Max speed shows the 3.93M game.
+3. Optional: fewer 4s per cascade (e.g. a wider or deeper fallback beam, or a
+   heavier charge in the fallback) for the last few hundred points.
+4. Optional: a stronger random-spawn heuristic for `snake` (monotonicity and
+   merge terms); the snake gradient alone stalls at 8192.
 
 ## What exists and works
 

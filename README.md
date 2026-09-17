@@ -5,8 +5,8 @@ n-tuple network written in C that learns by afterstate temporal-difference
 self-play, tens of billions of moves in a few hours on a laptop, and plays with
 expectimax. In "cool mode", where the player places its own tiles, the game is
 a deterministic puzzle, and a beam search guided by a snake-order heuristic
-plays it to the 131072 tile and 3.67M points, about 93% of the theoretical
-maximum, with no training at all. A CNN value network is kept as a baseline.
+plays it to the 131072 tile and 3,931,768 points, 396 short of the 3,932,164
+ceiling, with no training at all. A CNN value network is kept as a baseline.
 The game rules, a FastAPI server and a plain HTML/JS board come with it, so you
 can play by hand, try cool mode yourself, or watch the agents at max speed.
 
@@ -292,17 +292,38 @@ steps ahead, four steps per plan. On the canonical game:
 | snake only, decay 0.5 | 64 x 16 | 1,614,376 | 65536 | 30,801 | 2.4 min |
 | snake only, decay 0.5 | 128 x 16 | 1,704,108 | 65536 | 32,806 | 2.3 min |
 | snake only, decay 0.75 | 128 x 16 | 3,670,436 | **131072** | 65,636 | 4.3 min |
-| snake only, decay 0.9 | 128 x 16 | **3,670,068** | **131072** | 65,544 | 4.2 min |
+| snake only, decay 0.9 | 128 x 16 | 3,670,068 | **131072** | 65,544 | 4.2 min |
+| decay 0.9, 2s only (`tiles=1`) | 128 x 16 | 1,835,012 | 65536 | | |
+| decay 0.9, 4s charged (`tiles=7`) | 128 x 16 | 1,742,508 | 65536 | 42,402 | 2.8 min |
+| decay 0.9, 2s first (`tiles=12`) | 128 x 16 | **3,931,768** | **131072** | 130,969 | 4.1 min |
 
-The theoretical maximum on a 4x4 board is about 3.93M, so the snake player is
-within 7% of perfect play. The gap is the 4s it places: restricted to 2s
-(`tiles=1`) the same beam finds the perfect 2s line, 1,835,012 points for a
-flawless chain from 65536 down to 2, and then stops, because the 131072 needs
-exactly one 4 at the very end. `tiles=7` charges each placed 4 its 4-point
-opportunity cost in the ranking so 4s are used only where they pay. Pick
-**snake** in the web UI with Cool mode and Max speed to watch it. Outside cool
-mode `snake` is weak (the heuristic only lives in the beam); use **ntuple**
-for random spawns.
+Where the ceiling comes from: every point is a merge, so a game's score is
+what its final board would be worth if every tile had been built from 2s,
+minus 4 for each 4 that was placed (a placed 4 skips the 2+2 merge). The best
+final board holds one of each tile from 131072 down to 4, worth 3,932,164, so
+past reaching that board the only thing left to optimize is the number of 4s.
+The 3,670,068 game placed almost nothing but 4s, which costs the whole board
+mass, 262,140 points.
+
+Restricted to 2s (`tiles=1`) the beam builds a flawless chain from 65536 down
+to 2 and then stops: the next level needs 17 tiles on 16 cells unless one of
+them arrives as a 4. Charging each placed 4 its 4 points in the ranking
+(`tiles=7`) is not enough on its own, because a 4 still adds twice the mass per
+step, and that game died at 65536. What works is **2s first** (`tiles=8`, or
+12 to also charge the 4s): plan with 2s only, and only when every 2s-only line
+dies within the 16-step horizon, plan again with 4s allowed and play just that
+plan's first step. That game ends on the best board with 99 fours, 98 placed
+in bursts of seven or eight at the 131072 cascade and at later full-chain
+cascades, plus a final 2 where a 4 would have scored the same: 3,931,768 points,
+99.99% of the ceiling. Twice as many moves, since every tile arrives as a 2,
+but the same wall time, since a 2s-only beam has half the candidates. Pick
+**snake** in the web UI with Cool mode and Max speed to watch it.
+
+With random spawns the snake agent plays depth-3 expectimax with the snake
+bonus at the leaves (`NTupleNet.leaf_snake`, weight 16, decay 0.9). Over 24
+games that averages 66k and reaches 2048 every time, but 8192 at best
+(without the bonus: 20k). A bonus for empty cells made it worse at every
+weight tried. For random spawns use **ntuple**.
 
 ```python
 net = nt.NTupleNet.load("checkpoints/ntuple_choose/weights.bin")

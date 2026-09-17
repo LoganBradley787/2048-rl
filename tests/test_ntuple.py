@@ -558,10 +558,13 @@ def test_ntuple_agent_chooses_move_and_placement(tmp_path):
 def test_train_choose_learns_to_place_tiles_well():
     # Games run to their natural end: cutting many games at a move cap leaves the
     # late boards ungrounded, values inflate and the policy collapses.
+    # Short choose-mode runs are chaotic: with four Hogwild threads about one run in
+    # four barely improves, and the evaluation is one canonical line. One thread
+    # makes the run deterministic (see the next test), so this cannot flake.
     n = nt.NTupleNet()
     before = n.play_choose(games=6, depth=1, topk=4, threads=3, seed=9, max_moves=30_000)["scores"].mean()
-    stats = n.train_choose(games=1500, threads=4, seed=1, max_moves=100_000)
-    assert stats["scores"].shape == (1500,) and (stats["moves"] > 0).all()
+    stats = n.train_choose(games=600, threads=1, seed=1, max_moves=100_000)
+    assert stats["scores"].shape == (600,) and (stats["moves"] > 0).all()
     after = n.play_choose(games=6, depth=1, topk=4, threads=3, seed=9, max_moves=30_000)["scores"].mean()
     assert after > 1.5 * before, (before, after)
     n.close()
@@ -866,6 +869,57 @@ def test_snake_decay_is_adjustable():
     assert nt.snake_score(chain) == pytest.approx(sum(t * 0.5 ** k for k, t in enumerate(tiles)))
 
 
+def test_leaf_snake_adds_the_snake_bonus_to_random_spawn_search_leaves():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(39)
+    try:
+        nt.set_snake_decay(0.5)
+        assert n.leaf_snake == 0.0
+        n.leaf_snake = 3.0
+        assert n.leaf_snake == 3.0
+        for _ in range(5):
+            bits = nt.to_bits(rand_exps(rng, density=0.6))
+            expected = max(r + 3.0 * nt.snake_score(after)
+                           for after, r in (nt.move(bits, m) for m in range(4)) if after != bits)
+            assert n.search_value(bits, depth=0) == pytest.approx(expected)
+        n.leaf_snake = 0.0
+        assert n.search_value(bits, depth=0) == pytest.approx(
+            max(r for after, r in (nt.move(bits, m) for m in range(4)) if after != bits))
+    finally:
+        n.close()
+
+
+def test_changing_the_snake_decay_flushes_cached_search_values():
+    a = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(40)
+    bits = nt.to_bits(rand_exps(rng, density=0.5))
+    try:
+        nt.set_snake_decay(0.5)
+        a.leaf_snake = 2.0
+        at_half = a.search_value(bits, depth=1)                     # fills a's cache
+        nt.set_snake_decay(0.9)
+        fresh = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+        fresh.leaf_snake = 2.0
+        assert a.search_value(bits, depth=1) == pytest.approx(fresh.search_value(bits, depth=1))
+        assert a.search_value(bits, depth=1) != pytest.approx(at_half)
+        fresh.close()
+    finally:
+        nt.set_snake_decay(0.5)
+        a.close()
+
+
+def test_leaf_snake_plays_random_spawn_games_better_than_rewards_alone():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    try:
+        nt.set_snake_decay(0.5)
+        plain = n.play(games=8, depth=2, threads=4, seed=3)["scores"].mean()
+        n.leaf_snake = 4.0
+        snake = n.play(games=8, depth=2, threads=4, seed=3)["scores"].mean()
+        assert snake > 1.5 * plain
+    finally:
+        n.close()
+
+
 def test_beam_can_be_restricted_to_placing_twos():
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
     rng = np.random.default_rng(36)
@@ -878,6 +932,48 @@ def test_beam_can_be_restricted_to_placing_twos():
     stats = n.play_beam(games=1, width=8, depth=4, threads=1, seed=1, max_moves=300, snake=2.0, tiles=1)
     assert stats["moves"][0] == 300
     n.close()
+
+
+def test_beam_twos_first_places_a_four_only_when_a_two_dead_ends():
+    # Only left and right move. Either leaves one empty cell where a 2 fills a board
+    # with no merge, while a 4 merges with its neighbour.
+    exps = np.array([[1, 1, 3, 4],
+                     [5, 6, 5, 2],
+                     [6, 5, 6, 5],
+                     [5, 6, 5, 6]])
+    bits = nt.to_bits(exps)
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    try:
+        nt.set_snake_decay(0.5)
+        twos = n.beam_plan(bits, width=64, depth=3, snake=2.0, tiles=1)
+        assert len(twos) == 1 and twos[0][2] == 1                       # a dead line: the board fills
+        for tiles in (8, 12):
+            plan = n.beam_plan(bits, width=64, depth=3, snake=2.0, tiles=tiles)
+            assert len(plan) == 1 and plan[0][2] == 2                   # the fallback: one step, a 4
+            after, _ = nt.move(bits, plan[0][0])
+            board = nt.with_cell(after, plan[0][1], plan[0][2])
+            assert any(nt.move(board, m)[0] != board for m in range(4))  # and the game goes on
+    finally:
+        n.close()
+
+
+def test_beam_twos_first_is_the_twos_only_plan_while_twos_survive():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(38)
+    try:
+        nt.set_snake_decay(0.5)
+        for _ in range(6):
+            bits = nt.to_bits(rand_exps(rng, density=0.3))
+            twos = n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=1)
+            assert len(twos) == 6
+            assert n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=12) == twos
+            assert n.beam_value(bits, width=16, depth=6, snake=2.0, tiles=12) == pytest.approx(
+                n.beam_value(bits, width=16, depth=6, snake=2.0, tiles=1))
+        stats = n.play_beam(games=1, width=8, depth=4, threads=1, seed=1, max_moves=300, stride=4, snake=2.0,
+                            tiles=12)
+        assert stats["moves"][0] == 300
+    finally:
+        n.close()
 
 
 def test_beam_can_charge_fours_their_opportunity_cost():

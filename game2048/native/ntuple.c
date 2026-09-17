@@ -175,6 +175,7 @@ typedef struct search_ctx {
     double cutoff;
     struct net *net;
     uint64_t version;
+    uint64_t epoch;          /* snake_epoch the cached values were computed under */
 } search_ctx_t;
 
 /* Stages: a board's stage is the number of tile-mass boundaries it has passed;
@@ -199,6 +200,7 @@ typedef struct net {
     uint64_t version;        /* bumped whenever weights change; search contexts flush on mismatch */
     search_ctx_t *main_ctx;  /* for single-threaded best_move calls */
     search_ctx_t *choose_ctx; /* same, for the choose-mode search (its own transposition table) */
+    double leaf_snake;       /* weight of snake_score added to expectimax leaves (0 = tables only) */
 } net_t;
 
 static inline int64_t board_mass(board_t b) {
@@ -242,6 +244,7 @@ static double snake_w[16];
 static pthread_once_t snake_once = PTHREAD_ONCE_INIT;
 
 static double snake_decay = 0.5;
+static uint64_t snake_epoch = 0;   /* bumped when the decay changes, so search caches flush */
 
 static void snake_init(void) {
     for (int sym = 0; sym < 8; sym++)
@@ -254,8 +257,10 @@ static void snake_init(void) {
  * while games are being played. */
 void nt_set_snake_decay(double d) {
     pthread_once(&snake_once, snake_init);
+    if (d == snake_decay) return;
     snake_decay = d;
     for (int k = 0; k < 16; k++) snake_w[k] = pow(d, k);
+    snake_epoch++;
 }
 
 static double snake_score(board_t b) {
@@ -554,6 +559,7 @@ static search_ctx_t *ctx_create_tt(net_t *net, double cutoff, int use_tt) {
     c->cutoff = cutoff;
     c->net = net;
     c->version = net->version;
+    c->epoch = snake_epoch;
     return c;
 }
 
@@ -562,10 +568,11 @@ static search_ctx_t *ctx_create(net_t *net, double cutoff) {
 }
 
 static void ctx_sync(search_ctx_t *c, double cutoff) {
-    if (c->version != c->net->version || c->cutoff != cutoff) {
+    if (c->version != c->net->version || c->cutoff != cutoff || c->epoch != snake_epoch) {
         if (c->tt) memset(c->tt, 0, ((size_t)1 << TT_BITS) * sizeof(tt_entry_t));
         c->version = c->net->version;
         c->cutoff = cutoff;
+        c->epoch = snake_epoch;
     }
 }
 
@@ -577,8 +584,26 @@ static void ctx_free(search_ctx_t *c) {
 
 static double max_node(search_ctx_t *c, board_t b, int depth, double prob);
 
+/* Random-spawn search leaves: the tables, plus the snake-order bonus when the net
+ * has a leaf weight (a heuristic player on empty tables). */
+static inline double leaf_value(const net_t *net, board_t a) {
+    double v = net_value(net, a);
+    if (net->leaf_snake > 0.0) v += net->leaf_snake * snake_score(a);
+    return v;
+}
+
+void nt_set_leaf_snake(void *p, double w) {
+    net_t *net = (net_t *)p;
+    if (w < 0.0) w = 0.0;
+    if (net->leaf_snake == w) return;
+    net->leaf_snake = w;
+    net->version++;                           /* cached search values are stale */
+}
+
+double nt_leaf_snake(void *p) { return ((net_t *)p)->leaf_snake; }
+
 static double chance_node(search_ctx_t *c, board_t after, int depth, double prob) {
-    if (depth == 0 || prob < c->cutoff) return net_value(c->net, after);
+    if (depth == 0 || prob < c->cutoff) return leaf_value(c->net, after);
     size_t h = tt_hash(after);
     tt_entry_t *e = &c->tt[h];
     if (e->key == after && e->depth == depth) return e->val;
@@ -928,9 +953,10 @@ static int beam_cmp(const void *x, const void *y) {
 /* tiles: bitmask of placements allowed, 1 = a 2, 2 = a 4 (3 = both). Placing only 2s
  * earns every 2+2 merge and approaches the theoretical maximum score, but the
  * 131072 needs one 4 at the very end; bit 4 charges each placed 4 the 4 points it
- * forfeits (in the ranking only), so 4s are used just where they earn more. */
-static int beam_search(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
-                       int *moves, int *cells, int *values, double *score) {
+ * forfeits (in the ranking only). Bit 8 is handled by beam_search below.
+ * *alive gets whether the best line can still move at the end of the horizon. */
+static int beam_search_raw(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
+                           int *moves, int *cells, int *values, double *score, int *alive) {
     if (width < 1) width = 1;
     if (depth < 1) depth = 1;
     if (spread < 0) spread = 0;
@@ -1024,14 +1050,33 @@ static int beam_search(net_t *net, board_t b, int width, int depth, int spread, 
             idx2 = e->parent;
         }
         *score = lev[(size_t)L * width].score;
+        *alive = lev[(size_t)L * width].alive;
     } else {
         *score = 0.0;
+        *alive = 0;
     }
     free(lev);
     free(cand);
     free(seen);
     free(kids);
     return len;
+}
+
+/* Bit 8 of tiles = 2s first: plan with 2s only, and only when the best 2s-only
+ * line dies within the horizon plan again with 4s allowed (bit 4 still charges
+ * them). With a snake bonus and no negative values a live line always outranks a
+ * dead one, so that means every 2s-only line in the beam dies. A fallback plan is
+ * cut to its first step, so the next plan tries 2s again: 4s are placed only when
+ * 2s cannot keep the game going. */
+static int beam_search(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
+                       int *moves, int *cells, int *values, double *score) {
+    int alive;
+    if (!(tiles & 8))
+        return beam_search_raw(net, b, width, depth, spread, snake, tiles, moves, cells, values, score, &alive);
+    int len = beam_search_raw(net, b, width, depth, spread, snake, 1, moves, cells, values, score, &alive);
+    if (len > 0 && alive) return len;
+    len = beam_search_raw(net, b, width, depth, spread, snake, 3 | (tiles & 4), moves, cells, values, score, &alive);
+    return len < 1 ? len : 1;
 }
 
 #define BEAM_MAX_DEPTH 256

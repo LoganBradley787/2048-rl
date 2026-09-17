@@ -99,6 +99,7 @@ def test_snake_agent_needs_no_weights_and_plays_cool_mode():
     agent = make_agent("snake")                              # beam search on the snake heuristic alone
     assert agent.beam_width > 0 and agent.beam_snake > 0 and agent.net is not None
     assert agent.beam_snake_decay == 0.9                      # every tile on the path counts, not just the head
+    assert agent.beam_tiles == 12                             # 2s first: a 4 only when a 2 dead-ends
     game = Game(seed=2, spawn_mode="choose")
     for _ in range(6):
         direction, (row, col, value) = agent.choose(game)
@@ -107,3 +108,17 @@ def test_snake_agent_needs_no_weights_and_plays_cool_mode():
         game.place(row, col, value)
     assert game.score > 0
     assert "snake" in AGENTS
+
+
+def test_snake_agent_plays_random_spawns_on_the_snake_heuristic():
+    from game2048.core import Game
+    agent = make_agent("snake")
+    assert agent.net.leaf_snake == 16.0 and agent.depth == 3
+    game = Game(seed=3)
+    for _ in range(40):
+        if game.is_over():
+            break
+        direction = agent.act(game)
+        assert direction in game.legal_moves()
+        game.move(direction)
+    assert game.score > 0

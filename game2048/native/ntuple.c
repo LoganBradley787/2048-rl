@@ -925,11 +925,14 @@ static int beam_cmp(const void *x, const void *y) {
 
 /* Writes the best line's steps to moves/cells/values (each of size `depth`) and
  * returns its length (0 if the root has no move); *score gets the line's value. */
-static int beam_search(net_t *net, board_t b, int width, int depth, int spread, double snake, int *moves,
-                       int *cells, int *values, double *score) {
+/* tiles: bitmask of placements allowed, 1 = a 2, 2 = a 4 (3 = both). Placing only 2s
+ * earns every 2+2 merge and approaches the theoretical maximum score. */
+static int beam_search(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
+                       int *moves, int *cells, int *values, double *score) {
     if (width < 1) width = 1;
     if (depth < 1) depth = 1;
     if (spread < 0) spread = 0;
+    if ((tiles & 3) == 0) tiles = 3;
     size_t cap = (size_t)width * 121;            /* 4 moves x 30 placements, plus carried dead lines */
     size_t hcap = 1;
     while (hcap < 2 * cap) hcap <<= 1;
@@ -963,6 +966,7 @@ static int beam_search(net_t *net, board_t b, int width, int depth, int spread, 
                 for (int c = 0; c < 16; c++) {
                     if (cell(a, c)) continue;
                     for (board_t v = 1; v <= 2; v++) {
+                        if (!(tiles & (1 << (v - 1)))) continue;
                         board_t s2 = a | put((int)v, c);
                         size_t h = (size_t)(hash128(s2) >> (64 - hbits));
                         while (seen[h] && seen[h] != s2) h = (h + 1) & (hcap - 1);
@@ -1030,39 +1034,39 @@ static int beam_search(net_t *net, board_t b, int width, int depth, int spread, 
 
 #define BEAM_MAX_DEPTH 256
 
-int nt_beam_plan(void *p, uint64_t lo, uint64_t hi, int width, int depth, int spread, double snake,
+int nt_beam_plan(void *p, uint64_t lo, uint64_t hi, int width, int depth, int spread, double snake, int tiles,
                  int *moves, int *cells, int *values) {
     board_t b = mk(lo, hi);
     double score;
     if (depth > BEAM_MAX_DEPTH) depth = BEAM_MAX_DEPTH;
-    return beam_search((net_t *)p, b, width, depth, spread, snake, moves, cells, values, &score);
+    return beam_search((net_t *)p, b, width, depth, spread, snake, tiles, moves, cells, values, &score);
 }
 
-int nt_beam_choose(void *p, uint64_t lo, uint64_t hi, int width, int depth, int spread, double snake,
+int nt_beam_choose(void *p, uint64_t lo, uint64_t hi, int width, int depth, int spread, double snake, int tiles,
                    int *cell_out, int *value) {
     board_t b = mk(lo, hi);
     int moves[BEAM_MAX_DEPTH], cells[BEAM_MAX_DEPTH], values[BEAM_MAX_DEPTH];
     double score;
     if (depth > BEAM_MAX_DEPTH) depth = BEAM_MAX_DEPTH;
-    int len = beam_search((net_t *)p, b, width, depth, spread, snake, moves, cells, values, &score);
+    int len = beam_search((net_t *)p, b, width, depth, spread, snake, tiles, moves, cells, values, &score);
     if (len == 0) { *cell_out = -1; *value = 0; return -1; }
     *cell_out = cells[0];
     *value = values[0];
     return moves[0];
 }
 
-double nt_beam_value(void *p, uint64_t lo, uint64_t hi, int width, int depth, int spread, double snake) {
+double nt_beam_value(void *p, uint64_t lo, uint64_t hi, int width, int depth, int spread, double snake, int tiles) {
     board_t b = mk(lo, hi);
     int moves[BEAM_MAX_DEPTH], cells[BEAM_MAX_DEPTH], values[BEAM_MAX_DEPTH];
     double score;
     if (depth > BEAM_MAX_DEPTH) depth = BEAM_MAX_DEPTH;
-    beam_search((net_t *)p, b, width, depth, spread, snake, moves, cells, values, &score);
+    beam_search((net_t *)p, b, width, depth, spread, snake, tiles, moves, cells, values, &score);
     return score;
 }
 
 typedef struct {
     net_t *net;
-    int width, depth, stride, spread;
+    int width, depth, stride, spread, tiles;
     double snake;
     long *next, n, max_moves, prefix;
     uint64_t seed;
@@ -1082,7 +1086,7 @@ static void *beam_worker(void *arg) {
         int32_t mv = 0;
         while (mv < j->max_moves) {
             double score;
-            int len = beam_search(j->net, b, j->width, j->depth, j->spread, j->snake, moves, cells, values, &score);
+            int len = beam_search(j->net, b, j->width, j->depth, j->spread, j->snake, j->tiles, moves, cells, values, &score);
             if (len == 0) break;
             int take = j->stride < len ? j->stride : len;   /* commit the first `stride` steps */
             if (mv < j->prefix) take = 1;                   /* a random spawn breaks the plan */
@@ -1102,8 +1106,9 @@ static void *beam_worker(void *arg) {
     return NULL;
 }
 
-void nt_play_beam(void *p, long games, int width, int depth, int stride, int spread, double snake, int threads,
-                  uint64_t seed, long max_moves, long prefix, int64_t *scores, int32_t *maxtiles, int32_t *moves) {
+void nt_play_beam(void *p, long games, int width, int depth, int stride, int spread, double snake, int tiles,
+                  int threads, uint64_t seed, long max_moves, long prefix, int64_t *scores, int32_t *maxtiles,
+                  int32_t *moves) {
     net_t *net = (net_t *)p;
     if (threads < 1) threads = 1;
     if (stride < 1) stride = 1;
@@ -1112,7 +1117,7 @@ void nt_play_beam(void *p, long games, int width, int depth, int stride, int spr
     beam_job_t *jobs = (beam_job_t *)malloc(sizeof(beam_job_t) * threads);
     long next = 0;
     for (int t = 0; t < threads; t++) {
-        jobs[t] = (beam_job_t){net, width, depth, stride, spread, snake, &next, games, max_moves, prefix, seed, scores, maxtiles, moves};
+        jobs[t] = (beam_job_t){net, width, depth, stride, spread, tiles, snake, &next, games, max_moves, prefix, seed, scores, maxtiles, moves};
         pthread_create(&tid[t], NULL, beam_worker, &jobs[t]);
     }
     for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);

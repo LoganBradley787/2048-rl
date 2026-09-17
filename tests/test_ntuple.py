@@ -862,3 +862,17 @@ def test_snake_decay_is_adjustable():
     finally:
         nt.set_snake_decay(0.5)
     assert nt.snake_score(chain) == pytest.approx(sum(t * 0.5 ** k for k, t in enumerate(tiles)))
+
+
+def test_beam_can_be_restricted_to_placing_twos():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(36)
+    for _ in range(5):
+        bits = nt.to_bits(rand_exps(rng, density=0.5))
+        plan = n.beam_plan(bits, width=8, depth=6, snake=2.0, tiles=1)
+        assert plan and all(v == 1 for _, _, v in plan)               # only 2s
+        plan4 = n.beam_plan(bits, width=8, depth=6, snake=2.0, tiles=2)
+        assert plan4 and all(v == 2 for _, _, v in plan4)             # only 4s
+    stats = n.play_beam(games=1, width=8, depth=4, threads=1, seed=1, max_moves=300, snake=2.0, tiles=1)
+    assert stats["moves"][0] == 300
+    n.close()

@@ -162,12 +162,12 @@ def lib() -> ctypes.CDLL:
                                  P(i64), P(i32), P(i32)]
     L.nt_train_choose.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, i32, i32, ctypes.c_long, f64,
                                   P(u64), ctypes.c_long, f64, P(i64), P(i32), P(i32)]
-    L.nt_beam_choose.argtypes, L.nt_beam_choose.restype = [vp, u64, u64, i32, i32, i32, f64, P(i32), P(i32)], i32
+    L.nt_beam_choose.argtypes, L.nt_beam_choose.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32)], i32
     L.nt_snake_score.argtypes, L.nt_snake_score.restype = [u64, u64], f64
     L.nt_set_snake_decay.argtypes = [f64]
-    L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64], f64
-    L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, P(i32), P(i32), P(i32)], i32
-    L.nt_play_beam.argtypes = [vp, ctypes.c_long, i32, i32, i32, i32, f64, i32, u64, ctypes.c_long, ctypes.c_long,
+    L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
+    L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32), P(i32)], i32
+    L.nt_play_beam.argtypes = [vp, ctypes.c_long, i32, i32, i32, i32, f64, i32, i32, u64, ctypes.c_long, ctypes.c_long,
                                P(i64), P(i32), P(i32)]
     L.nt_save.argtypes, L.nt_save.restype = [vp, cp], i32
     L.nt_save_ex.argtypes, L.nt_save_ex.restype = [vp, cp, i32], i32
@@ -462,40 +462,44 @@ class NTupleNet:
 
     # --- beam search: plan a line of the deterministic choose game ------------
 
-    def beam_value(self, bits: int, width: int = 64, depth: int = 16, spread: int = 0, snake: float = 0.0) -> float:
+    def beam_value(self, bits: int, width: int = 64, depth: int = 16, spread: int = 0, snake: float = 0.0,
+                   tiles: int = 3) -> float:
         """Value of the best line found by a beam of `width` boards over `depth`
         move+placement steps; unlimited width equals the full tree of that depth.
         `spread` > 0 caps the survivors per parent so the beam covers distinct lines;
-        `snake` adds that weight times `snake_score` to every leaf."""
-        return float(self._lib.nt_beam_value(self._h, *_lohi(bits), int(width), int(depth), int(spread), float(snake)))
+        `snake` adds that weight times `snake_score` to every leaf. `tiles` is a mask of
+        the placements allowed: 1 = 2s only, 2 = 4s only, 3 = both."""
+        return float(self._lib.nt_beam_value(self._h, *_lohi(bits), int(width), int(depth), int(spread), float(snake),
+                                             int(tiles)))
 
     def beam_choose(self, bits: int, width: int = 64, depth: int = 16, spread: int = 0,
-                    snake: float = 0.0) -> tuple[int, int, int]:
+                    snake: float = 0.0, tiles: int = 3) -> tuple[int, int, int]:
         """(move, cell 0..15, tile exponent 1 or 2) starting the best line; move -1 if stuck."""
         cell_, value = ctypes.c_int(-1), ctypes.c_int(0)
         m = int(self._lib.nt_beam_choose(self._h, *_lohi(bits), int(width), int(depth), int(spread), float(snake),
-                                         ctypes.byref(cell_), ctypes.byref(value)))
+                                         int(tiles), ctypes.byref(cell_), ctypes.byref(value)))
         return m, cell_.value, value.value
 
     def beam_plan(self, bits: int, width: int = 64, depth: int = 16, spread: int = 0,
-                  snake: float = 0.0) -> list[tuple[int, int, int]]:
+                  snake: float = 0.0, tiles: int = 3) -> list[tuple[int, int, int]]:
         """The best line found: [(move, cell, tile exponent), ...], empty when stuck."""
         depth = int(depth)
         moves, cells, values = (ctypes.c_int * depth)(), (ctypes.c_int * depth)(), (ctypes.c_int * depth)()
         n = int(self._lib.nt_beam_plan(self._h, *_lohi(bits), int(width), depth, int(spread), float(snake),
-                                       moves, cells, values))
+                                       int(tiles), moves, cells, values))
         return [(moves[i], cells[i], values[i]) for i in range(n)]
 
     def play_beam(self, games: int, width: int = 64, depth: int = 16, threads: int = 1, seed: int = 0,
                   max_moves: int = 200_000, stride: int = 1, spread: int = 0, prefix: int = 0,
-                  snake: float = 0.0) -> dict:
+                  snake: float = 0.0, tiles: int = 3) -> dict:
         """Play with beam search; `stride` steps of each plan are committed before
         re-planning; the first `prefix` moves get random spawns (see play_choose)."""
         scores = (ctypes.c_int64 * games)()
         maxtiles = (ctypes.c_int32 * games)()
         moves = (ctypes.c_int32 * games)()
-        self._lib.nt_play_beam(self._h, games, int(width), int(depth), int(stride), int(spread), float(snake), threads,
-                               seed & 0xFFFFFFFFFFFFFFFF, int(max_moves), int(prefix), scores, maxtiles, moves)
+        self._lib.nt_play_beam(self._h, games, int(width), int(depth), int(stride), int(spread), float(snake),
+                               int(tiles), threads, seed & 0xFFFFFFFFFFFFFFFF, int(max_moves), int(prefix),
+                               scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
 
     def train_choose(self, games: int, threads: int = 1, alpha: float = 1.0, seed: int = 0,
@@ -550,7 +554,7 @@ class NTupleAgent:
     def __init__(self, weights=None, depth: int = 3, cutoff: float = 0.0, choose_depth: int = 3,
                  topk: int = 4, beam_width: int = 0, beam_depth: int = 16, beam_stride: int = 1,
                  beam_spread: int = 0, beam_snake: float = 0.0, beam_snake_decay: float | None = None,
-                 net: "NTupleNet | None" = None) -> None:
+                 beam_tiles: int = 3, net: "NTupleNet | None" = None) -> None:
         if net is not None:                 # a ready network, e.g. an empty one for a heuristic-only player
             self.net = net
         else:
@@ -570,6 +574,7 @@ class NTupleAgent:
         self.beam_spread = beam_spread    # survivors per parent (0 = unlimited)
         self.beam_snake = beam_snake      # weight of the snake-order bonus at the leaves
         self.beam_snake_decay = beam_snake_decay   # process-wide snake decay applied before each plan (None = leave)
+        self.beam_tiles = beam_tiles      # placements allowed: 1 = 2s, 2 = 4s, 3 = both
         self._plan: list[tuple[int, int, int]] = []
         self._plan_board = -1             # board the next cached step applies to
 
@@ -578,7 +583,7 @@ class NTupleAgent:
             if self.beam_snake_decay is not None:
                 set_snake_decay(self.beam_snake_decay)
             self._plan = self.net.beam_plan(bits, self.beam_width, self.beam_depth, self.beam_spread,
-                                            self.beam_snake)[: max(1, self.beam_stride)]
+                                            self.beam_snake, self.beam_tiles)[: max(1, self.beam_stride)]
         if not self._plan:
             return -1, -1, 0
         m, cell, value = self._plan.pop(0)

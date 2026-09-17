@@ -92,3 +92,17 @@ def test_cool_agent_reads_search_settings_saved_beside_its_weights(monkeypatch, 
     (tmp_path / "best.json").unlink()
     agent = make_agent("ntuple-cool")                       # no settings file: the defaults
     assert agent.beam_width == 32 and agent.beam_depth == 12 and agent.beam_stride == 4
+
+
+def test_snake_agent_needs_no_weights_and_plays_cool_mode():
+    from game2048.core import Game
+    agent = make_agent("snake")                              # beam search on the snake heuristic alone
+    assert agent.beam_width > 0 and agent.beam_snake > 0 and agent.net is not None
+    game = Game(seed=2, spawn_mode="choose")
+    for _ in range(6):
+        direction, (row, col, value) = agent.choose(game)
+        assert direction in game.legal_moves() and value in (2, 4)
+        game.move(direction)
+        game.place(row, col, value)
+    assert game.score > 0
+    assert "snake" in AGENTS

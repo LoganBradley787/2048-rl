@@ -542,13 +542,16 @@ class NTupleAgent:
 
     def __init__(self, weights=None, depth: int = 3, cutoff: float = 0.0, choose_depth: int = 3,
                  topk: int = 4, beam_width: int = 0, beam_depth: int = 16, beam_stride: int = 1,
-                 beam_spread: int = 0, beam_snake: float = 0.0) -> None:
-        path = resolve_weights(weights)
-        if not path.exists():
-            raise FileNotFoundError(
-                f"no n-tuple weights at {path}; train some with `uv run python -m game2048.ntuple_train`"
-            )
-        self.net = NTupleNet.load(path)
+                 beam_spread: int = 0, beam_snake: float = 0.0, net: "NTupleNet | None" = None) -> None:
+        if net is not None:                 # a ready network, e.g. an empty one for a heuristic-only player
+            self.net = net
+        else:
+            path = resolve_weights(weights)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"no n-tuple weights at {path}; train some with `uv run python -m game2048.ntuple_train`"
+                )
+            self.net = NTupleNet.load(path)
         self.depth = depth
         self.cutoff = cutoff
         self.choose_depth = choose_depth

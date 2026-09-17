@@ -68,12 +68,23 @@ def _ntuple_cool_agent() -> Agent:
                        beam_stride=cfg["stride"], beam_snake=cfg["snake"])
 
 
+def _snake_agent() -> Agent:
+    """No training at all: beam search over the choose game scoring boards by their
+    merges plus the snake-order heuristic (an untouched network contributes 0).
+    64 lines, 16 steps, snake weight 2: 1.61M with a 65536 on the canonical game."""
+    from .ntuple import NTupleAgent, NTupleNet
+
+    return NTupleAgent(net=NTupleNet(patterns=[[0, 1, 2, 3]], tc=False), beam_width=64, beam_depth=16,
+                       beam_stride=4, beam_snake=2.0)
+
+
 AGENTS: dict[str, Callable[[], Agent]] = {
     "random": RandomAgent,
     "greedy": GreedyAgent,
     "nn": _nn_agent,
     "ntuple": _ntuple_agent,
     "ntuple-cool": _ntuple_cool_agent,
+    "snake": _snake_agent,
 }
 
 

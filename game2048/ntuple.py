@@ -158,7 +158,7 @@ def lib() -> ctypes.CDLL:
     L.nt_play_choose.argtypes = [vp, ctypes.c_long, i32, i32, i32, u64, ctypes.c_long, ctypes.c_long,
                                  P(i64), P(i32), P(i32)]
     L.nt_train_choose.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, i32, i32, ctypes.c_long, f64,
-                                  P(i64), P(i32), P(i32)]
+                                  P(u64), ctypes.c_long, f64, P(i64), P(i32), P(i32)]
     L.nt_beam_choose.argtypes, L.nt_beam_choose.restype = [vp, u64, u64, i32, i32, i32, f64, P(i32), P(i32)], i32
     L.nt_snake_score.argtypes, L.nt_snake_score.restype = [u64, u64], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64], f64
@@ -219,6 +219,44 @@ def spawn(bits: int, seed: int) -> int:
     lo, hi = ctypes.c_uint64(0), ctypes.c_uint64(0)
     lib().nt_spawn(*_lohi(bits), ctypes.byref(state), ctypes.byref(lo), ctypes.byref(hi))
     return lo.value | (hi.value << 64)
+
+
+def board_mass(bits: int) -> int:
+    """Sum of all tiles on the board."""
+    return sum(1 << cell(bits, i) for i in range(16) if cell(bits, i))
+
+
+def harvest_starts(net, games: int = 1, min_mass: int = 40_000, every: int = 200, width: int = 32,
+                   depth: int = 12, stride: int = 4, snake: float = 0.0, seed: int = 0,
+                   max_moves: int = 200_000) -> np.ndarray:
+    """Play the choose game with the beam and record a board every `every` moves
+    once the tile mass reaches `min_mass`. Returns (n, 4, 4) uint8 exponent grids
+    to feed back to training as late-game starts (see `train_choose(starts=...)`)."""
+    grids = []
+    for g in range(games):
+        b = spawn(spawn(0, seed * 7919 + g), seed * 7919 + g + 1)
+        moves, plan = 0, []
+        while moves < max_moves:
+            if not plan:
+                plan = net.beam_plan(b, width, depth, 0, snake)[: max(1, stride)]
+            if not plan:
+                break
+            m, c, v = plan.pop(0)
+            b, _ = move(b, m)
+            b = with_cell(b, c, v)
+            moves += 1
+            if moves % every == 0 and board_mass(b) >= min_mass:
+                grids.append(from_bits(b))
+    return np.array(grids, dtype=np.uint8).reshape(-1, 4, 4)
+
+
+def save_starts(path, grids) -> None:
+    np.save(path, np.asarray(grids, dtype=np.uint8).reshape(-1, 4, 4))
+
+
+def load_starts(path) -> list[int]:
+    """Saved start grids -> list of bitboards."""
+    return [to_bits(g) for g in np.load(path)]
 
 
 def snake_score(bits: int) -> float:
@@ -440,18 +478,23 @@ class NTupleNet:
 
     def train_choose(self, games: int, threads: int = 1, alpha: float = 1.0, seed: int = 0,
                      max_moves: int = 200_000, alpha_plain: float | None = None, depth: int = 1,
-                     topk: int = 4, explore: float = 0.0) -> dict:
+                     topk: int = 4, explore: float = 0.0, starts=None, start_frac: float = 0.0) -> dict:
         """Self-play TD(0) learning of the choose game: the agent places every tile,
         picking move and placement with the choose search at `depth`. Games are cut
         at `max_moves` (without a terminal update). With probability `explore` a step
         places a random tile instead, so games leave the one line a deterministic
-        policy replays. Returns per-game stats."""
+        policy replays. `starts` is a list of bitboards; a `start_frac` share of the
+        games begins from one of them instead of two tiles (late-game restarts, so
+        the endgame gets trained more than once per 30k-move game). Returns per-game stats."""
         ap = alpha if alpha_plain is None else alpha_plain
         scores = (ctypes.c_int64 * games)()
         maxtiles = (ctypes.c_int32 * games)()
         moves = (ctypes.c_int32 * games)()
+        starts = list(starts or [])
+        packed = (ctypes.c_uint64 * max(2, 2 * len(starts)))(*[h for b in starts for h in _lohi(b)])
         self._lib.nt_train_choose(self._h, games, threads, float(alpha), float(ap), seed & 0xFFFFFFFFFFFFFFFF,
-                                  int(depth), int(topk), int(max_moves), float(explore), scores, maxtiles, moves)
+                                  int(depth), int(topk), int(max_moves), float(explore),
+                                  packed, len(starts), float(start_frac), scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
 
     def play(self, games: int, depth: int = 1, cutoff: float = 0.0, threads: int = 1, seed: int = 0) -> dict:

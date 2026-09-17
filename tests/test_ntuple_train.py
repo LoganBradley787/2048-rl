@@ -82,11 +82,16 @@ def test_time_budget_ignores_wall_clock_jumps(tmp_path, monkeypatch):
 
 
 def test_train_cli_choose_flag_trains_and_evaluates_in_choose_mode(tmp_path):
+    import numpy as np
+    from game2048 import ntuple as nt
+    starts = tmp_path / "starts.npy"
+    nt.save_starts(starts, np.array([[[10, 9, 8, 7], [3, 4, 5, 6], [2, 1, 0, 0], [0, 0, 0, 0]]], dtype=np.uint8))
     tr.main(["--games", "60", "--chunk", "30", "--threads", "2", "--out", str(tmp_path), "--choose",
              "--max-moves", "500", "--eval-every-min", "0", "--save-every-min", "0", "--eval-at-end",
-             "--eval-games", "3", "--eval-depth", "1", "--eval-prefix", "5", "--explore", "0.02"])
+             "--eval-games", "3", "--eval-depth", "1", "--eval-prefix", "5", "--explore", "0.02",
+             "--starts", str(starts), "--start-frac", "0.5"])
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["choose"] is True and state["games"] == 60 and state["eval_prefix"] == 5
-    assert state["explore"] == 0.02
+    assert state["explore"] == 0.02 and state["starts"] == str(starts) and state["start_frac"] == 0.5
     ev = rows(tmp_path / "eval.csv")
     assert len(ev) == 1 and ev[0]["mode"] == "choose"

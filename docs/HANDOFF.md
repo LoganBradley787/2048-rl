@@ -184,6 +184,23 @@ the value function learns 65536 and 131072:
   the 4-hour tables on the new engine into `checkpoints/ntuple_big/` for 3 h with
   `--explore 0.02` (3.3 GB pinned), evals every 30 min at depth 3, 2 games.
 
+## Late-game restarts and the snake verdict (2026-09-16, late)
+
+- Snake sweep on the 4-hour tables (beam w32 d12 stride 4, canonical game):
+  weight 0 -> 1,294,752; 0.5 -> 1,283,128; **1.0 -> 1,534,512 (65536)**; 2.0 ->
+  795k; 4.0 -> 713k; 8.0 -> 802k (the last three stall at 32768). `ntuple-cool`
+  now plays with `beam_snake=1.0`.
+- Late-game restarts: `train_choose(starts=[bitboards], start_frac=p)` / CLI
+  `--starts file.npy --start-frac p` start that share of games from saved boards;
+  `nt.harvest_starts(net, games, min_mass, every, ...)` records boards from beam
+  games past a tile mass, `save_starts`/`load_starts` (.npy of 4x4 exponent grids).
+  The queued big-engine run (`scratchpad/launch_big.sh`) now waits for
+  `checkpoints/ntuple_big/starts.npy` (harvested from the current tables, mass
+  >= 40k, every 150 moves, snake 1.0 and 0 lines) and uses `--start-frac 0.3`.
+- The full suite passed 194/195 under heavy load; the one failure
+  (`test_play_choose_scores_far_above_random_spawns`) passes on rerun (a Hogwild
+  margin under contention).
+
 ## Machine constraints (important)
 
 - 19 GB RAM, but Docker's VMs hold ~9 GB; swap ran 4-10 GB. Pinned tables above

@@ -821,3 +821,30 @@ def test_ntuple_agent_accepts_a_snake_weight(tmp_path):
         game.move(direction)
         game.place(row, col, value)
     assert game.score > 0
+
+
+# --- late-game restarts -------------------------------------------------------------
+
+def test_train_choose_can_start_games_from_saved_boards():
+    late = nt.to_bits(np.array([[15, 14, 13, 12], [8, 9, 10, 11], [7, 6, 5, 4], [0, 0, 1, 2]], dtype=np.uint8))
+    a, b, c = nt.NTupleNet(), nt.NTupleNet(), nt.NTupleNet()
+    fresh = a.train_choose(games=10, threads=1, seed=3, max_moves=400)
+    same = b.train_choose(games=10, threads=1, seed=3, max_moves=400, starts=[late], start_frac=0.0)
+    assert np.array_equal(fresh["scores"], same["scores"])            # frac 0: nothing changes
+    late_runs = c.train_choose(games=10, threads=1, seed=3, max_moves=400, starts=[late], start_frac=1.0)
+    assert (late_runs["max_tiles"] >= 32768).all()                    # every game started from the late board
+    assert not np.array_equal(late_runs["scores"], fresh["scores"])
+    a.close(); b.close(); c.close()
+
+
+def test_harvest_starts_collects_boards_past_a_mass_threshold(tmp_path):
+    n = nt.NTupleNet()
+    n.train_choose(games=100, threads=2, seed=6, max_moves=100_000)
+    grids = nt.harvest_starts(n, games=2, min_mass=600, every=25, width=4, depth=3, seed=1, max_moves=1500)
+    assert grids.ndim == 3 and grids.shape[1:] == (4, 4) and len(grids) > 0
+    assert all(sum(1 << int(v) for v in g.reshape(16) if v) >= 600 for g in grids)   # int(): uint8 shifts overflow
+    path = tmp_path / "starts.npy"
+    nt.save_starts(path, grids)
+    loaded = nt.load_starts(path)
+    assert len(loaded) == len(grids) and all(nt.cell(b, 0) == g[0, 0] for b, g in zip(loaded, grids))
+    n.close()

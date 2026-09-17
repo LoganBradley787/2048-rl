@@ -80,6 +80,10 @@ def main(argv=None) -> None:
                    help="cut choose-mode games at this many moves; a guard only, see above")
     p.add_argument("--explore", type=float, default=0.0,
                    help="choose-mode training: probability per step of placing a random tile instead of the searched one")
+    p.add_argument("--starts", default=None,
+                   help="choose-mode training: .npy of saved late boards (see ntuple.harvest_starts) to restart games from")
+    p.add_argument("--start-frac", type=float, default=0.5,
+                   help="share of choose-mode games that begin from a saved board when --starts is given")
     p.add_argument("--eval-prefix", type=int, default=0,
                    help="choose-mode evaluations: kind random spawns for this many moves first (games still "
                         "funnel into one line, so 2 eval games are enough)")
@@ -101,6 +105,9 @@ def main(argv=None) -> None:
                            tc_stages=tc_stages)
         state = {}
     choose = bool(args.choose or state.get("choose", False))
+    starts = nt.load_starts(args.starts) if args.starts else []
+    if starts:
+        print(f"{len(starts)} saved late boards; {args.start_frac:.0%} of games restart from one", flush=True)
     locked = bool(args.lock_memory) and net.lock_memory()
     if args.lock_memory and not locked:
         print("warning: could not lock the tables in memory", flush=True)
@@ -126,7 +133,8 @@ def main(argv=None) -> None:
                                           "chunk": args.chunk, "alpha": args.alpha, "alpha_plain": args.alpha_plain,
                                           "tc_stages": net.tc_stages, "locked": locked,
                                           "choose": choose, "max_moves": args.max_moves,
-                                          "eval_prefix": args.eval_prefix, "explore": args.explore}))
+                                          "eval_prefix": args.eval_prefix, "explore": args.explore,
+                                          "starts": args.starts, "start_frac": args.start_frac if starts else 0.0}))
 
     def evaluate() -> None:
         t = time.monotonic()
@@ -157,7 +165,8 @@ def main(argv=None) -> None:
             t = time.monotonic()
             if choose:
                 st = net.train_choose(n, threads=args.threads, alpha=args.alpha, seed=args.seed + games,
-                                      max_moves=args.max_moves, alpha_plain=args.alpha_plain, explore=args.explore)
+                                      max_moves=args.max_moves, alpha_plain=args.alpha_plain, explore=args.explore,
+                                      starts=starts, start_frac=args.start_frac if starts else 0.0)
             else:
                 st = net.train(n, threads=args.threads, alpha=args.alpha, seed=args.seed + games,
                                alpha_plain=args.alpha_plain)

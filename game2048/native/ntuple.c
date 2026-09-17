@@ -1115,9 +1115,16 @@ void nt_play_beam(void *p, long games, int width, int depth, int stride, int spr
  * so the value function learns the game where the player places the tiles. */
 
 static void learn_choose_game(net_t *net, search_ctx_t *c, int depth, int topk, long max_moves, double explore,
+                              const board_t *starts, long n_starts, double start_frac,
                               float alpha, float alpha_plain, uint64_t *rng,
                               int64_t *score, int32_t *maxtile, int32_t *nmoves) {
-    board_t b = spawn(spawn(0, rng), rng);
+    /* late-game restarts: a fraction of games begin from a saved board, so the
+     * endgame gets more than one game-over per 30k moves of training signal */
+    board_t b;
+    if (n_starts > 0 && start_frac > 0.0 && (double)(rng_next(rng) >> 11) * (1.0 / 9007199254740992.0) < start_frac)
+        b = starts[rng_next(rng) % (uint64_t)n_starts];
+    else
+        b = spawn(spawn(0, rng), rng);
     board_t prev = 0;
     int have_prev = 0;
     int64_t sc = 0;
@@ -1158,6 +1165,9 @@ typedef struct {
     int depth, topk;
     long *next, n, max_moves;
     double explore;
+    const board_t *starts;
+    long n_starts;
+    double start_frac;
     float alpha, alpha_plain;
     uint64_t seed;
     int64_t *scores;
@@ -1171,31 +1181,41 @@ static void *choose_train_worker(void *arg) {
         long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
         if (g >= j->n) break;
         uint64_t rng = game_seed(j->seed, g);
-        learn_choose_game(j->net, c, j->depth, j->topk, j->max_moves, j->explore, j->alpha, j->alpha_plain, &rng,
-                          &j->scores[g], &j->maxtiles[g], &j->moves[g]);
+        learn_choose_game(j->net, c, j->depth, j->topk, j->max_moves, j->explore, j->starts, j->n_starts, j->start_frac,
+                          j->alpha, j->alpha_plain, &rng, &j->scores[g], &j->maxtiles[g], &j->moves[g]);
     }
     ctx_free(c);
     return NULL;
 }
 
+/* starts_lohi: n_starts boards as (lo, hi) pairs; start_frac of the games begin from one. */
 void nt_train_choose(void *p, long games, int threads, float alpha, float alpha_plain, uint64_t seed,
                      int depth, int topk, long max_moves, double explore,
+                     const uint64_t *starts_lohi, long n_starts, double start_frac,
                      int64_t *scores, int32_t *maxtiles, int32_t *moves) {
     net_t *net = (net_t *)p;
     if (threads < 1) threads = 1;
     if (depth < 1) depth = 1;
     if (topk < 1) topk = 1;
+    board_t *starts = NULL;
+    if (n_starts > 0 && starts_lohi) {
+        starts = (board_t *)malloc(sizeof(board_t) * (size_t)n_starts);
+        for (long i = 0; i < n_starts; i++) starts[i] = mk(starts_lohi[2 * i], starts_lohi[2 * i + 1]);
+    } else {
+        n_starts = 0;
+    }
     pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * threads);
     choose_train_job_t *jobs = (choose_train_job_t *)malloc(sizeof(choose_train_job_t) * threads);
     long next = 0;
     for (int t = 0; t < threads; t++) {
-        jobs[t] = (choose_train_job_t){net, depth, topk, &next, games, max_moves, explore, alpha, alpha_plain, seed,
-                                       scores, maxtiles, moves};
+        jobs[t] = (choose_train_job_t){net, depth, topk, &next, games, max_moves, explore, starts, n_starts, start_frac,
+                                       alpha, alpha_plain, seed, scores, maxtiles, moves};
         pthread_create(&tid[t], NULL, choose_train_worker, &jobs[t]);
     }
     for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);
     free(tid);
     free(jobs);
+    free(starts);
     net->version++;
 }
 

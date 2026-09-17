@@ -56,13 +56,16 @@ def _ntuple_agent() -> Agent:
 
 def _ntuple_cool_agent() -> Agent:
     """n-tuple tables trained for cool mode (the agent places every tile), played
-    with a beam search over the deterministic game: 32 lines, 12 steps ahead, 4
-    steps of each plan played before searching again (a quarter of the cost for
-    the same score), and a snake-order bonus of 1.0 that keeps the chain in a
-    shape it can collapse (1.53M vs 1.29M without it on the 4-hour tables)."""
-    from .ntuple import NTupleAgent, resolve_cool_weights
+    with a beam search over the deterministic game. The weights are the best
+    scoring snapshot when one has been promoted (checkpoints/ntuple_best), and the
+    beam settings come from the best.json beside them; otherwise 32 lines, 12 steps
+    ahead, 4 steps of each plan before searching again, snake bonus 1.0."""
+    from .ntuple import NTupleAgent, cool_search_settings, resolve_cool_weights
 
-    return NTupleAgent(weights=resolve_cool_weights(), beam_width=32, beam_depth=12, beam_stride=4, beam_snake=1.0)
+    weights = resolve_cool_weights()
+    cfg = cool_search_settings(weights)
+    return NTupleAgent(weights=weights, beam_width=cfg["width"], beam_depth=cfg["depth"],
+                       beam_stride=cfg["stride"], beam_snake=cfg["snake"])
 
 
 AGENTS: dict[str, Callable[[], Agent]] = {

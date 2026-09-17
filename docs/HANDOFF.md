@@ -201,6 +201,33 @@ the value function learns 65536 and 131072:
   (`test_play_choose_scores_far_above_random_spawns`) passes on rerun (a Hogwild
   margin under contention).
 
+## Best-snapshot pipeline and max speed (2026-09-16, night)
+
+- The 4-hour run finished: 104k games, 1.5B moves, final depth-3 line 796k. Its
+  final tables score **1,528,428 (65536)** with beam w32 d12 stride 4 snake 0, but
+  only 791k with snake 1.0, while an earlier autosave scored 1.53M with snake 1.0
+  and 1.29M without. The snake weight is a per-snapshot coin flip; treat it as a
+  config to search over, not a fixed setting. Lesson: autosaves overwrite each
+  other and the 1.53M snapshot of the earlier tables is gone.
+- `scratchpad/snapshot_loop.py <run dir>` (running against `checkpoints/ntuple_big`)
+  copies every autosave to `snap_<games>.bin`, scores the canonical game with
+  snake 0 and snake 1 (w32 d12 stride 4, 1 thread each), appends to
+  `snapshots.csv`, and promotes the best to `checkpoints/ntuple_best/weights.bin`
+  + `best.json` (width/depth/stride/snake/score). Seeded with the 4-hour tables.
+- `resolve_cool_weights` looks in `checkpoints/ntuple_best` first;
+  `cool_search_settings(weights)` reads `best.json` beside the weights; the
+  `ntuple-cool` agent uses both. Restart the server when a new best lands (the
+  agent is cached per process).
+- **Max speed** in the UI: `POST /api/agent/run {agent, ms, max_steps}` plays as
+  many steps as fit in `ms`; the checkbox makes auto-play loop on it (~100+
+  moves/s with the beam agent while training runs).
+- The big-engine run (`checkpoints/ntuple_big`, pid in `ps`): resumed the 4-hour
+  tables on the 128-bit engine, `--choose --explore 0.02 --starts starts.npy
+  --start-frac 0.3`, 3 h, evals every 30 min. Its first chunk already showed a
+  65536 in training games. NOTE: a resume into a fresh `--out` needs `--choose`
+  explicitly (state.json is read from `--out`); the first attempt silently ran
+  random-mode training for a minute and was killed and relaunched.
+
 ## Machine constraints (important)
 
 - 19 GB RAM, but Docker's VMs hold ~9 GB; swap ran 4-10 GB. Pinned tables above

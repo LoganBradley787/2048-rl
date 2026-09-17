@@ -12,6 +12,7 @@ needed (or when the source is newer than the built library).
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -27,7 +28,9 @@ LIB = NATIVE_DIR / ("libntuple.dylib" if sys.platform == "darwin" else "libntupl
 _CKPT = Path(__file__).resolve().parent.parent / "checkpoints" / "ntuple"
 DEFAULT_CANDIDATES = [_CKPT / "weights.bin", _CKPT / "latest.bin"]
 _COOL_CKPT = _CKPT.parent / "ntuple_choose"
-COOL_CANDIDATES = [_COOL_CKPT / "weights.bin", _COOL_CKPT / "latest.bin"]
+_BEST_CKPT = _CKPT.parent / "ntuple_best"     # best-scoring snapshot promoted by the snapshot loop
+COOL_CANDIDATES = [_BEST_CKPT / "weights.bin", _COOL_CKPT / "weights.bin", _COOL_CKPT / "latest.bin"]
+COOL_DEFAULTS = {"width": 32, "depth": 12, "stride": 4, "snake": 1.0}
 
 
 def resolve_weights(path) -> Path:
@@ -257,6 +260,18 @@ def save_starts(path, grids) -> None:
 def load_starts(path) -> list[int]:
     """Saved start grids -> list of bitboards."""
     return [to_bits(g) for g in np.load(path)]
+
+
+def cool_search_settings(weights) -> dict:
+    """Beam settings for cool-mode play: `best.json` beside the weights when the
+    snapshot loop wrote one (the config that scored best on those tables), else
+    the defaults. Keys: width, depth, stride, snake."""
+    settings = dict(COOL_DEFAULTS)
+    meta = Path(weights).with_name("best.json")
+    if meta.exists():
+        saved = json.loads(meta.read_text())
+        settings.update({k: saved[k] for k in settings if k in saved})
+    return settings
 
 
 def snake_score(bits: int) -> float:

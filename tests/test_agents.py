@@ -77,3 +77,18 @@ def test_registry_includes_the_cool_mode_agent(monkeypatch, tmp_path):
     monkeypatch.setenv("GAME2048_NTUPLE_COOL", str(tmp_path / "missing.bin"))
     with pytest.raises(FileNotFoundError):
         make_agent("ntuple-cool")
+
+
+def test_cool_agent_reads_search_settings_saved_beside_its_weights(monkeypatch, tmp_path):
+    import json
+    from game2048 import ntuple as nt
+    n = nt.NTupleNet()
+    n.save(tmp_path / "weights.bin", weights_only=True)
+    n.close()
+    (tmp_path / "best.json").write_text(json.dumps({"width": 8, "depth": 4, "stride": 2, "snake": 0.25, "score": 1}))
+    monkeypatch.setenv("GAME2048_NTUPLE_COOL", str(tmp_path / "weights.bin"))
+    agent = make_agent("ntuple-cool")
+    assert (agent.beam_width, agent.beam_depth, agent.beam_stride, agent.beam_snake) == (8, 4, 2, 0.25)
+    (tmp_path / "best.json").unlink()
+    agent = make_agent("ntuple-cool")                       # no settings file: the defaults
+    assert agent.beam_width == 32 and agent.beam_depth == 12 and agent.beam_stride == 4

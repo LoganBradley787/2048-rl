@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")   # the CNN baseline is an optional extra
 
 from game2048 import nn as g2nn
 from game2048 import vec_env as ve

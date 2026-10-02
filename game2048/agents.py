@@ -1,8 +1,8 @@
 """Pluggable policies. Anything with `act(game) -> Direction` is an agent.
 
-To watch a trained network play in the browser, add an entry to `AGENTS`
-whose factory returns an object exposing `act(game)`. Use `Env2048.observe`
--style encoding on `game.board` inside `act` and mask to `game.legal_moves()`.
+To watch your own player in the browser, add an entry to `AGENTS` whose factory
+returns an object with `act(game)`. Inside `act`, read `game.board` (tile values,
+0 for empty) and pick one of `game.legal_moves()`.
 """
 
 from __future__ import annotations
@@ -43,7 +43,10 @@ class GreedyAgent:
 
 
 def _nn_agent() -> Agent:
-    from .nn import NNAgent  # torch is only needed for this agent
+    try:
+        from .nn import NNAgent  # torch is only needed for this agent
+    except ImportError as e:
+        raise ImportError(f"the nn agent needs PyTorch ({e}); install it with `uv sync --extra train`") from e
 
     return NNAgent()
 
@@ -78,8 +81,7 @@ def _snake_agent() -> Agent:
     from .ntuple import NTupleAgent, NTupleNet
 
     return NTupleAgent(net=NTupleNet(patterns=[[0, 1, 2, 3]], tc=False), depth=3, leaf_snake=16.0,
-                       beam_width=128, beam_depth=16, beam_stride=4, beam_snake=2.0, beam_snake_decay=0.9,
-                       beam_tiles=12)
+                       snake_decay=0.9, beam_width=128, beam_depth=16, beam_stride=4, beam_snake=2.0, beam_tiles=12)
 
 
 AGENTS: dict[str, Callable[[], Agent]] = {

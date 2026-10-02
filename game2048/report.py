@@ -1,7 +1,14 @@
 """Build a self-contained HTML report from a training log and a final evaluation.
 
+The CNN:
+
     uv run python examples/evaluate.py --games 500 --symmetric --json checkpoints/eval.json
     uv run python -m game2048.report --log checkpoints/log.csv --eval checkpoints/eval.json
+
+The n-tuple network:
+
+    uv run python examples/evaluate_ntuple.py --json checkpoints/ntuple/evals.json
+    uv run python -m game2048.report --ntuple
 """
 
 from __future__ import annotations
@@ -627,7 +634,7 @@ dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 
   <section class="method">
     <h2>Method</h2>
-    <p>The evaluator is an <em>n-tuple network</em>: {{K}} fixed patterns of {{CELLS}} cells, each looked up under all eight board symmetries, so a board is scored by adding {{LOOKUPS}} table entries. With 16 possible tile values per cell that is {{WEIGHTS}} weights and no arithmetic beyond the additions, which is why one move costs microseconds and why this family holds every strong published 2048 result.</p>
+    <p>The evaluator is an <em>n-tuple network</em>: {{K}} fixed patterns of {{CELLS}} cells, each looked up under all eight board symmetries, so a board is scored by adding {{LOOKUPS}} table entries. With 18 possible values per cell (empty, then 2 up to 131072) that is {{WEIGHTS}} weights and no arithmetic beyond the additions, which is why one move costs microseconds and why this family holds every strong published 2048 result.</p>
     <p>Learning is afterstate TD(0) self-play in C: after each move the table entries of the previous afterstate are nudged toward the reward just earned plus the value of the new afterstate, with per-entry temporal-coherence step sizes. Twelve threads update the shared tables without locks.{{STAGES_NOTE}}</p>
     <p>At play time, expectimax looks ahead: for each move it averages the best continuation over every possible spawn (a 2 with probability 0.9, a 4 with 0.1, in each empty cell), repeating for the configured depth, with a transposition table so repeated positions are scored once.</p>
     <dl>{{CONFIG}}</dl>
@@ -832,7 +839,7 @@ def build_ntuple_report(log_rows: list[dict], evals: dict, meta: dict) -> str:
     k = len(patterns)
     cells = sorted({len(p) for p in patterns})
     cells_txt = " or ".join(str(c) for c in cells) if cells else "?"
-    weights = sum(16 ** len(p) for p in patterns) * (len(meta.get("boundaries") or []) + 1)
+    weights = sum(18 ** len(p) for p in patterns) * (len(meta.get("boundaries") or []) + 1)   # a cell holds 0..17
     bounds = meta.get("boundaries") or []
     chunk = int(rows[0]["games"]) if rows else 0
 
@@ -937,4 +944,9 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--ntuple" in sys.argv[1:]:
+        ntuple_main([a for a in sys.argv[1:] if a != "--ntuple"])
+    else:
+        main()

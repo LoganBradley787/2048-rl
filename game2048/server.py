@@ -1,6 +1,6 @@
 """FastAPI server: one game per process, plus a static web UI.
 
-    uvicorn game2048.server:app --reload
+    uvicorn game2048.server:app --port 8048
 """
 
 from __future__ import annotations
@@ -29,18 +29,21 @@ class State:
     lock: threading.Lock = field(default_factory=threading.Lock)
     agents: dict[str, Agent] = field(default_factory=dict)
     evaluator: Callable | None = None  # for best/evil spawns; loaded once
+    load_lock: threading.Lock = field(default_factory=threading.Lock)  # one loader at a time
 
 
 def get_agent(name: str) -> Agent:
-    """Agents are built once per process; loading a network is not free."""
-    if name not in state.agents:
-        try:
-            state.agents[name] = make_agent(name)
-        except KeyError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        except (FileNotFoundError, ImportError) as e:
-            raise HTTPException(status_code=503, detail=str(e))
-    return state.agents[name]
+    """Agents are built once per process: loading a network can mean reading a
+    gigabyte of tables, so two requests for the same new agent must not both do it."""
+    with state.load_lock:
+        if name not in state.agents:
+            try:
+                state.agents[name] = make_agent(name)
+            except KeyError as e:
+                raise HTTPException(status_code=404, detail=e.args[0])
+            except (FileNotFoundError, ImportError) as e:
+                raise HTTPException(status_code=503, detail=str(e))
+        return state.agents[name]
 
 
 state = State()
@@ -105,8 +108,9 @@ def new_game(req: NewGameRequest | None = None):
     mode = req.mode if req else "random"
     evaluator = None
     if mode in ("best", "evil", "choose"):
-        if state.evaluator is None:
-            state.evaluator = evaluators.best_available()
+        with state.load_lock:
+            if state.evaluator is None:
+                state.evaluator = evaluators.best_available()
         evaluator = state.evaluator
     with state.lock:
         state.game = Game(seed=seed, spawn_mode=mode, evaluator=evaluator)

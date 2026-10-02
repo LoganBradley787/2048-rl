@@ -46,6 +46,7 @@ def test_registry_includes_nn_agent():
 
 
 def test_nn_agent_without_checkpoint_is_file_not_found(monkeypatch, tmp_path):
+    pytest.importorskip("torch")
     monkeypatch.setenv("GAME2048_CHECKPOINT", str(tmp_path / "missing.pt"))
     with pytest.raises(FileNotFoundError):
         make_agent("nn")
@@ -98,7 +99,7 @@ def test_snake_agent_needs_no_weights_and_plays_cool_mode():
     from game2048.core import Game
     agent = make_agent("snake")                              # beam search on the snake heuristic alone
     assert agent.beam_width > 0 and agent.beam_snake > 0 and agent.net is not None
-    assert agent.beam_snake_decay == 0.9                      # every tile on the path counts, not just the head
+    assert agent.net.snake_decay == 0.9                      # every tile on the path counts, not just the head
     assert agent.beam_tiles == 12                             # 2s first: a 4 only when a 2 dead-ends
     game = Game(seed=2, spawn_mode="choose")
     for _ in range(6):

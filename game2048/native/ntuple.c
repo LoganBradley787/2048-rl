@@ -175,7 +175,6 @@ typedef struct search_ctx {
     double cutoff;
     struct net *net;
     uint64_t version;
-    uint64_t epoch;          /* snake_epoch the cached values were computed under */
 } search_ctx_t;
 
 /* Stages: a board's stage is the number of tile-mass boundaries it has passed;
@@ -201,6 +200,8 @@ typedef struct net {
     search_ctx_t *main_ctx;  /* for single-threaded best_move calls */
     search_ctx_t *choose_ctx; /* same, for the choose-mode search (its own transposition table) */
     double leaf_snake;       /* weight of snake_score added to expectimax leaves (0 = tables only) */
+    double snake_decay;      /* weight ratio between consecutive cells on the snake path */
+    double snake_w[16];      /* snake_decay^k */
 } net_t;
 
 static inline int64_t board_mass(board_t b) {
@@ -234,59 +235,58 @@ static int sym_cell(int cell, int s) {
 }
 
 /* Snake-order score: the tiles read along the path 0 1 2 3 / 7 6 5 4 / 8 9 10 11 /
- * 15 14 13 12, each weighted by 0.5^k, best of the 8 symmetries. A chain laid out
- * as a snake scores highest; a scattered chain loses the weight of every tile
- * that is off its place. Added to the beam's leaf value with a tunable weight
- * so the search keeps the chain in a shape it can collapse (and that looks good). */
+ * 15 14 13 12, the k-th weighted by decay^k, best of the 8 symmetries. A chain
+ * laid out as a snake scores highest; a scattered chain loses the weight of every
+ * tile that is off its place. Added to the search's leaf value with a tunable
+ * weight so the chain stays in a shape that can be collapsed. The decay belongs to
+ * the network (0.5 by default: the head dominates; nearer 1 the whole chain's
+ * order counts). */
+#define SNAKE_DECAY_DEFAULT 0.5
 static const int SNAKE_PATH[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12};
 static int snake_cells[8][16];
-static double snake_w[16];
 static pthread_once_t snake_once = PTHREAD_ONCE_INIT;
-
-static double snake_decay = 0.5;
-static uint64_t snake_epoch = 0;   /* bumped when the decay changes, so search caches flush */
 
 static void snake_init(void) {
     for (int sym = 0; sym < 8; sym++)
         for (int k = 0; k < 16; k++) snake_cells[sym][k] = sym_cell(SNAKE_PATH[k], sym);
-    for (int k = 0; k < 16; k++) snake_w[k] = pow(snake_decay, k);
 }
 
-/* Weight ratio between consecutive cells on the snake path (0.5 by default: the
- * head dominates; nearer 1 the whole chain's order counts). Not thread-safe
- * while games are being played. */
-void nt_set_snake_decay(double d) {
-    pthread_once(&snake_once, snake_init);
-    if (d == snake_decay) return;
-    snake_decay = d;
-    for (int k = 0; k < 16; k++) snake_w[k] = pow(d, k);
-    snake_epoch++;
+static void snake_weights(double decay, double *w) {
+    for (int k = 0; k < 16; k++) w[k] = pow(decay, k);
 }
 
-static double snake_score(board_t b) {
+static double snake_score(const double *w, board_t b) {
     pthread_once(&snake_once, snake_init);
     double best = 0.0;
     for (int sym = 0; sym < 8; sym++) {
         double acc = 0.0;
         for (int k = 0; k < 16; k++) {
             int v = cell(b, snake_cells[sym][k]);
-            if (v) acc += (double)(1u << v) * snake_w[k];
+            if (v) acc += (double)(1u << v) * w[k];
         }
         if (acc > best) best = acc;
     }
     return best;
 }
 
-double nt_snake_score(uint64_t lo, uint64_t hi) { return snake_score(mk(lo, hi)); }
+double nt_snake_score(uint64_t lo, uint64_t hi, double decay) {
+    double w[16];
+    snake_weights(decay, w);
+    return snake_score(w, mk(lo, hi));
+}
 
 static inline int stage_is_tc(const net_t *net, int st) { return st < net->tc_stages; }
 static inline int stage_has_bits(const net_t *net, int st) { return net->flags && st > 0 && !stage_is_tc(net, st); }
+static inline size_t bits_bytes(size_t entries) { return (entries + 7) / 8; }
+
+void nt_free(void *p);
 
 static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_stages, int flags,
                         const int64_t *bounds, int n_bounds) {
     init_tables();
     if (K < 1 || K > MAX_PATTERNS || n_bounds < 0 || n_bounds >= MAX_STAGES) return NULL;
     net_t *net = (net_t *)calloc(1, sizeof(net_t));
+    if (!net) return NULL;
     net->K = K;
     net->n_bounds = n_bounds;
     net->n_stages = n_bounds + 1;
@@ -297,22 +297,30 @@ static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_st
     for (int i = 0; i < n_bounds; i++) net->bounds[i] = bounds[i];
     for (int k = 0; k < K; k++) {
         int n = lens[k];
-        if (n < 1 || n > 7) { free(net); return NULL; }   /* 18^7 entries is the most that fits an index */
+        if (n < 1 || n > 7) { nt_free(net); return NULL; }   /* 18^7 entries is the most that fits an index */
         net->len[k] = n;
-        for (int j = 0; j < n; j++) net->orig[k][j] = cells_flat[k * MAX_LEN + j];
+        for (int j = 0; j < n; j++) {
+            int c = cells_flat[k * MAX_LEN + j];
+            if (c < 0 || c > 15) { nt_free(net); return NULL; }
+            net->orig[k][j] = c;
+        }
         for (int s = 0; s < 8; s++)
             for (int j = 0; j < n; j++) net->cells[k][s][j] = sym_cell(net->orig[k][j], s);
         net->size[k] = 1;
         for (int j = 0; j < n; j++) net->size[k] *= RADIX;
         for (int st = 0; st < net->n_stages; st++) {
-            net->w[st][k] = (float *)calloc(net->size[k], sizeof(float));
+            int ok = (net->w[st][k] = (float *)calloc(net->size[k], sizeof(float))) != NULL;
             if (stage_is_tc(net, st)) {
-                net->e[st][k] = (float *)calloc(net->size[k], sizeof(float));
-                net->a[st][k] = (float *)calloc(net->size[k], sizeof(float));
+                ok &= (net->e[st][k] = (float *)calloc(net->size[k], sizeof(float))) != NULL;
+                ok &= (net->a[st][k] = (float *)calloc(net->size[k], sizeof(float))) != NULL;
             }
-            if (stage_has_bits(net, st)) net->bits[st][k] = (uint8_t *)calloc(net->size[k] / 8, 1);
+            if (stage_has_bits(net, st))
+                ok &= (net->bits[st][k] = (uint8_t *)calloc(bits_bytes(net->size[k]), 1)) != NULL;
+            if (!ok) { nt_free(net); return NULL; }           /* out of memory: the tables are large */
         }
     }
+    net->snake_decay = SNAKE_DECAY_DEFAULT;
+    snake_weights(net->snake_decay, net->snake_w);
     net->version = 1;
     return net;
 }
@@ -320,11 +328,6 @@ static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_st
 void *nt_create_ex(const int *cells_flat, const int *lens, int K, int tc_stages,
                    const int64_t *bounds, int n_bounds) {
     return net_alloc(cells_flat, lens, K, tc_stages, 1, bounds, n_bounds);
-}
-
-void *nt_create(const int *cells_flat, const int *lens, int K, int use_tc,
-                const int64_t *bounds, int n_bounds) {
-    return net_alloc(cells_flat, lens, K, use_tc ? n_bounds + 1 : 0, 1, bounds, n_bounds);
 }
 
 void nt_free(void *p) {
@@ -349,7 +352,7 @@ int nt_lock_memory(void *p) {
             if (net->w[st][k] && mlock(net->w[st][k], bytes) != 0) rc = -1;
             if (net->e[st][k] && mlock(net->e[st][k], bytes) != 0) rc = -1;
             if (net->a[st][k] && mlock(net->a[st][k], bytes) != 0) rc = -1;
-            if (net->bits[st][k] && mlock(net->bits[st][k], net->size[k] / 8) != 0) rc = -1;
+            if (net->bits[st][k] && mlock(net->bits[st][k], bits_bytes(net->size[k])) != 0) rc = -1;
         }
     }
     return rc;
@@ -449,9 +452,6 @@ void nt_spawn(uint64_t lo, uint64_t hi, uint64_t *rng, uint64_t *out_lo, uint64_
     *out_hi = hi64(r);
 }
 
-int nt_cell_bits(void) { return CB; }
-int nt_max_exp(void) { return MAX_EXP; }
-
 float nt_value(void *p, uint64_t lo, uint64_t hi) { return net_value((net_t *)p, mk(lo, hi)); }
 
 void nt_update(void *p, uint64_t lo, uint64_t hi, float delta, float alpha, float alpha_plain) {
@@ -473,6 +473,20 @@ void nt_update_stage(void *p, uint64_t lo, uint64_t hi, float delta, float alpha
     if (stage < 0 || stage >= net->n_stages) net_update(net, b, delta, alpha, alpha_plain);
     else net_update_stage(net, b, delta, alpha, alpha_plain, stage);
     net->version++;
+}
+
+/* ----------------------------------------------------------------- threads --- */
+
+/* Run `fn(job)` on `threads` threads and wait. The job is shared: workers pull
+ * game indices from its atomic counter, so fast cores simply take more games. */
+static void run_workers(void *(*fn)(void *), void *job, int threads) {
+    if (threads < 1) threads = 1;
+    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)threads);
+    int started = 0;
+    while (tid && started < threads && pthread_create(&tid[started], NULL, fn, job) == 0) started++;
+    if (started == 0) fn(job);                       /* no thread could start: do the work here */
+    for (int t = 0; t < started; t++) pthread_join(tid[t], NULL);
+    free(tid);
 }
 
 /* ---------------------------------------------------------------- learning --- */
@@ -513,7 +527,7 @@ static void learn_game(net_t *net, float alpha, float alpha_plain, uint64_t *rng
 
 typedef struct {
     net_t *net;
-    long *next, n;   /* shared atomic counter: fast cores simply take more games */
+    long *next, n;   /* next: the shared game counter */
     float alpha, alpha_plain;
     uint64_t seed;
     int64_t *scores;
@@ -534,17 +548,9 @@ static void *train_worker(void *arg) {
 void nt_train(void *p, long games, int threads, float alpha, float alpha_plain, uint64_t seed,
               int64_t *scores, int32_t *maxtiles, int32_t *moves) {
     net_t *net = (net_t *)p;
-    if (threads < 1) threads = 1;
-    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * threads);
-    train_job_t *jobs = (train_job_t *)malloc(sizeof(train_job_t) * threads);
     long next = 0;
-    for (int t = 0; t < threads; t++) {
-        jobs[t] = (train_job_t){net, &next, games, alpha, alpha_plain, seed, scores, maxtiles, moves};
-        pthread_create(&tid[t], NULL, train_worker, &jobs[t]);
-    }
-    for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);
-    free(tid);
-    free(jobs);
+    train_job_t job = {net, &next, games, alpha, alpha_plain, seed, scores, maxtiles, moves};
+    run_workers(train_worker, &job, threads);
     net->version++;
 }
 
@@ -559,7 +565,6 @@ static search_ctx_t *ctx_create_tt(net_t *net, double cutoff, int use_tt) {
     c->cutoff = cutoff;
     c->net = net;
     c->version = net->version;
-    c->epoch = snake_epoch;
     return c;
 }
 
@@ -568,11 +573,10 @@ static search_ctx_t *ctx_create(net_t *net, double cutoff) {
 }
 
 static void ctx_sync(search_ctx_t *c, double cutoff) {
-    if (c->version != c->net->version || c->cutoff != cutoff || c->epoch != snake_epoch) {
+    if (c->version != c->net->version || c->cutoff != cutoff) {
         if (c->tt) memset(c->tt, 0, ((size_t)1 << TT_BITS) * sizeof(tt_entry_t));
         c->version = c->net->version;
         c->cutoff = cutoff;
-        c->epoch = snake_epoch;
     }
 }
 
@@ -588,25 +592,36 @@ static double max_node(search_ctx_t *c, board_t b, int depth, double prob);
  * has a leaf weight (a heuristic player on empty tables). */
 static inline double leaf_value(const net_t *net, board_t a) {
     double v = net_value(net, a);
-    if (net->leaf_snake > 0.0) v += net->leaf_snake * snake_score(a);
+    if (net->leaf_snake > 0.0) v += net->leaf_snake * snake_score(net->snake_w, a);
     return v;
 }
+
+/* Both setters bump the version: values cached by a search are stale afterwards.
+ * Call them between searches, not while games are being played on other threads. */
+void nt_set_snake_decay(void *p, double d) {
+    net_t *net = (net_t *)p;
+    if (net->snake_decay == d) return;
+    net->snake_decay = d;
+    snake_weights(d, net->snake_w);
+    net->version++;
+}
+
+double nt_snake_decay(void *p) { return ((net_t *)p)->snake_decay; }
 
 void nt_set_leaf_snake(void *p, double w) {
     net_t *net = (net_t *)p;
     if (w < 0.0) w = 0.0;
     if (net->leaf_snake == w) return;
     net->leaf_snake = w;
-    net->version++;                           /* cached search values are stale */
+    net->version++;
 }
 
 double nt_leaf_snake(void *p) { return ((net_t *)p)->leaf_snake; }
 
 static double chance_node(search_ctx_t *c, board_t after, int depth, double prob) {
     if (depth == 0 || prob < c->cutoff) return leaf_value(c->net, after);
-    size_t h = tt_hash(after);
-    tt_entry_t *e = &c->tt[h];
-    if (e->key == after && e->depth == depth) return e->val;
+    tt_entry_t *e = c->tt ? &c->tt[tt_hash(after)] : NULL;
+    if (e && e->key == after && e->depth == depth) return e->val;
     int empty = count_empty(after);
     double p2 = prob * 0.9 / empty, p4 = prob * 0.1 / empty, sum = 0.0;
     for (int i = 0; i < 16; i++) {
@@ -615,9 +630,11 @@ static double chance_node(search_ctx_t *c, board_t after, int depth, double prob
         sum += 0.1 * max_node(c, after | (put(2, i)), depth - 1, p4);
     }
     double v = sum / empty;
-    e->key = after;
-    e->depth = (uint8_t)depth;
-    e->val = (float)v;
+    if (e) {
+        e->key = after;
+        e->depth = (uint8_t)depth;
+        e->val = (float)v;
+    }
     return v;
 }
 
@@ -701,18 +718,9 @@ static void *play_worker(void *arg) {
 
 void nt_play(void *p, long games, int depth, double cutoff, int threads, uint64_t seed,
              int64_t *scores, int32_t *maxtiles, int32_t *moves) {
-    net_t *net = (net_t *)p;
-    if (threads < 1) threads = 1;
-    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * threads);
-    play_job_t *jobs = (play_job_t *)malloc(sizeof(play_job_t) * threads);
     long next = 0;
-    for (int t = 0; t < threads; t++) {
-        jobs[t] = (play_job_t){net, depth, cutoff, &next, games, seed, scores, maxtiles, moves};
-        pthread_create(&tid[t], NULL, play_worker, &jobs[t]);
-    }
-    for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);
-    free(tid);
-    free(jobs);
+    play_job_t job = {(net_t *)p, depth, cutoff, &next, games, seed, scores, maxtiles, moves};
+    run_workers(play_worker, &job, threads);
 }
 
 /* A random spawn that never ends the game when it can be avoided: uniform over
@@ -890,20 +898,11 @@ static void *choose_worker(void *arg) {
 
 void nt_play_choose(void *p, long games, int depth, int topk, int threads, uint64_t seed, long max_moves,
                     long prefix, int64_t *scores, int32_t *maxtiles, int32_t *moves) {
-    net_t *net = (net_t *)p;
-    if (threads < 1) threads = 1;
     if (depth < 1) depth = 1;
     if (topk < 1) topk = 1;
-    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * threads);
-    choose_job_t *jobs = (choose_job_t *)malloc(sizeof(choose_job_t) * threads);
     long next = 0;
-    for (int t = 0; t < threads; t++) {
-        jobs[t] = (choose_job_t){net, depth, topk, &next, games, max_moves, prefix, seed, scores, maxtiles, moves};
-        pthread_create(&tid[t], NULL, choose_worker, &jobs[t]);
-    }
-    for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);
-    free(tid);
-    free(jobs);
+    choose_job_t job = {(net_t *)p, depth, topk, &next, games, max_moves, prefix, seed, scores, maxtiles, moves};
+    run_workers(choose_worker, &job, threads);
 }
 
 /* ------------------------------------------------------------ beam search --- */
@@ -935,7 +934,7 @@ static inline int next_value(net_t *net, board_t s, double snake, double *out) {
         board_t a = do_move(s, m, &r);
         if (a == s) continue;
         double v = (double)r + net_value(net, a);
-        if (snake > 0.0) v += snake * snake_score(a);
+        if (snake > 0.0) v += snake * snake_score(net->snake_w, a);
         if (!any || v > best) { best = v; any = 1; }
     }
     *out = best;
@@ -1156,20 +1155,12 @@ static void *beam_worker(void *arg) {
 void nt_play_beam(void *p, long games, int width, int depth, int stride, int spread, double snake, int tiles,
                   int threads, uint64_t seed, long max_moves, long prefix, int64_t *scores, int32_t *maxtiles,
                   int32_t *moves) {
-    net_t *net = (net_t *)p;
-    if (threads < 1) threads = 1;
     if (stride < 1) stride = 1;
     if (depth > BEAM_MAX_DEPTH) depth = BEAM_MAX_DEPTH;
-    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * threads);
-    beam_job_t *jobs = (beam_job_t *)malloc(sizeof(beam_job_t) * threads);
     long next = 0;
-    for (int t = 0; t < threads; t++) {
-        jobs[t] = (beam_job_t){net, width, depth, stride, spread, tiles, snake, &next, games, max_moves, prefix, seed, scores, maxtiles, moves};
-        pthread_create(&tid[t], NULL, beam_worker, &jobs[t]);
-    }
-    for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);
-    free(tid);
-    free(jobs);
+    beam_job_t job = {(net_t *)p, width, depth, stride, spread, tiles, snake, &next, games, max_moves, prefix, seed,
+                      scores, maxtiles, moves};
+    run_workers(beam_worker, &job, threads);
 }
 
 /* ------------------------------------------------ learning the choose game --- */
@@ -1257,27 +1248,20 @@ void nt_train_choose(void *p, long games, int threads, float alpha, float alpha_
                      const uint64_t *starts_lohi, long n_starts, double start_frac,
                      int64_t *scores, int32_t *maxtiles, int32_t *moves) {
     net_t *net = (net_t *)p;
-    if (threads < 1) threads = 1;
     if (depth < 1) depth = 1;
     if (topk < 1) topk = 1;
     board_t *starts = NULL;
     if (n_starts > 0 && starts_lohi) {
         starts = (board_t *)malloc(sizeof(board_t) * (size_t)n_starts);
+        if (!starts) n_starts = 0;
         for (long i = 0; i < n_starts; i++) starts[i] = mk(starts_lohi[2 * i], starts_lohi[2 * i + 1]);
     } else {
         n_starts = 0;
     }
-    pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * threads);
-    choose_train_job_t *jobs = (choose_train_job_t *)malloc(sizeof(choose_train_job_t) * threads);
     long next = 0;
-    for (int t = 0; t < threads; t++) {
-        jobs[t] = (choose_train_job_t){net, depth, topk, &next, games, max_moves, explore, starts, n_starts, start_frac,
-                                       alpha, alpha_plain, seed, scores, maxtiles, moves};
-        pthread_create(&tid[t], NULL, choose_train_worker, &jobs[t]);
-    }
-    for (int t = 0; t < threads; t++) pthread_join(tid[t], NULL);
-    free(tid);
-    free(jobs);
+    choose_train_job_t job = {net, depth, topk, &next, games, max_moves, explore, starts, n_starts, start_frac,
+                              alpha, alpha_plain, seed, scores, maxtiles, moves};
+    run_workers(choose_train_worker, &job, threads);
     free(starts);
     net->version++;
 }
@@ -1291,10 +1275,11 @@ static const char MAGIC_V4[8] = "NTUPLE04";
 static const char MAGIC_V5[8] = "NTUPLE05";
 static const char MAGIC_V6[8] = "NTUPLE06";   /* radix-18 tables (five-bit cells) */
 
-/* Format 05: header (K, tc_stages, flags, n_bounds, bounds, len, orig), then per
+/* Format 06: header (K, tc_stages, flags, n_bounds, bounds, len, orig), then per
  * stage and pattern: w; e and a for TC stages; touched bits for plain stages >= 1.
  * weights_only drops the learning state and writes every stage's table with
- * promotion applied, so the file plays identically at a third of the size. */
+ * promotion applied, so the file plays identically at a third of the size.
+ * Returns 0, or -1 when the file could not be written in full. */
 int nt_save_ex(void *p, const char *path, int weights_only) {
     net_t *net = (net_t *)p;
     FILE *f = fopen(path, "wb");
@@ -1310,10 +1295,15 @@ int nt_save_ex(void *p, const char *path, int weights_only) {
     fwrite(net->len, sizeof(int), MAX_PATTERNS, f);
     fwrite(net->orig, sizeof(int), MAX_PATTERNS * MAX_LEN, f);
     float *buf = NULL;
+    if (weights_only && net->flags) {                /* scratch for baking promotion in */
+        size_t largest = 0;
+        for (int k = 0; k < net->K; k++) if (net->size[k] > largest) largest = net->size[k];
+        buf = (float *)malloc(largest * sizeof(float));
+        if (!buf) { fclose(f); return -1; }
+    }
     for (int st = 0; st < net->n_stages; st++) {
         for (int k = 0; k < net->K; k++) {
             if (weights_only && st > 0 && net->flags) {
-                if (!buf) buf = (float *)malloc(net->size[k] * sizeof(float));
                 for (uint32_t i = 0; i < net->size[k]; i++) buf[i] = entry_value(net, st, k, i);
                 fwrite(buf, sizeof(float), net->size[k], f);
             } else {
@@ -1323,14 +1313,13 @@ int nt_save_ex(void *p, const char *path, int weights_only) {
                 fwrite(net->e[st][k], sizeof(float), net->size[k], f);
                 fwrite(net->a[st][k], sizeof(float), net->size[k], f);
             }
-            if (!weights_only && stage_has_bits(net, st)) fwrite(net->bits[st][k], 1, net->size[k] / 8, f);
+            if (!weights_only && stage_has_bits(net, st)) fwrite(net->bits[st][k], 1, bits_bytes(net->size[k]), f);
         }
     }
     free(buf);
-    return fclose(f) == 0 ? 0 : -1;
+    int failed = ferror(f);                          /* e.g. the disk filled up */
+    return (fclose(f) == 0 && !failed) ? 0 : -1;
 }
-
-int nt_save(void *p, const char *path) { return nt_save_ex(p, path, 0); }
 
 static int skip_bytes(FILE *f, size_t n) { return fseek(f, (long)n, SEEK_CUR) == 0 ? 0 : -1; }
 
@@ -1352,9 +1341,10 @@ static int read_table(FILE *f, float *dst, size_t fn, int old, int n, float *tmp
 }
 
 static int read_bits(FILE *f, uint8_t *dst, size_t fn, int old, int n, uint8_t *tmpb) {
-    if (!dst) return skip_bytes(f, fn / 8);
-    if (!old) return fread(dst, 1, fn / 8, f) == fn / 8 ? 0 : -1;
-    if (fread(tmpb, 1, fn / 8, f) != fn / 8) return -1;
+    size_t nb = bits_bytes(fn);
+    if (!dst) return skip_bytes(f, nb);
+    if (!old) return fread(dst, 1, nb, f) == nb ? 0 : -1;
+    if (fread(tmpb, 1, nb, f) != nb) return -1;
     for (uint32_t i = 0; i < fn; i++)
         if ((tmpb[i >> 3] >> (i & 7)) & 1) { uint32_t j = remap_old_index(i, n); dst[j >> 3] |= (uint8_t)(1 << (j & 7)); }
     return 0;
@@ -1388,8 +1378,7 @@ void *nt_load_ex(const char *path, const int64_t *req_bounds, int n_req, int tc_
         if (v >= 3 && fread(&has_a, sizeof(int), 1, f) != 1) { fclose(f); return NULL; }
         if (v == 4 && fread(&f_bits_v4, sizeof(int), 1, f) != 1) { fclose(f); return NULL; }
         f_e_all = use_tc;
-        f_a_all = has_a < 0 ? 1 : has_a;          /* formats 1-2 always stored A when it existed */
-        if (has_a < 0) f_a_all = use_tc;
+        f_a_all = has_a < 0 ? use_tc : has_a;     /* formats 1-2 stored A exactly when they stored E */
     }
     if (v >= 2 && (fread(&n_bounds, sizeof(int), 1, f) != 1 ||
                    fread(bounds, sizeof(int64_t), MAX_STAGES, f) != MAX_STAGES)) { fclose(f); return NULL; }
@@ -1422,7 +1411,8 @@ void *nt_load_ex(const char *path, const int64_t *req_bounds, int n_req, int tc_
         if (fn > maxfn) maxfn = fn;
     }
     float *tmp = (float *)malloc(maxfn * sizeof(float));
-    uint8_t *tmpb = (uint8_t *)malloc(maxfn / 8 + 1);
+    uint8_t *tmpb = (uint8_t *)malloc(bits_bytes(maxfn));
+    if (!tmp || !tmpb) goto fail;
     for (int st = 0; st < file_stages; st++) {
         for (int k = 0; k < K; k++) {
             size_t fn = old ? ((size_t)1 << (4 * len[k])) : net->size[k];
@@ -1453,5 +1443,3 @@ fail:
     nt_free(net);
     return NULL;
 }
-
-void *nt_load(const char *path) { return nt_load_ex(path, NULL, 0, -1); }

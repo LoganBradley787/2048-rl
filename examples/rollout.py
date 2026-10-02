@@ -33,10 +33,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    agent = make_agent(args.agent)          # once: some agents load large tables
+    env = Env2048(seed=args.seed)           # each reset is a new, reproducible game
     scores, tiles, lengths = [], [], []
     for ep in range(args.episodes):
-        env = Env2048(seed=args.seed + ep)
-        score, max_tile, steps = run_episode(env, make_agent(args.agent))
+        score, max_tile, steps = run_episode(env, agent)
         scores.append(score)
         tiles.append(max_tile)
         lengths.append(steps)

@@ -1,19 +1,18 @@
 [project]
 name = "game2048"
 version = "0.1.0"
-description = "2048 with a Python rules engine, a gym-style training env, and a web UI"
+description = "2048 players: an n-tuple network in C trained by self-play, expectimax and beam search, and a web UI to watch them"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110",
+    "numpy>=1.26",
     "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "httpx>=0.27"]
-train = [
-    "numpy>=1.26",
-    "torch>=2.14.0",
-]
+train = ["torch>=2.2"]   # only the CNN baseline (game2048/nn.py, game2048/train.py) needs it
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -24,3 +23,5 @@ packages = ["game2048"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The engine tests save weight files of a gigabyte or more; do not keep them after each test.
+tmp_path_retention_policy = "none"

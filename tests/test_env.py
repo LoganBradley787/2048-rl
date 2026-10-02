@@ -134,6 +134,22 @@ def test_same_seed_same_trajectory():
         assert a.step(act) == b.step(act)
 
 
+def test_each_reset_of_a_seeded_env_is_a_new_but_reproducible_game():
+    def episodes(seed):
+        env, out = Env2048(seed=seed), []
+        for _ in range(4):
+            first = env.reset()
+            for act in [0, 1, 2, 3] * 5:
+                env.step(act)
+            out.append((first, env.observe()))
+        return out
+
+    run = episodes(9)
+    assert run == episodes(9)                                   # the whole sequence repeats
+    assert len({str(ep) for ep in run}) == 4                    # but no episode repeats another
+    assert Env2048(seed=9).reset() == run[0][0]                 # and the first is still Game(seed)
+
+
 def test_env_passes_spawn_mode_and_evaluator_to_the_game():
     env = Env2048(seed=1, spawn_mode="evil", evaluator=lambda board: 0.0)
     env.reset()

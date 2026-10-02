@@ -28,7 +28,7 @@ LIB = NATIVE_DIR / ("libntuple.dylib" if sys.platform == "darwin" else "libntupl
 _CKPT = Path(__file__).resolve().parent.parent / "checkpoints" / "ntuple"
 DEFAULT_CANDIDATES = [_CKPT / "weights.bin", _CKPT / "latest.bin"]
 _COOL_CKPT = _CKPT.parent / "ntuple_choose"
-_BEST_CKPT = _CKPT.parent / "ntuple_best"     # best-scoring snapshot promoted by the snapshot loop
+_BEST_CKPT = _CKPT.parent / "ntuple_best"     # a hand-picked best snapshot, with its beam settings in best.json
 COOL_CANDIDATES = [_BEST_CKPT / "weights.bin", _COOL_CKPT / "weights.bin", _COOL_CKPT / "latest.bin"]
 COOL_DEFAULTS = {"width": 32, "depth": 12, "stride": 4, "snake": 1.0}
 
@@ -89,6 +89,8 @@ PATTERN_SETS = {
 MAX_PATTERNS, MAX_LEN, MAX_STAGES = 16, 8, 8   # MAX_LEN is the C struct stride; at most MAX_CELLS cells are usable
 MAX_CELLS = 7                                  # 18**7 entries is the most a 32-bit table index can hold
 CELL_BITS, CELL_MASK, MAX_EXP = 5, 31, 17   # five bits per cell: tiles up to 131072 (2**17)
+BEAM_MAX_DEPTH = 256                           # the C beam plans at most this many steps
+SNAKE_DECAY = 0.5                              # default weight ratio between consecutive snake cells
 
 
 def cell(bits: int, i: int) -> int:
@@ -120,7 +122,11 @@ _lib = None
 def _build() -> None:
     cc = os.environ.get("CC", "cc")
     tmp = LIB.with_suffix(LIB.suffix + ".tmp")
-    subprocess.run([cc, "-O3", "-shared", "-fPIC", "-o", str(tmp), str(SRC), "-lpthread", "-lm"], check=True)
+    try:
+        subprocess.run([cc, "-O3", "-shared", "-fPIC", "-o", str(tmp), str(SRC), "-lpthread", "-lm"], check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise ImportError(f"could not build the C engine with {cc!r} ({e}); it needs a C compiler "
+                          "(Xcode command line tools on macOS, gcc or clang on Linux; set CC to pick one)") from e
     os.replace(tmp, LIB)  # atomic, so a process that has the old library mapped keeps it
 
 
@@ -134,7 +140,6 @@ def lib() -> ctypes.CDLL:
     u64, i32, i64, f32, f64, vp, cp = (ctypes.c_uint64, ctypes.c_int, ctypes.c_int64, ctypes.c_float,
                                         ctypes.c_double, ctypes.c_void_p, ctypes.c_char_p)
     P = ctypes.POINTER
-    L.nt_create.argtypes, L.nt_create.restype = [P(i32), P(i32), i32, i32, P(i64), i32], vp
     L.nt_create_ex.argtypes, L.nt_create_ex.restype = [P(i32), P(i32), i32, i32, P(i64), i32], vp
     L.nt_tc_stages.argtypes, L.nt_tc_stages.restype = [vp], i32
     L.nt_free.argtypes = [vp]
@@ -149,7 +154,6 @@ def lib() -> ctypes.CDLL:
     L.nt_pattern.argtypes, L.nt_pattern.restype = [vp, i32, P(i32)], i32
     L.nt_move.argtypes, L.nt_move.restype = [u64, u64, i32, P(i32), P(u64), P(u64)], None
     L.nt_spawn.argtypes, L.nt_spawn.restype = [u64, u64, P(u64), P(u64), P(u64)], None
-    L.nt_cell_bits.restype, L.nt_max_exp.restype = i32, i32
     L.nt_value.argtypes, L.nt_value.restype = [vp, u64, u64], f32
     L.nt_update.argtypes = [vp, u64, u64, f32, f32, f32]
     L.nt_train.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(i64), P(i32), P(i32)]
@@ -163,17 +167,16 @@ def lib() -> ctypes.CDLL:
     L.nt_train_choose.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, i32, i32, ctypes.c_long, f64,
                                   P(u64), ctypes.c_long, f64, P(i64), P(i32), P(i32)]
     L.nt_beam_choose.argtypes, L.nt_beam_choose.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32)], i32
-    L.nt_snake_score.argtypes, L.nt_snake_score.restype = [u64, u64], f64
-    L.nt_set_snake_decay.argtypes = [f64]
+    L.nt_snake_score.argtypes, L.nt_snake_score.restype = [u64, u64, f64], f64
+    L.nt_set_snake_decay.argtypes = [vp, f64]
+    L.nt_snake_decay.argtypes, L.nt_snake_decay.restype = [vp], f64
     L.nt_set_leaf_snake.argtypes = [vp, f64]
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
     L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32), P(i32)], i32
     L.nt_play_beam.argtypes = [vp, ctypes.c_long, i32, i32, i32, i32, f64, i32, i32, u64, ctypes.c_long, ctypes.c_long,
                                P(i64), P(i32), P(i32)]
-    L.nt_save.argtypes, L.nt_save.restype = [vp, cp], i32
     L.nt_save_ex.argtypes, L.nt_save_ex.restype = [vp, cp, i32], i32
-    L.nt_load.argtypes, L.nt_load.restype = [cp], vp
     L.nt_load_ex.argtypes, L.nt_load_ex.restype = [cp, P(i64), i32, i32], vp
     _lib = L
     return L
@@ -182,14 +185,13 @@ def lib() -> ctypes.CDLL:
 # --- board helpers --------------------------------------------------------------
 
 def to_bits(board) -> int:
-    """(4, 4) exponents -> bitboard (a Python int, five bits per cell). A board of
-    tile values whose largest tile is above 17 is converted too, but a Game board
-    must use `tiles_to_bits`: early boards of 2s, 4s and 8s look like exponents."""
-    arr = np.asarray(board)
-    if arr.max() > MAX_EXP:  # tile values, not exponents
-        return tiles_to_bits(arr)
+    """(4, 4) exponents (0 = empty, k = tile 2**k) -> bitboard: a Python int, five
+    bits per cell. For a board of tile values, as in `Game.board`, use `tiles_to_bits`."""
+    arr = np.asarray(board).reshape(16)
+    if arr.max() > MAX_EXP:
+        raise ValueError(f"exponents go up to {MAX_EXP}; for tile values use tiles_to_bits")
     bits = 0
-    for i, v in enumerate(arr.reshape(16)):
+    for i, v in enumerate(arr):
         bits |= int(v) << (CELL_BITS * i)
     return bits
 
@@ -277,22 +279,22 @@ def cool_search_settings(weights) -> dict:
     return settings
 
 
-def set_snake_decay(decay: float) -> None:
-    """Weight ratio between consecutive snake cells (default 0.5). Process-wide; set
-    it between games, not while games are being played."""
-    lib().nt_set_snake_decay(float(decay))
-
-
-def snake_score(bits: int) -> float:
-    """Tiles read along the snake path (0 1 2 3 / 7 6 5 4 / ...), weighted 0.5**k,
-    best of the 8 symmetries. A chain laid out as a snake scores highest."""
-    return float(lib().nt_snake_score(*_lohi(bits)))
+def snake_score(bits: int, decay: float = SNAKE_DECAY) -> float:
+    """Tiles read along the snake path (0 1 2 3 / 7 6 5 4 / ...), the k-th weighted
+    decay**k, best of the 8 symmetries. A chain laid out as a snake scores highest.
+    A search uses its network's decay (`NTupleNet.snake_decay`)."""
+    return float(lib().nt_snake_score(*_lohi(bits), float(decay)))
 
 
 def stage_of(bits: int, boundaries: list[int]) -> int:
     """Stage index: how many mass boundaries (sum of all tiles) the board has reached."""
     arr = (ctypes.c_int64 * max(1, len(boundaries)))(*boundaries)
     return int(lib().nt_stage_of(*_lohi(bits), arr, len(boundaries)))
+
+
+def _game_buffers(games: int):
+    """Per-game output arrays for the native play and train calls: scores, max tiles, moves."""
+    return (ctypes.c_int64 * games)(), (ctypes.c_int32 * games)(), (ctypes.c_int32 * games)()
 
 
 def _stats(scores, maxtiles, moves) -> dict:
@@ -320,6 +322,8 @@ class NTupleNet:
             patterns = [list(p) for p in (patterns or DEFAULT_PATTERNS)]
             if not 1 <= len(patterns) <= MAX_PATTERNS or any(not 1 <= len(p) <= MAX_CELLS for p in patterns):
                 raise ValueError("1..16 patterns of 1..7 cells each")
+            if any(not 0 <= int(c) <= 15 for p in patterns for c in p):
+                raise ValueError("pattern cells are board indices 0..15 (row * 4 + col)")
             boundaries = sorted(int(b) for b in (boundaries or []))
             if len(boundaries) >= MAX_STAGES:
                 raise ValueError(f"at most {MAX_STAGES - 1} boundaries")
@@ -334,7 +338,7 @@ class NTupleNet:
                 tc_stages = len(boundaries) + 1 if tc else 0
             self._h = self._lib.nt_create_ex(flat, lens, len(patterns), int(tc_stages), barr, len(boundaries))
             if not self._h:
-                raise RuntimeError("could not create n-tuple network")
+                raise MemoryError("could not allocate the n-tuple tables")
 
     @classmethod
     def load(cls, path, boundaries=None, keep_tc: bool = True, tc_stages: int | None = None) -> "NTupleNet":
@@ -422,12 +426,22 @@ class NTupleNet:
               alpha_plain: float | None = None) -> dict:
         """Play `games` self-play games with TD(0) learning; returns per-game stats."""
         ap = alpha if alpha_plain is None else alpha_plain
-        scores = (ctypes.c_int64 * games)()
-        maxtiles = (ctypes.c_int32 * games)()
-        moves = (ctypes.c_int32 * games)()
+        scores, maxtiles, moves = _game_buffers(games)
         self._lib.nt_train(self._h, games, threads, float(alpha), float(ap), seed & 0xFFFFFFFFFFFFFFFF,
                            scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
+
+    @property
+    def snake_decay(self) -> float:
+        """Weight ratio between consecutive cells on the snake path, for every search
+        on this network that adds a snake bonus (the beam's `snake`, `leaf_snake`).
+        0.5 by default: the head dominates; nearer 1 the whole chain's order counts.
+        Set it between searches, not while games are being played."""
+        return float(self._lib.nt_snake_decay(self._h))
+
+    @snake_decay.setter
+    def snake_decay(self, decay: float) -> None:
+        self._lib.nt_set_snake_decay(self._h, float(decay))
 
     @property
     def leaf_snake(self) -> float:
@@ -465,9 +479,7 @@ class NTupleNet:
         random (never immediately fatal) spawns instead of the chosen tile, so the
         games differ: the choose game is otherwise deterministic, and a deterministic
         policy funnels different starts into the same line within a few moves."""
-        scores = (ctypes.c_int64 * games)()
-        maxtiles = (ctypes.c_int32 * games)()
-        moves = (ctypes.c_int32 * games)()
+        scores, maxtiles, moves = _game_buffers(games)
         self._lib.nt_play_choose(self._h, games, int(depth), int(topk), threads, seed & 0xFFFFFFFFFFFFFFFF,
                                  int(max_moves), int(prefix), scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
@@ -499,7 +511,7 @@ class NTupleNet:
     def beam_plan(self, bits: int, width: int = 64, depth: int = 16, spread: int = 0,
                   snake: float = 0.0, tiles: int = 3) -> list[tuple[int, int, int]]:
         """The best line found: [(move, cell, tile exponent), ...], empty when stuck."""
-        depth = int(depth)
+        depth = min(max(int(depth), 1), BEAM_MAX_DEPTH)   # the C side clamps the same way and fills `depth` slots
         moves, cells, values = (ctypes.c_int * depth)(), (ctypes.c_int * depth)(), (ctypes.c_int * depth)()
         n = int(self._lib.nt_beam_plan(self._h, *_lohi(bits), int(width), depth, int(spread), float(snake),
                                        int(tiles), moves, cells, values))
@@ -510,9 +522,7 @@ class NTupleNet:
                   snake: float = 0.0, tiles: int = 3) -> dict:
         """Play with beam search; `stride` steps of each plan are committed before
         re-planning; the first `prefix` moves get random spawns (see play_choose)."""
-        scores = (ctypes.c_int64 * games)()
-        maxtiles = (ctypes.c_int32 * games)()
-        moves = (ctypes.c_int32 * games)()
+        scores, maxtiles, moves = _game_buffers(games)
         self._lib.nt_play_beam(self._h, games, int(width), int(depth), int(stride), int(spread), float(snake),
                                int(tiles), threads, seed & 0xFFFFFFFFFFFFFFFF, int(max_moves), int(prefix),
                                scores, maxtiles, moves)
@@ -529,9 +539,7 @@ class NTupleNet:
         games begins from one of them instead of two tiles (late-game restarts, so
         the endgame gets trained more than once per 30k-move game). Returns per-game stats."""
         ap = alpha if alpha_plain is None else alpha_plain
-        scores = (ctypes.c_int64 * games)()
-        maxtiles = (ctypes.c_int32 * games)()
-        moves = (ctypes.c_int32 * games)()
+        scores, maxtiles, moves = _game_buffers(games)
         starts = list(starts or [])
         packed = (ctypes.c_uint64 * max(2, 2 * len(starts)))(*[h for b in starts for h in _lohi(b)])
         self._lib.nt_train_choose(self._h, games, threads, float(alpha), float(ap), seed & 0xFFFFFFFFFFFFFFFF,
@@ -540,9 +548,7 @@ class NTupleNet:
         return _stats(scores, maxtiles, moves)
 
     def play(self, games: int, depth: int = 1, cutoff: float = 0.0, threads: int = 1, seed: int = 0) -> dict:
-        scores = (ctypes.c_int64 * games)()
-        maxtiles = (ctypes.c_int32 * games)()
-        moves = (ctypes.c_int32 * games)()
+        scores, maxtiles, moves = _game_buffers(games)
         self._lib.nt_play(self._h, games, int(depth), float(cutoff), threads, seed & 0xFFFFFFFFFFFFFFFF,
                           scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
@@ -569,7 +575,7 @@ class NTupleAgent:
 
     def __init__(self, weights=None, depth: int = 3, cutoff: float = 0.0, choose_depth: int = 3,
                  topk: int = 4, beam_width: int = 0, beam_depth: int = 16, beam_stride: int = 1,
-                 beam_spread: int = 0, beam_snake: float = 0.0, beam_snake_decay: float | None = None,
+                 beam_spread: int = 0, beam_snake: float = 0.0, snake_decay: float | None = None,
                  beam_tiles: int = 3, leaf_snake: float = 0.0, net: "NTupleNet | None" = None) -> None:
         if net is not None:                 # a ready network, e.g. an empty one for a heuristic-only player
             self.net = net
@@ -589,8 +595,9 @@ class NTupleAgent:
         self.beam_stride = beam_stride    # steps of a plan to follow before planning again
         self.beam_spread = beam_spread    # survivors per parent (0 = unlimited)
         self.beam_snake = beam_snake      # weight of the snake-order bonus at the leaves
-        self.beam_snake_decay = beam_snake_decay   # process-wide snake decay applied before each plan (None = leave)
         self.beam_tiles = beam_tiles      # placement mask, see NTupleNet.beam_value (12 = 2s first)
+        if snake_decay is not None:       # how fast the snake weights fall off along the path
+            self.net.snake_decay = snake_decay
         if leaf_snake:                    # snake bonus at the random-spawn search leaves
             self.net.leaf_snake = leaf_snake
         self._plan: list[tuple[int, int, int]] = []
@@ -598,8 +605,6 @@ class NTupleAgent:
 
     def _beam_step(self, bits: int) -> tuple[int, int, int]:
         if not self._plan or self._plan_board != bits:
-            if self.beam_snake_decay is not None:
-                set_snake_decay(self.beam_snake_decay)
             self._plan = self.net.beam_plan(bits, self.beam_width, self.beam_depth, self.beam_spread,
                                             self.beam_snake, self.beam_tiles)[: max(1, self.beam_stride)]
         if not self._plan:
@@ -621,8 +626,6 @@ class NTupleAgent:
         return Direction(m), (cell // 4, cell % 4, 2 ** value)
 
     def act(self, game: Game) -> Direction:
-        if self.beam_snake_decay is not None and self.net.leaf_snake > 0:
-            set_snake_decay(self.beam_snake_decay)
         d = self.net.best_move(tiles_to_bits(game.board), self.depth, self.cutoff)
         if d < 0:
             raise ValueError("no legal moves")

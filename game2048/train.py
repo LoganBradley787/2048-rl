@@ -304,10 +304,9 @@ def train(cfg: Config) -> dict:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for f in dataclasses.fields(Config):
-        kind = {int: int, float: float, str: str}.get(f.type if isinstance(f.type, type) else None)
-        if kind is None:  # "int | None" style annotations
-            kind = float if "float" in str(f.type) else (str if "str" in str(f.type) else int)
+    kinds = {"int": int, "float": float, "str": str}
+    for f in dataclasses.fields(Config):   # annotations are strings here: "int", "float | None", ...
+        kind = kinds[f.type.split(" | ")[0]]
         parser.add_argument(f"--{f.name.replace('_', '-')}", type=kind, default=f.default)
     args = parser.parse_args(argv)
     cfg = Config(**vars(args))

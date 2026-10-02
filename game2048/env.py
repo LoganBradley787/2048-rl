@@ -6,6 +6,10 @@
 
 Observations are the board flattened row-major, each cell encoded as
 log2(tile) (0 for empty). `obs_array()` gives the same thing as a numpy array.
+
+With a seed, episode n is the game `Game(seed=seed + n)`: runs are reproducible
+and every episode is a different game. In "choose" spawn mode the env does not
+place tiles; call `env.game.place(row, col, value)` after each step.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ class Env2048:
         self.invalid_move_penalty = invalid_move_penalty
         self.max_invalid_moves = max_invalid_moves
         self.game: Game | None = None
+        self._episode = 0
         self._invalid_streak = 0
 
     @property
@@ -41,7 +46,9 @@ class Env2048:
         return len(Direction)
 
     def reset(self) -> Observation:
-        self.game = Game(size=self.size, seed=self._seed, spawn_mode=self.spawn_mode, evaluator=self.evaluator)
+        seed = None if self._seed is None else self._seed + self._episode
+        self.game = Game(size=self.size, seed=seed, spawn_mode=self.spawn_mode, evaluator=self.evaluator)
+        self._episode += 1
         self._invalid_streak = 0
         return self.observe()
 

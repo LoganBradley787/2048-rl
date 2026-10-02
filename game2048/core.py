@@ -230,18 +230,14 @@ class Game:
             self.board[i][j] = 4 if self._rng.random() < self.SPAWN_FOUR_PROBABILITY else 2
 
     def _spawn(self) -> None:
-        empty = [
-            (i, j)
-            for i in range(self.size)
-            for j in range(self.size)
-            if self.board[i][j] == 0
-        ]
+        """The tile after a move, by spawn mode (choose mode never gets here: the player places it)."""
+        if self.spawn_mode == "random":
+            self._random_spawn()
+            return
+        empty = [(i, j) for i in range(self.size) for j in range(self.size) if self.board[i][j] == 0]
         if not empty:
             return
-        if self.spawn_mode in ("random", "choose"):
-            i, j = self._rng.choice(empty)
-            value = 4 if self._rng.random() < self.SPAWN_FOUR_PROBABILITY else 2
-        elif self.spawn_mode == "kind":
+        if self.spawn_mode == "kind":
             i, j, value = self._kind_spawn(empty)
         else:
             i, j, value = self._extreme_spawn(empty, best=self.spawn_mode == "best")

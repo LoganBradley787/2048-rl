@@ -297,7 +297,8 @@ def test_default_weights_resolve_to_first_existing_candidate(tmp_path, monkeypat
 
 def test_lock_memory_pins_tables_and_training_still_works():
     n = nt.NTupleNet()
-    assert n.lock_memory() is True
+    locked = n.lock_memory()      # False where the OS refuses (a container's memlock limit), never an error
+    assert locked in (True, False)
     stats = n.train(games=50, threads=2, seed=1)
     assert (stats["scores"] > 0).all()
     n.close()
@@ -378,6 +379,27 @@ def test_tc_file_can_be_loaded_as_plain_multistage(tmp_path):
     stats = m.train(games=20, threads=2, seed=3)
     assert (stats["scores"] > 0).all()
     a.close(); m.close()
+
+
+def test_short_patterns_keep_their_touched_bits_through_save_and_load(tmp_path):
+    # 18 and 18**2 table entries are not multiples of 8: the last touched bits need a byte of their own.
+    n = nt.NTupleNet(patterns=[[0], [1, 2], [0, 1, 2, 3]], tc=False, boundaries=[60000])
+    top = np.full((4, 4), 17, dtype=np.uint8)            # every index is the table's last entry
+    top[3] = [16, 15, 14, 13]                            # mass above the boundary: stage 1
+    hb = nt.to_bits(top)
+    assert nt.stage_of(hb, [60000]) == 1
+    n.update(hb, 80.0, alpha=1.0)
+    value = n.value(hb)                                  # symmetric samples share entries, so not simply 80
+    assert value > 0
+    n.save(tmp_path / "short.bin")
+    n.save(tmp_path / "short_wo.bin", weights_only=True)  # mixed table sizes share one scratch buffer
+    for name in ("short.bin", "short_wo.bin"):
+        m = nt.NTupleNet.load(tmp_path / name)
+        assert m.patterns == [[0], [1, 2], [0, 1, 2, 3]]
+        assert m.value(hb) == pytest.approx(value, rel=1e-6)
+        assert m.value_in_stage(hb, 0) == pytest.approx(0.0, abs=1e-6)   # stage 0 was never updated
+        m.close()
+    n.close()
 
 
 # --- hybrid: temporal coherence on the first stages, plain TD on the rest ------------
@@ -688,8 +710,7 @@ def test_ntuple_agent_follows_its_beam_plan_until_the_board_diverges(tmp_path):
         game.move(direction)
         game.place(row, col, value)
     assert searches == 3                      # one search per 3 steps
-    game.place  # a human-made deviation: the plan no longer applies
-    game2 = Game(seed=5, spawn_mode="choose")
+    game2 = Game(seed=5, spawn_mode="choose")  # a board the plan was not made for: search again
     direction, (row, col, value) = agent.choose(game2)
     assert direction in game2.legal_moves()
     assert searches == 4
@@ -699,6 +720,24 @@ def test_tiles_to_bits_never_mistakes_small_tiles_for_exponents():
     board = [[2, 4, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 8]]
     assert nt.tiles_to_bits(board) == nt.with_cell(nt.with_cell(nt.with_cell(0, 0, 1), 1, 2), 15, 3)
     assert nt.tiles_to_bits([[0] * 4] * 4) == 0
+
+
+def test_to_bits_takes_exponents_and_refuses_tile_values():
+    assert nt.to_bits([[17, 1, 0, 0]] + [[0] * 4] * 3) == nt.with_cell(nt.with_cell(0, 0, 17), 1, 1)
+    with pytest.raises(ValueError, match="tiles_to_bits"):
+        nt.to_bits([[2048, 2, 0, 0]] + [[0] * 4] * 3)
+
+
+def test_patterns_must_name_board_cells():
+    with pytest.raises(ValueError, match="0..15"):
+        nt.NTupleNet(patterns=[[0, 1, 16]], tc=False)
+
+
+def test_beam_plan_with_a_zero_depth_plans_one_step():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    bits = nt.to_bits(rand_exps(np.random.default_rng(42), density=0.5))
+    assert len(n.beam_plan(bits, width=4, depth=0, snake=1.0)) == 1
+    n.close()
 
 
 def test_agent_sees_the_real_board_early_in_a_game(tmp_path):
@@ -768,7 +807,6 @@ def test_train_choose_explore_takes_random_placements_reproducibly():
 # --- snake-order bonus for the beam --------------------------------------------------
 
 def test_snake_score_rewards_the_snake_layout_under_any_symmetry():
-    nt.set_snake_decay(0.5)                                        # the decay is process-wide
     assert nt.snake_score(0) == 0.0
     one = nt.with_cell(0, 0, 10)                                   # 1024 in a corner: head of the snake
     assert nt.snake_score(one) == pytest.approx(1024.0)
@@ -818,7 +856,6 @@ def test_ntuple_agent_accepts_a_snake_weight(tmp_path):
     n.train(games=50, threads=2, seed=7)
     n.save(tmp_path / "w.bin")
     n.close()
-    nt.set_snake_decay(0.5)                                        # the decay is process-wide
     agent = nt.NTupleAgent(weights=tmp_path / "w.bin", beam_width=4, beam_depth=3, beam_snake=1.0)
     game = Game(seed=2, spawn_mode="choose")
     for _ in range(12):
@@ -859,21 +896,38 @@ def test_harvest_starts_collects_boards_past_a_mass_threshold(tmp_path):
 def test_snake_decay_is_adjustable():
     chain = nt.to_bits(np.array([[17, 16, 15, 14], [10, 11, 12, 13], [9, 8, 7, 6], [2, 3, 4, 5]], dtype=np.uint8))
     tiles = [1 << e for e in [17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2]]
-    try:
-        nt.set_snake_decay(0.9)
-        assert nt.snake_score(chain) == pytest.approx(sum(t * 0.9 ** k for k, t in enumerate(tiles)))
-        nt.set_snake_decay(1.0)
-        assert nt.snake_score(chain) == pytest.approx(sum(tiles))
-    finally:
-        nt.set_snake_decay(0.5)
+    assert nt.snake_score(chain, decay=0.9) == pytest.approx(sum(t * 0.9 ** k for k, t in enumerate(tiles)))
+    assert nt.snake_score(chain, decay=1.0) == pytest.approx(sum(tiles))
     assert nt.snake_score(chain) == pytest.approx(sum(t * 0.5 ** k for k, t in enumerate(tiles)))
+
+
+def test_snake_decay_belongs_to_the_network():
+    # Two players in one process (the UI's snake and ntuple-cool agents) must not
+    # change each other's heuristic.
+    a = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    b = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(41)
+    try:
+        assert a.snake_decay == b.snake_decay == nt.SNAKE_DECAY == 0.5
+        a.snake_decay = 0.9
+        assert a.snake_decay == 0.9 and b.snake_decay == 0.5
+        a.leaf_snake = b.leaf_snake = 1.0
+        for _ in range(5):
+            bits = nt.to_bits(rand_exps(rng, density=0.6))
+            for n in (a, b):                                           # tables are empty: the value is the bonus
+                expected = max(r + nt.snake_score(after, n.snake_decay)
+                               for after, r in (nt.move(bits, m) for m in range(4)) if after != bits)
+                assert n.search_value(bits, depth=0) == pytest.approx(expected)
+        agent = nt.NTupleAgent(net=b, snake_decay=0.75)
+        assert b.snake_decay == 0.75 and agent.net is b and a.snake_decay == 0.9
+    finally:
+        a.close(); b.close()
 
 
 def test_leaf_snake_adds_the_snake_bonus_to_random_spawn_search_leaves():
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
     rng = np.random.default_rng(39)
     try:
-        nt.set_snake_decay(0.5)
         assert n.leaf_snake == 0.0
         n.leaf_snake = 3.0
         assert n.leaf_snake == 3.0
@@ -894,24 +948,21 @@ def test_changing_the_snake_decay_flushes_cached_search_values():
     rng = np.random.default_rng(40)
     bits = nt.to_bits(rand_exps(rng, density=0.5))
     try:
-        nt.set_snake_decay(0.5)
         a.leaf_snake = 2.0
         at_half = a.search_value(bits, depth=1)                     # fills a's cache
-        nt.set_snake_decay(0.9)
+        a.snake_decay = 0.9
         fresh = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
-        fresh.leaf_snake = 2.0
+        fresh.leaf_snake, fresh.snake_decay = 2.0, 0.9
         assert a.search_value(bits, depth=1) == pytest.approx(fresh.search_value(bits, depth=1))
         assert a.search_value(bits, depth=1) != pytest.approx(at_half)
         fresh.close()
     finally:
-        nt.set_snake_decay(0.5)
         a.close()
 
 
 def test_leaf_snake_plays_random_spawn_games_better_than_rewards_alone():
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
     try:
-        nt.set_snake_decay(0.5)
         plain = n.play(games=8, depth=2, threads=4, seed=3)["scores"].mean()
         n.leaf_snake = 4.0
         snake = n.play(games=8, depth=2, threads=4, seed=3)["scores"].mean()
@@ -944,7 +995,6 @@ def test_beam_twos_first_places_a_four_only_when_a_two_dead_ends():
     bits = nt.to_bits(exps)
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
     try:
-        nt.set_snake_decay(0.5)
         twos = n.beam_plan(bits, width=64, depth=3, snake=2.0, tiles=1)
         assert len(twos) == 1 and twos[0][2] == 1                       # a dead line: the board fills
         for tiles in (8, 12):
@@ -961,7 +1011,6 @@ def test_beam_twos_first_is_the_twos_only_plan_while_twos_survive():
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
     rng = np.random.default_rng(38)
     try:
-        nt.set_snake_decay(0.5)
         for _ in range(6):
             bits = nt.to_bits(rand_exps(rng, density=0.3))
             twos = n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=1)

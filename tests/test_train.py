@@ -1,7 +1,9 @@
 import csv
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")   # the CNN baseline is an optional extra
 
 from game2048 import nn as g2nn
 from game2048 import train as tr

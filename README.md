@@ -1,5 +1,7 @@
 # 2048-rl
 
+[![tests](https://github.com/LoganBradley787/2048-rl/actions/workflows/tests.yml/badge.svg)](https://github.com/LoganBradley787/2048-rl/actions/workflows/tests.yml)
+
 AI players for 2048, written from scratch: the game, a C engine that learns
 it by playing against itself, the searches that go with it, and a web page
 where you can watch them or play yourself.

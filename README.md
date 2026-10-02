@@ -1,391 +1,250 @@
 # 2048-rl
 
-2048-rl is a set of 2048 players. The strong one against random spawns is an
-n-tuple network written in C that learns by afterstate temporal-difference
-self-play, tens of billions of moves in a few hours on a laptop, and plays with
-expectimax. In "cool mode", where the player places its own tiles, the game is
-a deterministic puzzle, and a beam search guided by a snake-order heuristic
-plays it to the 131072 tile and 3,931,768 points, 396 short of the 3,932,164
-ceiling, with no training at all. A CNN value network is kept as a baseline.
-The game rules, a FastAPI server and a plain HTML/JS board come with it, so you
-can play by hand, try cool mode yourself, or watch the agents at max speed.
+AI players for 2048, written from scratch: the game, a C engine that learns
+it by playing against itself, the searches that go with it, and a web page
+where you can watch them or play yourself.
 
-The rules and state are entirely in Python. The same code doubles as a
-gym-style environment, and any agent with an `act(game)` method shows up in
-the browser.
+Two results:
 
-## Run the web UI
+- **The normal game.** A network of lookup tables trained by self-play
+  averages **351,671 points** and reaches the 16384 tile in 98% of games. It
+  started from nothing, with no human games and no built-in strategy, and
+  trained for 4 hours on a laptop.
+- **Cool mode**, a variant where you also choose where each new tile goes. A
+  search with one hand-written rule and no training builds the **131072**
+  tile, the largest a 4x4 board can hold, and scores **3,931,768**. The upper
+  bound is 3,932,164.
+
+For scale: a person who reaches the 2048 tile once has about 20,000 points.
+
+![The snake agent playing a whole cool-mode game, sped up](docs/images/snake-cool-mode.gif)
+
+*The `snake` agent playing one cool-mode game from the first tile to the
+last: 130,969 moves, about four minutes in real time. The last frame is as
+full as a board gets: one of every tile from 131072 down to 8, and a final 2.*
+
+## Try it
+
+You need Python 3.10 or newer, [uv](https://docs.astral.sh/uv/), and a C
+compiler (`cc`), on macOS or Linux.
 
 ```bash
-uv sync --extra dev
+git clone https://github.com/LoganBradley787/2048-rl.git
+cd 2048-rl
+uv sync
+uv run uvicorn game2048.server:app --port 8048
 ```
 
-```bash
-uv run uvicorn game2048.server:app --reload --port 8048
-```
+Open http://localhost:8048. Then:
 
-Then open http://localhost:8048. Arrow keys or WASD move; swipe on touch.
-The **Step** and **Auto-play** buttons drive the game with the agent chosen
-in the dropdown. **Max speed** makes auto-play batch about 100 ms of moves per
-request (`POST /api/agent/run`) and redraw once per batch, so a full cool-mode
-game takes minutes rather than most of an hour; the speed readout then shows
-the moves per second achieved.
+1. **Play.** Arrow keys or WASD, or swipe on a phone.
+2. **Watch the game in the animation above.** Set the tile mode to
+   *Cool mode*, leave the player on *snake*, tick **Max speed**, and press
+   **Auto-play**.
+3. **Lose quickly.** Set the tile mode to *Evil tiles*, where every new tile
+   lands where it hurts most.
 
-If you would rather not use uv, `pip install -e ".[dev]"` and
+The `snake`, `greedy` and `random` players work on a fresh clone. `ntuple`,
+`ntuple-cool` and `nn` need trained weights, which are not in the repository
+(the tables are 0.5 GB and up). [Train your own](#train-your-own) takes one
+command.
+
+Without uv, `pip install -e .` and
 `python -m uvicorn game2048.server:app --port 8048` do the same thing.
 
-## Tile modes
+## The players
 
-The dropdown next to **New game** (and `mode` in `POST /api/new`) picks how
-each new tile is placed:
-
-| Mode | The next tile is... |
-| --- | --- |
-| `random` | the standard game: a uniform empty cell, 2 with probability 0.9, else 4 |
-| `kind` | random, but never a placement that ends the game while another placement keeps a move |
-| `best` | the placement that maximises your best reply (reward plus the evaluator's value of the resulting board) |
-| `evil` | the placement that minimises it, and ends the game whenever a tile can |
-| `choose` | cool mode: you place it yourself, any empty cell, 2 or 4 |
-
-`best` and `evil` judge boards with the trained n-tuple tables when
-`checkpoints/ntuple/weights.bin` exists, else with a small heuristic based on
-empty cells and merges. The same modes work for training: `Env2048(spawn_mode=...)`
-and `Config(spawn_mode=...)` for the CNN trainer (`random` and `kind` in the
-vectorised engine; all of them in the Python `Game`).
-
-## Layout
-
-| Path | What it is |
-| --- | --- |
-| `game2048/core.py` | Rules engine. `Game` holds the board and score, `move()` slides/merges/spawns. No dependencies. |
-| `game2048/env.py` | `Env2048`: `reset()` / `step(action)` wrapper for training. |
-| `game2048/agents.py` | `Agent` protocol, `RandomAgent`, `GreedyAgent`, and the `AGENTS` registry the server reads. |
-| `game2048/server.py` | FastAPI app and JSON API. One game per process. |
-| `game2048/vec_env.py` | numpy engine for many boards at once, used by training and evaluation. |
-| `game2048/nn.py` | `ValueNet`, checkpoint helpers, and `NNAgent` (the "nn" entry in the UI). |
-| `game2048/train.py` | Afterstate TD(0) trainer; `python -m game2048.train`. |
-| `examples/evaluate.py` | Scores a checkpoint over many games and prints the max-tile histogram. |
-| `game2048/native/ntuple.c` | Bitboard engine, n-tuple network, TD/TC learning, expectimax and beam search, all multithreaded. |
-| `game2048/ntuple.py` | ctypes wrapper: `NTupleNet`, `NTupleAgent` (the "ntuple" and "ntuple-cool" entries in the UI). |
-| `game2048/ntuple_train.py` | Training CLI for the n-tuple network; `python -m game2048.ntuple_train`. |
-| `examples/evaluate_ntuple.py` | Evaluates n-tuple weights at several depths, in random mode or cool mode. |
-| `static/` | The browser UI. |
-| `examples/rollout.py` | Runs episodes with a named agent and prints stats. |
-| `tests/` | pytest suite for the rules, env, agents, API, and the C engine. |
-
-Actions are the same everywhere: `0 = up, 1 = right, 2 = down, 3 = left`.
-
-## Training against the environment
-
-```python
-from game2048.env import Env2048
-
-env = Env2048(seed=0, invalid_move_penalty=1.0, max_invalid_moves=10)
-obs = env.reset()                 # list of 16 ints: log2(tile), 0 for empty
-done = False
-while not done:
-    mask = env.action_mask()      # [bool] * 4, True where the move changes the board
-    action = policy(obs, mask)    # your network goes here
-    obs, reward, done, info = env.step(action)
-    # reward = points from merges this move, or -invalid_move_penalty
-    # info = {"moved", "score", "max_tile", "legal_moves"}
-```
-
-`env.obs_array()` returns the observation as a numpy int64 array of shape
-`(16,)`. `env.game` is the underlying `Game` if you need the raw board or
-want to `clone()` it for search.
-
-The `--extra train` group installs numpy. Add torch or whatever you train
-with alongside it.
-
-## Watching a trained agent in the browser
-
-Register anything with an `act(game) -> Direction` method in
-`game2048/agents.py`:
-
-```python
-class MyNetAgent:
-    def __init__(self):
-        self.model = load_my_model()
-
-    def act(self, game):
-        obs = [v.bit_length() - 1 if v else 0 for row in game.board for v in row]
-        legal = game.legal_moves()
-        scores = self.model(obs)
-        return max(legal, key=lambda d: scores[int(d)])
-
-AGENTS["mynet"] = MyNetAgent
-```
-
-Restart the server and "mynet" shows up in the dropdown. An agent that also
-has `choose(game) -> (Direction, (row, col, 2 | 4))` plays cool mode by picking
-the move and the tile together; otherwise the server places the best tile
-for it (`Game.best_placement`).
-
-## API
-
-| Method | Path | Body | Returns |
+| Player | What it is | Normal game, mean score | Biggest tile |
 | --- | --- | --- | --- |
-| GET | `/api/state` | | `{board, score, over, legal_moves, max_tile, mode, awaiting_tile}` |
-| POST | `/api/move` | `{"direction": 0..3 or "up"/"right"/"down"/"left"}` | state plus `{moved, reward, direction}` |
-| POST | `/api/place` | `{"row", "col", "value": 2 or 4}` (cool mode, after a move) | state |
-| POST | `/api/new` | `{"seed": int, "mode": "random"}` (both optional) | fresh state |
-| GET | `/api/modes` | | list of tile modes |
-| GET | `/api/agents` | | list of agent names |
-| POST | `/api/agent/step` | `{"agent": "greedy"}` | state plus `{moved, reward, direction}`, and `placed` in cool mode; 404 unknown agent, 409 if the game is over |
-| POST | `/api/agent/run` | `{"agent": "ntuple-cool", "ms": 100, "max_steps": 5000}` | as many steps as fit in `ms`; state plus `steps` and the batch's total `reward` |
+| `random` | random legal moves | 1,099 | 256 at best |
+| `greedy` | takes the biggest merge on offer | 3,180 | 512 at best |
+| `nn` | small convolutional network, 46 minutes of training in PyTorch | 29,869 | 2048 in 74% of games |
+| `snake` | search with one hand-written rule, no training | 66,199 | 2048 in every game, 8192 in 12% |
+| `ntuple` | lookup tables trained by self-play in C, plus a 3-level search | **351,671** | 16384 in 98% of games, 32768 in 1% |
 
-## Training a network
+In cool mode:
 
-```bash
-uv sync --extra dev --extra train
-```
-
-```bash
-uv run python -m game2048.train --minutes 30
-```
-
-This trains a value network with afterstate TD(0) and writes to `checkpoints/`:
-`best.pt` (highest evaluation mean score), `latest.pt`, and `log.csv` with one
-row per evaluation. Once `best.pt` exists, pick **nn** in the web UI dropdown
-to watch it play (no restart needed; the server loads it on first use).
-
-How it works: the network scores a board *after* a move and *before* the
-random spawn, V(afterstate). To play, it tries the four moves and takes the
-one with the highest reward + V. To learn, it regresses V(afterstate) toward
-reward + V(next afterstate), or 0 when the game ended, using a replay buffer,
-a slowly tracking target network, and a random board symmetry on each sample.
-The vectorised numpy engine in `game2048/vec_env.py` runs hundreds of games
-in parallel with a 65536-entry row lookup table.
-
-Useful flags: `--envs`, `--batch`, `--grad-steps`, `--lr`, `--width`,
-`--hidden`, `--eval-every`, `--eval-games`, `--device cpu|mps|cuda`,
-`--resume checkpoints/latest.pt`. Run with `--help` for all of them.
-
-Evaluate a checkpoint over many games:
-
-```bash
-uv run python examples/evaluate.py --games 500 --symmetric
-```
-
-`--symmetric` averages V over the eight board symmetries at play time, which
-the **nn** agent in the UI also does.
-
-## The strong player: n-tuple network + expectimax
-
-The CNN above tops out around 74% at 2048. The strongest known approach to
-2048 is an n-tuple network, a set of lookup tables over fixed cell patterns
-(here four 6-cell patterns under all 8 board symmetries, 136M weights),
-trained with the same afterstate TD(0) idea and searched with expectimax at
-play time. That lives in `game2048/native/ntuple.c` and is driven from Python
-through `game2048/ntuple.py`. The C side has 128-bit bitboards with five bits
-per cell, so tiles go all the way to 131072, lock-free multithreaded learning
-with temporal-coherence learning rates, multi-stage weight tables, expectimax
-with a transposition table, and the cool-mode searches described below. It
-compiles itself with the system C compiler on first use.
-
-```bash
-uv run python -m game2048.ntuple_train --hours 2 --threads 12
-```
-
-```bash
-uv run python -m game2048.ntuple_train --hours 6 --threads 12 --resume checkpoints/ntuple/latest.bin --stages 16384,24576,32768 --tc-stages 1 --alpha-plain 0.025 --lock-memory --out checkpoints/ntuple_stages
-```
-
-Training ran at 6 to 7 million moves per second on an M3 Pro with the earlier
-64-bit engine. `--stages` gives boards whose tile mass (sum of all tiles) has
-crossed each boundary their own weight tables, the multi-stage trick behind
-the best published 32768 rates; `--resume single-stage.bin --stages ...` seeds
-stage 0 from an existing run. Temporal-coherence learning state costs about
-1.1 GB per stage on top of the weights, so `--tc-stages 1` keeps it on stage 0
-only and trains the other stages with plain TD at `--alpha-plain` (544 MB each
-plus a touched bit per entry); `--no-tc` drops it everywhere. `--lock-memory`
-pins the tables in RAM so paging cannot stall the lookups. `--patterns 8x6`
-starts a new network with eight 6-cell patterns instead of four (twice the
-capacity, 1.1 GB of weights). Weights and counters go to `--out`; `latest.bin`
-resumes training, `weights.bin` is the smaller deployment copy the UI loads.
-Weight files written before the 128-bit engine are converted when loaded.
-
-Evaluate at several search depths and build the report page:
-
-```bash
-uv run python examples/evaluate_ntuple.py --games 100 --depths 0,1,2,3 --json checkpoints/ntuple/evals.json
-```
-
-```bash
-uv run python -c "from game2048.report import ntuple_main; ntuple_main()"
-```
-
-Pick **ntuple** in the web UI to watch it play with depth-3 expectimax
-(about 8 ms per move). `GAME2048_NTUPLE` overrides the weights path. In
-Python:
-
-```python
-from game2048 import ntuple as nt
-net = nt.NTupleNet.load("checkpoints/ntuple/latest.bin")
-stats = nt.summarize(net.play(games=100, depth=3, threads=12))
-```
-
-`depth` counts random-spawn layers searched; depth 2 is the "3-ply"
-expectimax of the literature.
-
-### Cool mode: tables trained for placing the tiles
-
-In cool mode there is no chance node, so the search maximises over moves and
-over placements (`NTupleNet.best_choose`, `choose_value`, `play_choose`;
-`depth` counts placement decisions and `topk` placements are kept per node).
-Tables trained on random spawns never saw a 32768, so they stall there in
-cool mode. `--choose` trains tables by self-play in the choose game instead,
-TD(0) on afterstates with the depth-1 choose search as the policy, and
-`--explore 0.02` places a random tile on 2% of steps so the games do not all
-replay one line:
-
-```bash
-uv run python -m game2048.ntuple_train --choose --patterns 8x6 --hours 3 --threads 12 --lock-memory --out checkpoints/ntuple_choose --chunk 1000 --explore 0.02
-```
-
-Choose-mode games run thousands of moves with a small search each, so use a
-small `--chunk`. Leave `--max-moves` at its default. Games cut at a cap leave
-their late boards ungrounded, the values inflate, and the policy collapses.
-Pick **ntuple-cool** in the web UI (weights from `GAME2048_NTUPLE_COOL`, else
-`checkpoints/ntuple_choose/weights.bin`); it answers 503 until the weights exist.
-
-With no chance nodes the choose game is a deterministic puzzle, and beam
-search suits it better than a tree: keep the `width` best boards, extend each
-by a move and a placement, repeat `depth` times, then play the first step of
-the best line (`NTupleNet.beam_plan`, `beam_choose`, `beam_value`,
-`play_beam`). An entry is ranked by its rewards so far plus the best next
-move's reward and value. With unlimited width this is exactly the max-max tree
-of the same depth, and a test checks that. `spread` caps how many survivors
-may share a parent, `stride` commits several steps of a plan before searching
-again, and `snake` adds a weighted bonus for keeping the chain laid out as a
-snake along the board. On the 5-minute cool-mode tables, 6 games each, with
-32768 reached in every game:
-
-| search | mean score | cost per move |
+| Player | Score | Biggest tile |
 | --- | --- | --- |
-| max-max tree, depth 3 | 599k | 9 ms |
-| beam, width 16, depth 16 | 369k (stalls at 16384) | 16 ms |
-| beam, width 32, depth 12 | 808k | 20 ms |
+| `ntuple-cool`: tables trained on cool mode for 4 hours, plus a search | 1,528,428 | 65536 |
+| `snake` | **3,931,768** | **131072** |
 
-Width matters more than depth: a narrow beam fills up with variants of one
-line. The **ntuple-cool** agent uses width 32 and depth 12 and plays four
-steps of each plan before planning again. A deterministic policy makes the
-choose game a single canonical line. Different start tiles, and even a prefix
-of random spawns (`prefix=`), converge to the same game within a few hundred
-moves, so two evaluation games are as good as twelve, and small score
-differences between search settings are chaotic rather than statistical.
+Every number comes from a run of this code. The details are under
+[Results](#results).
 
-### The snake player: no tables, 131072
+## How it works
 
-The learned tables turned out to be the weak link in the endgame, where a
-16-tile chain has to be collapsed in exact order. The **snake** agent drops
-them entirely: an untouched network (value 0 everywhere) so the beam ranks
-boards by their merges plus the snake heuristic alone, with the decay set to
-0.9 so every tile on the path counts (`nt.set_snake_decay`), 128 lines, 16
-steps ahead, four steps per plan. On the canonical game:
+### Learning what a board is worth
 
-| evaluator | beam | score | max tile | moves | time |
-| --- | --- | --- | --- | --- | --- |
-| best learned tables, snake 0 | 32 x 12 | 1,528,428 | 65536 | 35,686 | 3 min |
-| snake only, decay 0.5 | 32 x 12 | 785,284 | 32768 | 16,405 | 37 s |
-| snake only, decay 0.5 | 64 x 16 | 1,614,376 | 65536 | 30,801 | 2.4 min |
-| snake only, decay 0.5 | 128 x 16 | 1,704,108 | 65536 | 32,806 | 2.3 min |
-| snake only, decay 0.75 | 128 x 16 | 3,670,436 | **131072** | 65,636 | 4.3 min |
-| snake only, decay 0.9 | 128 x 16 | 3,670,068 | **131072** | 65,544 | 4.2 min |
-| decay 0.9, 2s only (`tiles=1`) | 128 x 16 | 1,835,012 | 65536 | | |
-| decay 0.9, 4s charged (`tiles=7`) | 128 x 16 | 1,742,508 | 65536 | 42,402 | 2.8 min |
-| decay 0.9, 2s first (`tiles=12`) | 128 x 16 | **3,931,768** | **131072** | 130,969 | 4.1 min |
+After you move and before the new tile appears, the board is in an
+*afterstate*. Each learning player holds a function V that estimates how many
+more points a game will earn from a given afterstate. Playing is then simple:
+try the four moves and take the one with the highest total of points from the
+move plus V of the board it leaves behind.
 
-Where the ceiling comes from: every point is a merge, so a game's score is
-what its final board would be worth if every tile had been built from 2s,
-minus 4 for each 4 that was placed (a placed 4 skips the 2+2 merge). The best
-final board holds one of each tile from 131072 down to 4, worth 3,932,164, so
-past reaching that board the only thing left to optimize is the number of 4s.
-The 3,670,068 game placed almost nothing but 4s, which costs the whole board
-mass, 262,140 points.
+Learning is almost as simple. Play a game by that rule, and after every move
+nudge V of the previous afterstate toward the points just earned plus V of
+the new afterstate. When the game ends, nudge the last one toward zero. This
+is temporal-difference learning, TD(0) for short. V starts at zero
+everywhere. Nobody tells the player to keep its big tile in a corner. It
+finds that out from its own games.
 
-Restricted to 2s (`tiles=1`) the beam builds a flawless chain from 65536 down
-to 2 and then stops: the next level needs 17 tiles on 16 cells unless one of
-them arrives as a 4. Charging each placed 4 its 4 points in the ranking
-(`tiles=7`) is not enough on its own, because a 4 still adds twice the mass per
-step, and that game died at 65536. What works is **2s first** (`tiles=8`, or
-12 to also charge the 4s): plan with 2s only, and only when every 2s-only line
-dies within the 16-step horizon, plan again with 4s allowed and play just that
-plan's first step. That game ends on the best board with 99 fours, 98 placed
-in bursts of seven or eight at the 131072 cascade and at later full-chain
-cascades, plus a final 2 where a 4 would have scored the same: 3,931,768 points,
-99.99% of the ceiling. Twice as many moves, since every tile arrives as a 2,
-but the same wall time, since a 2s-only beam has half the candidates. Pick
-**snake** in the web UI with Cool mode and Max speed to watch it.
+### Lookup tables instead of a neural network
 
-With random spawns the snake agent plays depth-3 expectimax with the snake
-bonus at the leaves (`NTupleNet.leaf_snake`, weight 16, decay 0.9). Over 24
-games that averages 66k and reaches 2048 every time, but 8192 at best
-(without the bonus: 20k). A bonus for empty cells made it worse at every
-weight tried. For random spawns use **ntuple**.
+V has to be stored somehow. The `nn` player uses a small convolutional
+network. The stronger choice for 2048 is plainer: an *n-tuple network*, which
+is a set of lookup tables.
 
-```python
-net = nt.NTupleNet.load("checkpoints/ntuple_choose/weights.bin")
-stats = nt.summarize(net.play_beam(games=2, width=32, depth=12, stride=4, threads=2))
-```
+Pick 6 cells of the board. Their contents, 18 possibilities each (empty, 2,
+4, up to 131072), form an index into a table of 18^6 = 34 million weights. V
+is the sum of those lookups over 8 such patterns, each read under the 8
+rotations and reflections of the board. That is 64 additions per board and
+272 million weights.
+
+Because it is only additions, it is fast, and
+[`game2048/native/ntuple.c`](game2048/native/ntuple.c) is built around that.
+A board is one 128-bit integer with five bits per cell. A move is four table
+lookups. Training threads all write to the same tables without locks. Each
+weight has its own learning rate that falls as its updates start to cancel
+out (temporal coherence learning). The 8-pattern run in the table played 36
+billion moves in 4 hours on 12 threads of an M3 Pro, about 2.7 million a
+second, and the 4-pattern run went more than twice as fast.
+
+Python drives the C library through `ctypes`, and the library compiles itself
+with the system compiler the first time it is used.
+
+### Looking ahead
+
+A trained V plays well alone and better with search. *Expectimax* tries each
+move, then every tile that could appear (a 2 nine times in ten, a 4
+otherwise, in each empty cell), then each reply, three levels deep, with V at
+the leaves. It averages over the tiles instead of assuming the worst. That
+takes the 8-pattern network from 276,699 points with no search to 351,671, at
+about 8 ms per move.
+
+### Cool mode
+
+When you place the tiles yourself there is no luck left, and the game becomes
+a puzzle. Every point comes from a merge, so a finished game's score is fixed
+by its final board and by how many of the placed tiles were 4s (a placed 4
+skips the 2+2 merge that would have paid 4 points). No final board beats one
+of every tile from 131072 down to 4, which caps the score at 3,932,164.
+
+The `snake` agent gets within 396 of that with a beam search: keep the 128
+most promising lines of play, extend each by one move and one placement,
+repeat 16 times, play the first 4 steps of the best line, and plan again. A
+line is ranked by the points it earned plus one hand-written term that
+rewards tiles laid out in descending order along a snake-shaped path, so that
+each merge sets up the next. It places 2s unless only a 4 keeps the game
+alive, which happens 98 times in 131,000 moves.
+
+The learned tables are not involved. Tables trained on cool mode did worse
+than no tables at all. [docs/COOL_MODE.md](docs/COOL_MODE.md) has the whole
+story, including where the 396 points went.
+
+<img src="docs/images/final-board.png" alt="The last board of the snake agent's cool-mode game: 131072 down to 8 in snake order, with 3,931,768 points" width="380">
 
 ## Results
 
-Trained on an M3 Pro (MPS) for 46 minutes: 25 minutes at learning rate 3e-4,
-then 21 minutes resumed from the best checkpoint at 1e-4. 53.3M moves,
-54,645 games. The checkpoint that ships in `checkpoints/best.pt` is from
-iteration 95,000. Evaluated over 500 fresh games (`--seed 999`):
+Normal game. The baselines and the CNN played 500 games each (seeds from
+999). The n-tuple networks played the same 100 games at each search depth
+(seed 2024). Depth counts the layers of random tiles searched, so depth 0 is
+no search. The `snake` figures in the table above are from 24 games.
 
-| Player | Mean score | Median | Best game | Reach 1024 | Reach 2048 | Reach 4096 |
+| Player | Mean score | Median | Best game | Reach 2048 | Reach 16384 | Reach 32768 |
 | --- | --- | --- | --- | --- | --- | --- |
-| Random moves | 1,197 | | | 0% | 0% | 0% |
-| Greedy (max immediate merge) | 3,079 | | | 0% | 0% | 0% |
-| Value net | 23,392 | 23,236 | | 86.6% | 57.2% | 6.6% |
-| Value net, 8-symmetry average (the UI's **nn** agent) | 29,869 | 30,984 | 76,532 | 94.6% | 73.6% | 14.0% |
+| Random moves | 1,099 | | 3,124 | 0% | | |
+| Greedy | 3,180 | | 8,456 | 0% | | |
+| CNN | 23,392 | 23,236 | 70,536 | 57.2% | | |
+| CNN, averaged over the 8 board symmetries (`nn`) | 29,869 | 30,984 | 76,532 | 73.6% | | |
+| 4 patterns, 2 h of training, depth 0 | 241,803 | 270,258 | 372,332 | 99% | 61% | 0% |
+| 4 patterns, depth 3 | 345,675 | 363,168 | 385,588 | 100% | 97% | 0% |
+| 8 patterns, 4 h of training, depth 0 | 276,699 | 290,356 | 375,016 | 100% | 75% | 0% |
+| 8 patterns, depth 2 | 342,382 | 362,248 | 528,284 | 100% | 93% | 1% |
+| **8 patterns, depth 3 (`ntuple`)** | **351,671** | **365,754** | **621,048** | 100% | 98% | 1% |
 
-Two n-tuple networks, each evaluated over the same 100 games per depth
-(`--seed 2024`):
+<img src="docs/images/training-report.png" alt="Training report for the 8-pattern network: mean score at each search depth, and the learning curve over 4 million games" width="640">
 
-| Network | Search depth | Mean score | Median | Best game | Reach 8192 | Reach 16384 | Reach 32768 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 4 patterns, 2 h, 4.5M games | 0 | 241,803 | 270,258 | 372,332 | 91% | 61% | 0% |
-| | 2 | 343,454 | 362,828 | 385,160 | 99% | 95% | 0% |
-| | 3 | 345,675 | 363,168 | 385,588 | 100% | 97% | 0% |
-| **8 patterns, 4 h, 4.0M games** | 0 | 276,699 | 290,356 | 375,016 | 97% | 75% | 0% |
-| | 2 | 342,382 | 362,248 | 528,284 | 100% | 93% | 1% |
-| | 3 (the UI's **ntuple** agent) | **351,671** | **365,754** | **621,048** | 99% | 98% | 1% |
+*Part of the report page that `python -m game2048.report --ntuple` builds
+from a training log, here for the 8-pattern run.*
 
-The 4-pattern tables top out near 385,000, the score of a board holding
-16384, 8192 and the rest, because they never learn to merge two 16384s. The
-8-pattern network (`--patterns 8x6`) has the capacity for that and is the
-only one that reaches 32768; it ships as `checkpoints/ntuple/weights.bin`
-(the 4-pattern weights are kept as `weights_4x6.bin`). A 3-stage run seeded
-from the 4-pattern tables (`--stages 16384,24576`) scored 313,338 at depth 2
-and was dropped.
+This is a strong player and not the state of the art. The best published
+n-tuple players average about 600,000 and reach 32768 in most games
+(Jaśkowski, 2017). The 4-pattern tables here top out near 385,000, roughly
+where a game ends if it holds a 16384 and an 8192 and never merges two
+16384s. The 8-pattern tables manage that merge once in a hundred games.
 
-In cool mode, 8-pattern tables trained for 4 hours on the choose game and
-played with the beam (width 32, depth 12, four steps per plan) scored
-1,299,016 on the canonical game and built a 65536.
+## What did not work
 
-Regenerate the report page from the log and an evaluation:
+- **The CNN.** It was the first learner and it stalled at 2048 in 74% of
+  games. The tables passed it within the first minute of training.
+- **Multi-stage tables.** Giving late-game boards their own tables is the
+  idea behind the best published results. A 3-stage run seeded from the
+  4-pattern tables scored 313,338 at depth 2, below the single-stage tables,
+  and was dropped.
+- **Learning cool mode.** Tables trained for 4 hours on the choose game
+  reached 65536. The search with no tables reached 131072.
+- **Charging 4s their cost in the search ranking.** That game died at 65536.
+  Planning with 2s first and falling back to 4s is what worked.
+- **A bonus for empty cells** in the snake player's random-tile search. It
+  was worse at every weight tried.
+
+## Train your own
 
 ```bash
-uv run python examples/evaluate.py --games 500 --symmetric --json checkpoints/eval.json
+uv run python -m game2048.ntuple_train --hours 0.2 --threads 8
 ```
 
-```bash
-uv run python -m game2048.report --log checkpoints/log.csv --eval checkpoints/eval.json --out checkpoints/report.html
-```
+That is 12 minutes. It writes `checkpoints/ntuple/weights.bin`, and the
+`ntuple` player in the web UI picks it up. A short run goes a long way: after
+140,000 games (ten minutes on a laptop that was busy with other jobs) the
+tables averaged 201,797 points over 48 games with a 2-level search and
+reached 8192 in 96% of them. The 2-hour and 4-hour runs in the table are the
+same command with `--hours 2`, and with `--hours 4 --patterns 8x6`.
+
+[docs/TRAINING.md](docs/TRAINING.md) covers the flags, the cool-mode tables,
+the CNN, and the report page with the learning curves.
+
+## What is in the repo
+
+| Path | What it is |
+| --- | --- |
+| `game2048/core.py` | The rules. `Game` holds the board and score. No dependencies. |
+| `game2048/native/ntuple.c` | The C engine: bitboards, the n-tuple network, TD learning, expectimax and beam search, multithreaded. |
+| `game2048/ntuple.py` | The `ctypes` wrapper around it, and the `ntuple` and `snake` agents. |
+| `game2048/ntuple_train.py` | Training command for the n-tuple network. |
+| `game2048/server.py`, `static/` | FastAPI server and the browser UI (plain HTML, CSS and JS). |
+| `game2048/env.py`, `game2048/vec_env.py` | `reset()` / `step()` environment, and a numpy engine for many boards at once. |
+| `game2048/nn.py`, `game2048/train.py` | The CNN baseline and its trainer (PyTorch, optional). |
+| `game2048/agents.py` | The player registry. Add your own with an `act(game)` method. |
+| `game2048/report.py` | Builds an HTML report from a training log. |
+| `examples/` | Evaluation and rollout scripts. |
+| `tests/` | The test suite. |
+
+[docs/USAGE.md](docs/USAGE.md) has the Python API, the HTTP API, the tile
+modes, and how to plug in your own agent.
 
 ## Tests
 
 ```bash
+uv sync --extra dev
 uv run pytest
 ```
 
-## Example rollout
+About three minutes. The C code is checked against plain Python versions of
+the same logic: the move rules against `core.py`, and expectimax, the cool-mode
+tree and the beam search against small reference implementations in the
+tests. The CNN tests are skipped unless PyTorch is installed
+(`uv sync --extra dev --extra train`).
 
-```bash
-uv run python examples/rollout.py --agent greedy --episodes 20
-```
+## References
+
+- M. Szubert and W. Jaśkowski, "Temporal Difference Learning of N-Tuple
+  Networks for the Game 2048", IEEE CIG 2014. Afterstate TD learning with
+  n-tuple networks.
+- K.-H. Yeh, I-C. Wu, C.-H. Hsueh, C.-C. Chang, C.-C. Liang and H. Chiang,
+  "Multi-Stage Temporal Difference Learning for 2048-like Games", 2016. The
+  6-cell patterns and the stages.
+- W. Jaśkowski, "Mastering 2048 with Delayed Temporal Coherence Learning,
+  Multi-Stage Weight Promotion, Redundant Encoding and Carousel Shaping",
+  2017. Temporal coherence learning and weight promotion.

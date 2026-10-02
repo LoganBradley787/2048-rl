@@ -9,7 +9,8 @@
   const scoreEl = $("score");
   const bestEl = $("best");
   const deltaEl = $("score-delta");
-  const overlayEl = $("overlay");
+  const gameOverEl = $("game-over");
+  const fmt = (n) => n.toLocaleString("en-US");
   const statusEl = $("status");
   const agentSel = $("agent");
   const modeSel = $("mode");
@@ -24,8 +25,17 @@
     best: "Best mode: each new tile is the one that helps you most.", evil: "Evil mode: each new tile is the one that hurts you most.",
     choose: "Cool mode: after each move, click an empty cell and pick 2 or 4 (or press 2 / 4).",
   };
+  const AGENT_LABELS = {
+    snake: "snake: search only, no training",
+    ntuple: "ntuple: trained tables + expectimax",
+    "ntuple-cool": "ntuple-cool: tables trained for cool mode",
+    nn: "nn: small CNN (baseline)",
+    greedy: "greedy: biggest merge now",
+    random: "random moves",
+  };
+  const DEFAULT_AGENT = "snake";   // needs no trained weights, so it works on a fresh clone
   let awaiting = false;
-  let pickCell = null;   // [row, col] the player clicked while a tile is due
+  let pickCell = null;   // [row, col] the player chose while a tile is due
   const loadMode = () => { try { return localStorage.getItem("mode2048") || "random"; } catch { return "random"; } };
   const saveMode = (m) => { try { localStorage.setItem("mode2048", m); } catch {} };
   const autoBtn = $("agent-auto");
@@ -41,52 +51,61 @@
   const loadBest = () => { try { return Number(localStorage.getItem("best2048") || 0); } catch { return 0; } };
   const saveBest = (v) => { try { localStorage.setItem("best2048", String(v)); } catch {} };
   let best = loadBest();
-  bestEl.textContent = best;
+  bestEl.textContent = fmt(best);
 
   function render(state) {
     const spawned = spawnedCell(prevBoard, state.board);
     awaiting = !!state.awaiting_tile;
     if (!awaiting) pickCell = null;
     boardEl.classList.toggle("awaiting", awaiting);
-    boardEl.replaceChildren(
-      ...state.board.flatMap((row, i) => row.map((v, j) => {
-        const el = document.createElement("div");
-        el.className = "tile";
-        el.setAttribute("role", "gridcell");
-        if (v) {
-          el.dataset.v = v;
-          el.textContent = v;
-          if (v > 2048) el.classList.add("big");
-          if (spawned && spawned[0] === i && spawned[1] === j) el.classList.add("new");
-        } else if (awaiting) {
-          el.classList.add("placeable");
-          el.setAttribute("role", "button");
-          el.setAttribute("aria-label", `place a tile at row ${i + 1}, column ${j + 1}`);
-          el.tabIndex = 0;
-          if (pickCell && pickCell[0] === i && pickCell[1] === j) {
-            el.classList.add("picking");
-            for (const val of [2, 4]) {
-              const b = document.createElement("button");
-              b.className = "pick";
-              b.textContent = val;
-              b.addEventListener("click", (e) => { e.stopPropagation(); placeTile(i, j, val); });
-              el.appendChild(b);
-            }
-          } else {
-            el.addEventListener("click", () => { pickCell = [i, j]; render(lastState); });
-          }
-        }
-        return el;
-      }))
-    );
+    boardEl.replaceChildren(...state.board.map((row, i) => {
+      const rowEl = document.createElement("div");
+      rowEl.className = "row";
+      rowEl.setAttribute("role", "row");
+      rowEl.append(...row.map((v, j) => tileEl(v, i, j, spawned)));
+      return rowEl;
+    }));
     lastState = state;
-    scoreEl.textContent = state.score;
-    if (state.score > best) { best = state.score; saveBest(best); bestEl.textContent = best; }
-    overlayEl.hidden = !state.over;
+    scoreEl.textContent = fmt(state.score);
+    if (state.score > best) { best = state.score; saveBest(best); bestEl.textContent = fmt(best); }
+    gameOverEl.hidden = !state.over;
     if (state.over) stopAuto();
     if (state.mode && modeSel.value !== state.mode && [...modeSel.options].some((o) => o.value === state.mode)) modeSel.value = state.mode;
     modeHint.textContent = MODE_HINTS[state.mode] || "";
     prevBoard = state.board;
+  }
+
+  // One cell of the board. In cool mode an empty cell can be chosen (click, Enter or
+  // Space) and then shows the 2 and 4 buttons.
+  function tileEl(v, i, j, spawned) {
+    const el = document.createElement("div");
+    el.className = "tile";
+    el.setAttribute("role", "gridcell");
+    if (v) {
+      el.dataset.v = v;
+      el.textContent = v;
+      if (spawned && spawned[0] === i && spawned[1] === j) el.classList.add("new");
+    } else if (awaiting && pickCell && pickCell[0] === i && pickCell[1] === j) {
+      el.classList.add("placeable", "picking");
+      for (const val of [2, 4]) {
+        const b = document.createElement("button");
+        b.className = "pick";
+        b.textContent = val;
+        b.setAttribute("aria-label", `place a ${val} at row ${i + 1}, column ${j + 1}`);
+        b.addEventListener("click", (e) => { e.stopPropagation(); placeTile(i, j, val); });
+        el.appendChild(b);
+      }
+    } else if (awaiting) {
+      el.classList.add("placeable");
+      el.setAttribute("aria-label", `empty, row ${i + 1}, column ${j + 1}: choose to place a tile here`);
+      el.tabIndex = 0;
+      const pick = () => { pickCell = [i, j]; render(lastState); boardEl.querySelector(".pick")?.focus(); };
+      el.addEventListener("click", pick);
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+      });
+    }
+    return el;
   }
 
   // Cells that were empty and are now filled. After a slide there can be
@@ -101,7 +120,7 @@
 
   function showDelta(reward) {
     if (!reward) return;
-    deltaEl.textContent = `+${reward}`;
+    deltaEl.textContent = `+${fmt(reward)}`;
     deltaEl.classList.remove("show");
     void deltaEl.offsetWidth; // restart the animation
     deltaEl.classList.add("show");
@@ -112,8 +131,9 @@
       ? {}
       : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new Error(`${res.status} ${detail}`);
+      let detail = await res.text().catch(() => "");
+      try { const d = JSON.parse(detail).detail; if (typeof d === "string") detail = d; } catch {}
+      throw new Error(detail || `HTTP ${res.status}`);
     }
     return res.json();
   }
@@ -231,12 +251,15 @@
   (async () => {
     try {
       const names = await api("/api/agents");
-      agentSel.replaceChildren(...names.map((n) => Object.assign(document.createElement("option"), { value: n, textContent: n })));
+      agentSel.replaceChildren(...names.map((n) => Object.assign(document.createElement("option"), { value: n, textContent: AGENT_LABELS[n] || n })));
+      if (names.includes(DEFAULT_AGENT)) agentSel.value = DEFAULT_AGENT;
       const modes = await api("/api/modes");
       modeSel.replaceChildren(...modes.map((m) => Object.assign(document.createElement("option"), { value: m, textContent: MODE_LABELS[m] || m })));
       const state = await api("/api/state");
+      // The remembered mode only replaces an untouched game: the server holds the one
+      // game, and a second tab or a reload must not throw away a game that is under way.
       const wanted = loadMode();
-      if (state.mode !== wanted && modes.includes(wanted)) { modeSel.value = wanted; render(await api("/api/new", { mode: wanted })); }
+      if (state.mode !== wanted && modes.includes(wanted) && state.score === 0) { modeSel.value = wanted; render(await api("/api/new", { mode: wanted })); }
       else render(state);
     } catch (e) {
       statusEl.textContent = `Could not reach backend: ${e.message}`;

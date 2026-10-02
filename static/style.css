@@ -71,23 +71,11 @@ h1 { font-size: 56px; margin: 0; font-weight: 800; line-height: 1; }
   100% { opacity: 0; transform: translateY(-28px); }
 }
 
-.controls {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 14px;
-}
-
-.mode-controls { display: flex; align-items: center; gap: 6px; }
-
-.agent-controls {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
+.controls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.control-row { display: flex; align-items: center; gap: 6px; }
+.control-row select { flex: 1; min-width: 0; }
+.control-row .btn { white-space: nowrap; }
+.control-row.spread { justify-content: space-between; }
 
 .btn {
   border: 0;
@@ -113,9 +101,8 @@ select {
 }
 
 .speed { font-size: 13px; display: flex; align-items: center; gap: 4px; }
-.speed input { width: 80px; }
-
-.board-wrap { position: relative; }
+.speed input { width: 120px; }
+#speed-value { display: inline-block; min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; }
 
 .board {
   background: var(--board);
@@ -129,6 +116,7 @@ select {
   height: var(--size);
   touch-action: none;
 }
+.row { display: contents; }   /* rows exist for the grid role; the tiles are the grid items */
 
 .tile {
   border-radius: 4px;
@@ -155,21 +143,28 @@ select {
 .tile[data-v="512"]  { background: #edc850; color: #f9f6f2; font-size: calc(var(--size) / 11); }
 .tile[data-v="1024"] { background: #edc53f; color: #f9f6f2; font-size: calc(var(--size) / 13); }
 .tile[data-v="2048"] { background: #edc22e; color: #f9f6f2; font-size: calc(var(--size) / 13); box-shadow: 0 0 30px 6px rgba(243, 215, 116, .5); }
-.tile.big           { background: #3c3a32; color: #f9f6f2; font-size: calc(var(--size) / 14); }
+/* past 2048 the original game goes dark; here each tile keeps its own colour, so a
+   chain up to 131072 still reads as a gradient */
+.tile[data-v="4096"]   { background: #ef6a5f; color: #f9f6f2; font-size: calc(var(--size) / 13); }
+.tile[data-v="8192"]   { background: #e0507c; color: #f9f6f2; font-size: calc(var(--size) / 13); }
+.tile[data-v="16384"]  { background: #b84a9f; color: #f9f6f2; font-size: calc(var(--size) / 16); }
+.tile[data-v="32768"]  { background: #8552bd; color: #f9f6f2; font-size: calc(var(--size) / 16); }
+.tile[data-v="65536"]  { background: #4f66c9; color: #f9f6f2; font-size: calc(var(--size) / 16); }
+.tile[data-v="131072"] { background: #23272f; color: #f9f6f2; font-size: calc(var(--size) / 19); box-shadow: 0 0 30px 6px rgba(79, 102, 201, .45); }
 
-.overlay {
-  position: absolute;
-  inset: 0;
+/* shown under the board, so the final position stays in view */
+.game-over {
+  margin-top: 12px;
+  padding: 8px 8px 8px 18px;
   border-radius: 8px;
-  background: rgba(238, 228, 218, .78);
+  background: var(--btn);
+  color: var(--btn-fg);
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 16px;
+  justify-content: space-between;
 }
-.overlay[hidden] { display: none; }
-.overlay p { font-size: 48px; font-weight: 800; margin: 0; }
+.game-over[hidden] { display: none; }
+.game-over p { font-size: 22px; font-weight: 800; margin: 0; }
 
 .hint { margin-top: 18px; font-size: 14px; }
 .status { color: #b04a3c; font-weight: 600; }
@@ -191,4 +186,4 @@ select {
 .pick:hover { filter: brightness(.95); }
 @media (prefers-reduced-motion: reduce) { .board.awaiting .tile.placeable { animation: none; } }
 
-.turbo { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.9rem; opacity: 0.85; cursor: pointer; }
+.turbo { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }

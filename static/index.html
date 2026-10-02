@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>2048</title>
-<link rel="stylesheet" href="/static/style.css?v=6">
+<link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
 <main class="app">
@@ -17,14 +17,16 @@
   </header>
 
   <div class="controls">
-    <div class="mode-controls">
+    <div class="control-row">
       <button id="new-game" class="btn primary">New game</button>
       <select id="mode" aria-label="Tile mode" title="How the next tile is chosen"></select>
     </div>
-    <div class="agent-controls">
-      <select id="agent" aria-label="Agent"></select>
+    <div class="control-row">
+      <select id="agent" aria-label="Agent" title="The AI player that Step and Auto-play use"></select>
       <button id="agent-step" class="btn">Step</button>
       <button id="agent-auto" class="btn">Auto-play</button>
+    </div>
+    <div class="control-row spread">
       <label class="speed">Speed
         <input id="speed" type="range" min="1" max="30" value="8" aria-label="Moves per second">
         <span id="speed-value">8</span>/s
@@ -35,16 +37,14 @@
     </div>
   </div>
 
-  <div class="board-wrap">
-    <div id="board" class="board" role="grid" aria-label="2048 board"></div>
-    <div id="overlay" class="overlay" hidden>
-      <p>Game over</p>
-      <button id="retry" class="btn primary">Try again</button>
-    </div>
+  <div id="board" class="board" role="grid" aria-label="2048 board"></div>
+  <div id="game-over" class="game-over" role="status" hidden>
+    <p>Game over</p>
+    <button id="retry" class="btn">Try again</button>
   </div>
 
   <p class="hint"><span id="mode-hint"></span> Arrow keys or WASD to move. Backend: Python. <span id="status" class="status"></span></p>
 </main>
-<script src="/static/app.js?v=6"></script>
+<script src="/static/app.js?v=8"></script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 """n-tuple network 2048 player: ctypes wrapper over native/ntuple.c.
 
 The C library is compiled with the system C compiler the first time it is
-needed (or when the source is newer than the built library).
+needed (or when the source or this file is newer than the built library).
 
     net = NTupleNet()                # 4 x 6-tuples, TC learning
     net.train(games=10_000, threads=12)
@@ -122,8 +122,11 @@ _lib = None
 def _build() -> None:
     cc = os.environ.get("CC", "cc")
     tmp = LIB.with_suffix(LIB.suffix + ".tmp")
+    # -ffp-contract=off: no fused multiply-add, so every CPU does the same arithmetic.
+    # Self-play is chaotic; with fusing on, an arm64 and an x86-64 build train different tables.
+    flags = ["-O3", "-ffp-contract=off", "-shared", "-fPIC"]
     try:
-        subprocess.run([cc, "-O3", "-shared", "-fPIC", "-o", str(tmp), str(SRC), "-lpthread", "-lm"], check=True)
+        subprocess.run([cc, *flags, "-o", str(tmp), str(SRC), "-lpthread", "-lm"], check=True)
     except (OSError, subprocess.CalledProcessError) as e:
         raise ImportError(f"could not build the C engine with {cc!r} ({e}); it needs a C compiler "
                           "(Xcode command line tools on macOS, gcc or clang on Linux; set CC to pick one)") from e
@@ -134,7 +137,8 @@ def lib() -> ctypes.CDLL:
     global _lib
     if _lib is not None:
         return _lib
-    if not LIB.exists() or LIB.stat().st_mtime < SRC.stat().st_mtime:
+    newest = max(SRC.stat().st_mtime, Path(__file__).stat().st_mtime)   # this file holds the compiler flags
+    if not LIB.exists() or LIB.stat().st_mtime < newest:
         _build()
     L = ctypes.CDLL(str(LIB))
     u64, i32, i64, f32, f64, vp, cp = (ctypes.c_uint64, ctypes.c_int, ctypes.c_int64, ctypes.c_float,

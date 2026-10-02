@@ -191,6 +191,10 @@ where a game ends if it holds a 16384 and an 8192 and never merges two
 
 ## Train your own
 
+The trained weights are not in the repository: one set of n-tuple tables is
+0.5 to 3 GB, far past what git is for. The players that need them are a
+command away instead.
+
 ```bash
 uv run python -m game2048.ntuple_train --hours 0.2 --threads 8
 ```
@@ -202,8 +206,15 @@ tables averaged 201,797 points over 48 games with a 2-level search and
 reached 8192 in 96% of them. The 2-hour and 4-hour runs in the table are the
 same command with `--hours 2`, and with `--hours 4 --patterns 8x6`.
 
-[docs/TRAINING.md](docs/TRAINING.md) covers the flags, the cool-mode tables,
-the CNN, and the report page with the learning curves.
+The `nn` player needs PyTorch and a run of its own:
+
+```bash
+uv sync --extra train
+uv run python -m game2048.train --minutes 30
+```
+
+[docs/TRAINING.md](docs/TRAINING.md) covers the flags, the tables for
+`ntuple-cool`, and the report page with the learning curves.
 
 ## What is in the repo
 
@@ -248,3 +259,7 @@ tests. The CNN tests are skipped unless PyTorch is installed
 - W. Jaśkowski, "Mastering 2048 with Delayed Temporal Coherence Learning,
   Multi-Stage Weight Promotion, Redundant Encoding and Carousel Shaping",
   2017. Temporal coherence learning and weight promotion.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

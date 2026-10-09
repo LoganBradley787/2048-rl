@@ -31,6 +31,8 @@ def main(argv=None) -> None:
     p.add_argument("--seed", type=int, default=2024)
     p.add_argument("--cutoff", type=float, default=0.0,
                    help="skip spawn branches whose cumulative probability is below this (0 = exact)")
+    p.add_argument("--downgrade", type=int, default=0,
+                   help="tile (e.g. 32768) from which the search picks its move on the downgraded board; 0 = off")
     p.add_argument("--json", default=None)
     p.add_argument("--choose", action="store_true", help="evaluate the choose game (cool mode) instead of random spawns")
     p.add_argument("--beam", default="", help="choose mode: comma-separated beams width:depth[:spread[:stride]]")
@@ -39,6 +41,7 @@ def main(argv=None) -> None:
 
     path = nt.resolve_weights(args.weights)
     net = nt.NTupleNet.load(path)
+    net.downgrade = args.downgrade
     out_dir = path.parent
     state = json.loads((out_dir / "state.json").read_text()) if (out_dir / "state.json").exists() else {}
     mps = None
@@ -80,7 +83,7 @@ def main(argv=None) -> None:
             show(f"depth {d}", stats, t)
     if args.json:
         meta = {**state, "threads": state.get("threads", args.threads), "eval_threads": args.threads,
-                "cutoff": args.cutoff, "moves_per_s": mps, "weights": str(path),
+                "cutoff": args.cutoff, "downgrade": args.downgrade, "moves_per_s": mps, "weights": str(path),
                 "mode": "choose" if args.choose else "random"}
         Path(args.json).write_text(json.dumps({"evals": evals, "meta": meta}, indent=1))
         print(f"wrote {args.json}")

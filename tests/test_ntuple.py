@@ -62,6 +62,30 @@ def test_fresh_network_values_are_zero(net):
     assert all(net.value(nt.to_bits(rand_exps(rng))) == 0.0 for _ in range(10))
 
 
+def test_optimistic_network_values_every_board_at_v_init(tmp_path):
+    rng = np.random.default_rng(4)
+    boards = [nt.to_bits(rand_exps(rng, max_exp=15)) for _ in range(10)]
+    for patterns in (nt.PATTERN_SETS["4x6"], nt.PATTERN_SETS["8x6"]):
+        n = nt.NTupleNet(patterns=patterns, tc=False, v_init=320_000)
+        assert all(n.value(b) == pytest.approx(320_000, rel=1e-5) for b in boards)
+        n.save(tmp_path / "opt.bin")
+        n.close()
+        back = nt.NTupleNet.load(tmp_path / "opt.bin")
+        assert back.value(boards[0]) == pytest.approx(320_000, rel=1e-5)
+        back.close()
+
+
+def test_optimistic_values_move_only_where_the_network_has_played():
+    n = nt.NTupleNet(tc=False, v_init=10_000)
+    n.train(200, threads=1, alpha=0.1, seed=1)
+    start = nt.spawn(nt.spawn(0, 1), 2)
+    after = next(a for a in (nt.move(start, d)[0] for d in range(4)) if a != start)
+    unseen = nt.to_bits(np.full((4, 4), 15, dtype=np.uint8))
+    assert abs(n.value(after) - 10_000) > 100          # every game passes through boards like this
+    assert n.value(unseen) == pytest.approx(10_000, rel=1e-5)
+    n.close()
+
+
 def test_update_moves_value_by_alpha_times_delta():
     n = nt.NTupleNet(tc=False)
     # 16 distinct values so no two symmetric samples of a pattern share a table entry
@@ -1046,4 +1070,52 @@ def test_beam_can_charge_fours_their_opportunity_cost():
         fours_free += sum(v == 2 for _, _, v in n.beam_plan(bits, width=4096, depth=2, snake=2.0, tiles=3))
         fours_charged += sum(v == 2 for _, _, v in n.beam_plan(bits, width=4096, depth=2, snake=2.0, tiles=7))
     assert strict and fours_charged <= fours_free                     # 4s only when they earn more than 4 points
+    n.close()
+
+
+# --- tile downgrading ---------------------------------------------------------
+
+def test_downgrade_halves_every_tile_above_the_largest_missing_one():
+    b = nt.to_bits([[15, 14, 12, 11], [3, 2, 1, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
+    # 13 is the largest tile missing below the 15: the 15 and the 14 step down, the rest stay
+    assert nt.from_bits(nt.downgrade(b)).tolist() == [[14, 13, 12, 11], [3, 2, 1, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    full = nt.to_bits([[15, 14, 13, 12], [8, 9, 10, 11], [7, 6, 5, 4], [0, 1, 2, 3]])
+    assert nt.downgrade(full) == full                  # nothing is missing, nothing to do
+    assert nt.downgrade(0) == 0
+
+
+def test_downgrade_keeps_every_merge_possible_and_no_other():
+    rng = np.random.default_rng(11)
+    for _ in range(200):
+        b = nt.to_bits(rand_exps(rng, density=0.8, max_exp=15))
+        d = nt.downgrade(b)
+        for direction in range(4):
+            moved, down_moved = nt.move(b, direction)[0], nt.move(d, direction)[0]
+            assert (moved == b) == (down_moved == d)
+            assert (nt.from_bits(moved) == 0).tolist() == (nt.from_bits(down_moved) == 0).tolist()
+
+
+def test_search_plays_the_downgraded_board_once_the_threshold_tile_is_there():
+    n = nt.NTupleNet(tc=False)
+    n.train(300, threads=1, alpha=0.1, seed=3)
+    assert n.downgrade == 0
+    rng = np.random.default_rng(12)
+    big = [nt.to_bits(np.where(g == 15, 14, g)) | 15 for g in (rand_exps(rng, max_exp=15) for _ in range(40))]
+    small = [nt.to_bits(rand_exps(rng, max_exp=13)) for _ in range(40)]
+    plain = [n.best_move(b, depth=1) for b in big + small]
+    n.downgrade = 32768
+    assert n.downgrade == 32768
+    assert [n.best_move(b, depth=1) for b in small] == plain[40:]          # no 32768 on the board: untouched
+    with_dg = [n.best_move(b, depth=1) for b in big]
+    n.downgrade = 0
+    assert with_dg == [n.best_move(nt.downgrade(b), depth=1) for b in big]
+    # Raise one move's afterstate on the downgraded board and lower the same move's on
+    # the real board: the entries they share cancel, the ones that see the big tiles do not.
+    b = nt.to_bits([[15, 14, 12, 3], [2, 5, 1, 4], [1, 3, 2, 1], [0, 0, 1, 2]])
+    other = next(m for m in nt.afterstates_valid(b) if m != n.best_move(b, depth=1))
+    n.update(nt.move(nt.downgrade(b), other)[0], 1e6, alpha=1.0)
+    n.update(nt.move(b, other)[0], -1e6, alpha=1.0)
+    assert n.best_move(b, depth=1) != other
+    n.downgrade = 32768
+    assert n.best_move(b, depth=1) == other
     n.close()

@@ -39,6 +39,13 @@ uv run python -m game2048.ntuple_train --hours 4 --threads 12 --patterns 8x6
 
 - `--patterns 8x6` starts a network with eight 6-cell patterns instead of four:
   twice the capacity, 1.1 GB of weights, and the only one here that reaches 32768.
+- `--patterns 8x6-matsuzaki` is the eight-pattern set behind the strongest
+  published n-tuple players (Matsuzaki 2016; Guei et al. 2022).
+- `--v-init 320000` starts a new network valuing every board at that number
+  (optimistic initialisation): the greedy policy keeps trying boards it has not
+  played until their values come down. Meant for plain TD at a fixed rate,
+  `--no-tc --alpha-plain 0.1`, followed by a shorter temporal coherence run:
+  `--resume <out>/latest.bin --tc-stages 1`.
 - `--no-tc` uses plain TD instead of temporal coherence learning. Temporal
   coherence keeps two extra numbers per weight and gives every weight its own
   learning rate, which falls as that weight's updates start to cancel out.
@@ -54,7 +61,8 @@ uv run python -m game2048.ntuple_train --hours 4 --threads 12 --patterns 8x6
 - `--save-every-min`, `--eval-every-min`, `--eval-games`, `--eval-depth`
   control checkpoints and the evaluations logged to `eval.csv`.
 
-Run with `--help` for the rest. Weight files written by earlier versions of
+`kill <pid>` or Ctrl-C stops a run once the chunk in progress is done, and
+saves first. Run with `--help` for the rest. Weight files written by earlier versions of
 the engine are converted when loaded.
 
 ### Evaluate and build the report page
@@ -66,6 +74,10 @@ uv run python examples/evaluate_ntuple.py --games 100 --depths 0,1,2,3 --json ch
 ```bash
 uv run python -m game2048.report --ntuple
 ```
+
+`--downgrade 32768` on the evaluation makes the search pick its move on the
+downgraded board (every tile above the largest missing one halved) once a 32768
+is on the board, where the tables have seen far more training.
 
 That writes `checkpoints/ntuple/report.html`, a self-contained page with the
 learning curve and the evaluation at each depth. `depth` counts the layers of

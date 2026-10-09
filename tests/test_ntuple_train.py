@@ -71,6 +71,20 @@ def test_train_cli_patterns_flag(tmp_path):
     assert len(json.loads((tmp_path / "state.json").read_text())["patterns"]) == 8
 
 
+def test_train_cli_v_init_starts_an_optimistic_network_and_remembers_it(tmp_path):
+    import numpy as np
+    args = ["--chunk", "50", "--threads", "2", "--out", str(tmp_path), "--no-tc", "--alpha-plain", "0.1",
+            "--eval-every-min", "0", "--save-every-min", "0"]
+    tr.main(["--games", "50", "--v-init", "20000", *args])
+    assert json.loads((tmp_path / "state.json").read_text())["v_init"] == 20000
+    unseen = nt.to_bits(np.full((4, 4), 15, dtype=np.uint8))
+    net = nt.NTupleNet.load(tmp_path / "latest.bin")
+    assert abs(net.value(unseen) - 20000) < 1
+    net.close()
+    tr.main(["--games", "50", "--resume", str(tmp_path / "latest.bin"), *args])
+    assert json.loads((tmp_path / "state.json").read_text())["v_init"] == 20000   # carried across a resume
+
+
 def test_time_budget_ignores_wall_clock_jumps(tmp_path, monkeypatch):
     """A laptop sleeping must not eat the training budget: the budget uses a clock
     that pauses with the machine, not time.time()."""
@@ -96,3 +110,21 @@ def test_train_cli_choose_flag_trains_and_evaluates_in_choose_mode(tmp_path):
     assert state["explore"] == 0.02 and state["starts"] == str(starts) and state["start_frac"] == 0.5
     ev = rows(tmp_path / "eval.csv")
     assert len(ev) == 1 and ev[0]["mode"] == "choose"
+
+
+def test_kill_stops_a_detached_run_with_a_save(tmp_path):
+    """A run started in the background ignores SIGINT; SIGTERM must still save and exit."""
+    import signal
+    import subprocess
+    import sys
+    import time
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "game2048.ntuple_train", "--hours", "1", "--chunk", "20", "--threads", "1",
+         "--out", str(tmp_path), "--eval-every-min", "0", "--save-every-min", "0"],
+        stdout=subprocess.PIPE, text=True, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+    assert proc.stdout.readline().startswith("games 20")      # training is under way
+    proc.send_signal(signal.SIGTERM)
+    out, _ = proc.communicate(timeout=60)
+    assert proc.returncode == 0 and "interrupted; saving" in out
+    assert json.loads((tmp_path / "state.json").read_text())["games"] >= 20
+    assert (tmp_path / "latest.bin").exists()

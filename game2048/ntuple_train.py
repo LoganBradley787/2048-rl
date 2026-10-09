@@ -5,7 +5,8 @@
 Writes to --out: latest.bin (weights + learning state), weights.bin (weights
 only, what the UI loads), state.json (counters), log.csv (one row per chunk
 of training games) and eval.csv (expectimax evaluations). Resume with
---resume <out>/latest.bin.
+--resume <out>/latest.bin. `kill <pid>` (or Ctrl-C) stops a run after the chunk
+in progress and saves first.
 
 --choose trains for cool mode (the player places every tile): self-play uses
 the choose search and evaluations play the choose game. Keep --max-moves far
@@ -19,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import signal
 import time
 from pathlib import Path
 
@@ -65,6 +67,8 @@ def main(argv=None) -> None:
                    help="plain TD instead of temporal coherence (with --resume: drop the TC state, a third of the memory)")
     p.add_argument("--stages", default="", help="comma-separated tile-mass boundaries for multi-stage tables, e.g. 16384,24576,32768")
     p.add_argument("--patterns", default="4x6", choices=sorted(nt.PATTERN_SETS), help="pattern set for a new network")
+    p.add_argument("--v-init", type=float, default=0.0,
+                   help="value a new network gives every board (optimistic initialisation); 320000 for 8x6")
     p.add_argument("--out", default="checkpoints/ntuple")
     p.add_argument("--resume", default=None, help="weights file to continue from")
     p.add_argument("--seed", type=int, default=0)
@@ -102,8 +106,8 @@ def main(argv=None) -> None:
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
     else:
         net = nt.NTupleNet(patterns=nt.PATTERN_SETS[args.patterns], tc=not args.no_tc, boundaries=boundaries,
-                           tc_stages=tc_stages)
-        state = {}
+                           tc_stages=tc_stages, v_init=args.v_init)
+        state = {"v_init": args.v_init}
     choose = bool(args.choose or state.get("choose", False))
     starts = nt.load_starts(args.starts) if args.starts else []
     if starts:
@@ -132,6 +136,7 @@ def main(argv=None) -> None:
                                           "boundaries": net.boundaries, "threads": args.threads,
                                           "chunk": args.chunk, "alpha": args.alpha, "alpha_plain": args.alpha_plain,
                                           "tc_stages": net.tc_stages, "locked": locked,
+                                          "v_init": state.get("v_init", 0.0),
                                           "choose": choose, "max_moves": args.max_moves,
                                           "eval_prefix": args.eval_prefix, "explore": args.explore,
                                           "starts": args.starts, "start_frac": args.start_frac if starts else 0.0}))
@@ -155,6 +160,12 @@ def main(argv=None) -> None:
               f"2048 {stats['rate_2048']:.0%}, 4096 {stats['rate_4096']:.0%}, 8192 {stats['rate_8192']:.0%}, "
               f"16384 {stats['rate_16384']:.0%}, 32768 {stats['rate_32768']:.0%}", flush=True)
 
+    # A detached run (nohup ... &) starts with SIGINT ignored, so Python never installs
+    # its Ctrl-C handler; take both signals here so `kill` stops the run with a save.
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+
+    old_handlers = {sig: signal.signal(sig, _stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         while True:
             if args.games is not None and games_this_run >= args.games:
@@ -195,6 +206,9 @@ def main(argv=None) -> None:
                 last_eval = time.monotonic()
     except KeyboardInterrupt:
         print("interrupted; saving", flush=True)
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
 
     save()
     if args.eval_at_end:

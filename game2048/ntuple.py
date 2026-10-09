@@ -85,6 +85,18 @@ PATTERN_SETS = {
         [0, 1, 5, 6, 10, 11],
         [4, 5, 6, 7, 9, 10],
     ],
+    # The eight patterns Matsuzaki selected by measured usefulness (2016), the set
+    # behind the strongest published n-tuple players (Guei et al. 2022).
+    "8x6-matsuzaki": [
+        [0, 1, 2, 4, 5, 6],
+        [4, 5, 6, 7, 8, 9],
+        [0, 1, 2, 3, 4, 5],
+        [2, 3, 4, 5, 6, 9],
+        [0, 1, 2, 5, 9, 10],
+        [3, 4, 5, 6, 7, 8],
+        [1, 3, 4, 5, 6, 7],
+        [0, 1, 4, 8, 9, 10],
+    ],
 }
 MAX_PATTERNS, MAX_LEN, MAX_STAGES = 16, 8, 8   # MAX_LEN is the C struct stride; at most MAX_CELLS cells are usable
 MAX_CELLS = 7                                  # 18**7 entries is the most a 32-bit table index can hold
@@ -147,6 +159,7 @@ def lib() -> ctypes.CDLL:
     L.nt_create_ex.argtypes, L.nt_create_ex.restype = [P(i32), P(i32), i32, i32, P(i64), i32], vp
     L.nt_tc_stages.argtypes, L.nt_tc_stages.restype = [vp], i32
     L.nt_free.argtypes = [vp]
+    L.nt_fill.argtypes = [vp, f32]
     L.nt_num_patterns.argtypes, L.nt_num_patterns.restype = [vp], i32
     L.nt_lock_memory.argtypes, L.nt_lock_memory.restype = [vp], i32
     L.nt_use_tc.argtypes, L.nt_use_tc.restype = [vp], i32
@@ -175,6 +188,9 @@ def lib() -> ctypes.CDLL:
     L.nt_set_snake_decay.argtypes = [vp, f64]
     L.nt_snake_decay.argtypes, L.nt_snake_decay.restype = [vp], f64
     L.nt_set_leaf_snake.argtypes = [vp, f64]
+    L.nt_downgrade.argtypes = [u64, u64, P(u64), P(u64)]
+    L.nt_set_downgrade.argtypes = [vp, i32]
+    L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
     L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32), P(i32)], i32
@@ -230,6 +246,14 @@ def spawn(bits: int, seed: int) -> int:
     state = ctypes.c_uint64((seed * 0x9E3779B97F4A7C15 + 0x1234567) & 0xFFFFFFFFFFFFFFFF)
     lo, hi = ctypes.c_uint64(0), ctypes.c_uint64(0)
     lib().nt_spawn(*_lohi(bits), ctypes.byref(state), ctypes.byref(lo), ctypes.byref(hi))
+    return lo.value | (hi.value << 64)
+
+
+def downgrade(bits: int) -> int:
+    """Halve every tile above the largest tile value missing below the board's
+    maximum (tile downgrading, Guei et al. 2022). Unchanged when nothing is missing."""
+    lo, hi = ctypes.c_uint64(0), ctypes.c_uint64(0)
+    lib().nt_downgrade(*_lohi(bits), ctypes.byref(lo), ctypes.byref(hi))
     return lo.value | (hi.value << 64)
 
 
@@ -315,10 +339,15 @@ class NTupleNet:
 
     `tc_stages` is how many leading stages learn with temporal coherence (per-entry
     adaptive rates, 8 extra bytes per weight); the rest use plain TD with their own
-    step size (`alpha_plain`). Default: all stages when `tc`, else none."""
+    step size (`alpha_plain`). Default: all stages when `tc`, else none.
+
+    `v_init` is the value a fresh network gives every board (optimistic
+    initialisation, Guei et al. 2022): each weight starts at v_init / (8 * patterns)
+    and the greedy policy explores boards it has not played until their values
+    come down. 320,000 is the published setting for eight 6-cell patterns."""
 
     def __init__(self, patterns=None, tc: bool = True, boundaries=None, tc_stages: int | None = None,
-                 _handle=None) -> None:
+                 v_init: float = 0.0, _handle=None) -> None:
         self._lib = lib()
         if _handle is not None:
             self._h = _handle
@@ -343,6 +372,8 @@ class NTupleNet:
             self._h = self._lib.nt_create_ex(flat, lens, len(patterns), int(tc_stages), barr, len(boundaries))
             if not self._h:
                 raise MemoryError("could not allocate the n-tuple tables")
+            if v_init:
+                self._lib.nt_fill(self._h, float(v_init) / (8 * len(patterns)))
 
     @classmethod
     def load(cls, path, boundaries=None, keep_tc: bool = True, tc_stages: int | None = None) -> "NTupleNet":
@@ -456,6 +487,18 @@ class NTupleNet:
     @leaf_snake.setter
     def leaf_snake(self, weight: float) -> None:
         self._lib.nt_set_leaf_snake(self._h, float(weight))
+
+    @property
+    def downgrade(self) -> int:
+        """Tile (e.g. 32768) from which the random-spawn search picks its move on the
+        downgraded board (see `downgrade`); 0 = never. Boards with the largest tiles
+        are the least trained, and their downgraded twins are not."""
+        exp = int(self._lib.nt_get_downgrade(self._h))
+        return (1 << exp) if exp else 0
+
+    @downgrade.setter
+    def downgrade(self, tile: int) -> None:
+        self._lib.nt_set_downgrade(self._h, int(tile).bit_length() - 1 if tile else 0)
 
     def best_move(self, bits: int, depth: int = 1, cutoff: float = 0.0) -> int:
         """Expectimax move for the board, -1 if none is legal. depth = spawn layers searched."""

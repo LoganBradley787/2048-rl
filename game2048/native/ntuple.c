@@ -202,6 +202,7 @@ typedef struct net {
     double leaf_snake;       /* weight of snake_score added to expectimax leaves (0 = tables only) */
     double snake_decay;      /* weight ratio between consecutive cells on the snake path */
     double snake_w[16];      /* snake_decay^k */
+    int downgrade;           /* exponent of the tile that switches tile downgrading on at the search root (0 = off) */
 } net_t;
 
 static inline int64_t board_mass(board_t b) {
@@ -328,6 +329,17 @@ static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_st
 void *nt_create_ex(const int *cells_flat, const int *lens, int K, int tc_stages,
                    const int64_t *bounds, int n_bounds) {
     return net_alloc(cells_flat, lens, K, tc_stages, 1, bounds, n_bounds);
+}
+
+/* Optimistic initialisation: every weight of every stage starts at v, so a board
+ * the network has not played is worth 8K * v and the greedy policy is drawn to
+ * it until its real value has been learned. Call it on a fresh network. */
+void nt_fill(void *p, float v) {
+    net_t *net = (net_t *)p;
+    for (int st = 0; st < net->n_stages; st++)
+        for (int k = 0; k < net->K; k++)
+            for (size_t i = 0; i < net->size[k]; i++) net->w[st][k][i] = v;
+    net->version++;
 }
 
 void nt_free(void *p) {
@@ -491,7 +503,101 @@ static void run_workers(void *(*fn)(void *), void *job, int threads) {
 
 /* ---------------------------------------------------------------- learning --- */
 
+/* Single-stage fast path. A board's table indices are computed once, from its
+ * cells unpacked to bytes, and kept: the afterstate chosen at one step is the one
+ * updated at the next, so its indices are reused for the read and the write. The
+ * sums run in the same order as net_value / net_update_stage, so a single-threaded
+ * run gives the same weights bit for bit. */
+#define MAX_FEATS (MAX_PATTERNS * 8)
+
+static inline void feat_indices(const net_t *net, board_t b, uint32_t *idx) {
+    uint8_t c[16];
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
+    int f = 0;
+    for (int k = 0; k < net->K; k++) {
+        const int n = net->len[k];
+        const float *w = net->w[0][k];
+        for (int s = 0; s < 8; s++) {
+            const int *cells = net->cells[k][s];
+            uint32_t i = 0;
+            for (int j = 0; j < n; j++) i = i * RADIX + c[cells[j]];
+            __builtin_prefetch(&w[i]);
+            idx[f++] = i;
+        }
+    }
+}
+
+static inline float feat_value(const net_t *net, const uint32_t *idx) {
+    float v = 0.0f;
+    int f = 0;
+    for (int k = 0; k < net->K; k++) {
+        const float *w = net->w[0][k];
+        for (int s = 0; s < 8; s++) v += w[idx[f++]];
+    }
+    return v;
+}
+
+static inline void feat_update(net_t *net, const uint32_t *idx, float delta, float alpha, float alpha_plain) {
+    int tc = stage_is_tc(net, 0);
+    float step = (tc ? alpha : alpha_plain) * delta / (float)(net->K * 8);
+    int f = 0;
+    for (int k = 0; k < net->K; k++) {
+        float *w = net->w[0][k], *e = net->e[0][k], *a = net->a[0][k];
+        for (int s = 0; s < 8; s++) {
+            uint32_t i = idx[f++];
+            if (tc) {
+                float E = e[i], A = a[i];
+                float beta = (A == 0.0f) ? 1.0f : fabsf(E) / A;
+                w[i] += step * beta;
+                e[i] = E + delta;
+                a[i] = A + fabsf(delta);
+            } else {
+                w[i] += step;
+            }
+        }
+    }
+}
+
+static void learn_game_single(net_t *net, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
+    const size_t fbytes = sizeof(uint32_t) * (size_t)net->K * 8;
+    uint32_t idx[4][MAX_FEATS], pidx[MAX_FEATS];
+    board_t b = spawn(spawn(0, rng), rng);
+    int have_prev = 0;
+    int64_t sc = 0;
+    int32_t mv = 0;
+    for (;;) {
+        board_t after[4];
+        int r[4];
+        for (int d = 0; d < 4; d++) {
+            after[d] = do_move(b, d, &r[d]);
+            if (after[d] != b) feat_indices(net, after[d], idx[d]);
+        }
+        int best = -1;
+        float bestv = 0.0f, bestval = 0.0f;
+        for (int d = 0; d < 4; d++) {
+            if (after[d] == b) continue;
+            float va = feat_value(net, idx[d]);
+            float v = (float)r[d] + va;
+            if (best < 0 || v > bestv) { bestv = v; best = d; bestval = va; }
+        }
+        if (best < 0) {
+            if (have_prev) feat_update(net, pidx, 0.0f - feat_value(net, pidx), alpha, alpha_plain);
+            break;
+        }
+        if (have_prev) feat_update(net, pidx, (float)r[best] + bestval - feat_value(net, pidx), alpha, alpha_plain);
+        memcpy(pidx, idx[best], fbytes);
+        have_prev = 1;
+        sc += r[best];
+        mv++;
+        b = spawn(after[best], rng);
+    }
+    *score = sc;
+    *maxtile = max_exp(b) ? (1 << max_exp(b)) : 0;
+    *nmoves = mv;
+}
+
 static void learn_game(net_t *net, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
+    if (net->n_stages == 1) { learn_game_single(net, alpha, alpha_plain, rng, score, maxtile, nmoves); return; }
     board_t b = spawn(spawn(0, rng), rng);
     board_t prev = 0;
     int have_prev = 0;
@@ -651,7 +757,37 @@ static double max_node(search_ctx_t *c, board_t b, int depth, double prob) {
     return best;
 }
 
+/* Tile downgrading (Guei et al. 2022): halve every tile above the largest tile
+ * value that is missing below the board's maximum. The gap closes, every merge
+ * stays possible and no new one appears, and the board lands where the tables
+ * have seen far more training. Used at the search root only, for choosing the
+ * move, once the board holds the network's threshold tile. */
+static board_t downgrade(board_t b) {
+    unsigned present = 0;
+    for (int i = 0; i < 16; i++) present |= 1u << cell(b, i);
+    int gap = max_exp(b) - 1;
+    while (gap >= 1 && ((present >> gap) & 1)) gap--;
+    if (gap < 1) return b;
+    board_t out = 0;
+    for (int i = 0; i < 16; i++) {
+        int v = cell(b, i);
+        out |= put(v > gap ? v - 1 : v, i);
+    }
+    return out;
+}
+
+void nt_downgrade(uint64_t lo, uint64_t hi, uint64_t *out_lo, uint64_t *out_hi) {
+    board_t r = downgrade(mk(lo, hi));
+    *out_lo = lo64(r);
+    *out_hi = hi64(r);
+}
+
+/* Not for use while games are being played on other threads. */
+void nt_set_downgrade(void *p, int exp) { ((net_t *)p)->downgrade = exp < 0 ? 0 : exp; }
+int nt_get_downgrade(void *p) { return ((net_t *)p)->downgrade; }
+
 static int best_move(search_ctx_t *c, board_t b, int depth) {
+    if (c->net->downgrade && max_exp(b) >= c->net->downgrade) b = downgrade(b);
     int best = -1;
     double bestv = 0.0;
     for (int d = 0; d < 4; d++) {

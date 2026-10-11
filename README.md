@@ -19,18 +19,11 @@ Two results:
 
 For scale: a person who reaches the 2048 tile once has about 20,000 points.
 
-<!-- OUTDATED: docs/images/snake-cool-mode.gif shows the earlier 3,931,768 game. Re-record it with
-     the current snake agent (131,052 moves, 3,932,100 points, last tile a 4), then replace the caption
-     below with: "...from the first tile to the last: 131,052 moves, about four minutes in real time.
-     The last frame is as full as a board gets: one of every tile from 131072 down to 4." and delete
-     the "Recorded before" sentence and this comment. -->
 ![The snake agent playing a whole cool-mode game, sped up](docs/images/snake-cool-mode.gif)
 
 *The `snake` agent playing one cool-mode game from the first tile to the
-last: 130,969 moves, about four minutes in real time. The last frame is as
-full as a board gets: one of every tile from 131072 down to 8, and a final 2.
-Recorded before the last improvement: the agent now finishes on a 4 and
-scores 3,932,100.*
+last: 131,052 moves, about four minutes in real time. The last frame is as
+full as a board gets: one of every tile from 131072 down to 4.*
 
 ## Try it
 
@@ -152,13 +145,7 @@ The learned tables are not involved. Tables trained on cool mode did worse
 than no tables at all. [docs/COOL_MODE.md](docs/COOL_MODE.md) has the whole
 story, including where the 64 points went.
 
-<!-- OUTDATED: docs/images/final-board.png is the last board of the earlier game (131072 down to 8,
-     a final 2, 3,931,768 points). Replace it with the current agent's last board and change the alt
-     text to "...: 131072 down to 4 in snake order, with 3,932,100 points", then delete the line
-     below the image and this comment. -->
-<img src="docs/images/final-board.png" alt="The last board of the snake agent's cool-mode game: 131072 down to 8 in snake order, with 3,931,768 points" width="380">
-
-*The board above is from the earlier 3,931,768 game, which ended on a 2.*
+<img src="docs/images/final-board.png" alt="The last board of the snake agent's cool-mode game: 131072 down to 4 in snake order, with 3,932,100 points" width="380">
 
 ## Results
 

@@ -4,17 +4,17 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-10, 22:30. Run 14 is still going.
+Last updated 2026-10-11, 01:10. Runs 14 and 20 are still going.
 
 ## Totals so far
 
 | Machine | Wall-clock | CPU | Self-play moves |
 | --- | --- | --- | --- |
 | MacBook (M3 Pro, 12 cores) | 16.2 h | 168 thread-hours, plus 71 min on its GPU | 116 billion |
-| ThinkPad (i5-1240P, 16 threads) | 19.2 h | 304 thread-hours | 317 billion |
+| ThinkPad (i5-1240P, 16 threads) | 21.6 h | 342 thread-hours | 359 billion |
 | Google Colab, CPU runtimes | 7.4 h | 58 vCPU-hours | 86 billion |
 | Google Colab, GPU runtimes | 1.2 h | 1.2 GPU-hours | 10 billion |
-| **All** | **44 h** | **530 CPU thread-hours** | **about 530 billion** |
+| **All** | **46 h** | **570 CPU thread-hours** | **about 570 billion** |
 
 A thread-hour is one hardware thread busy for an hour. The threads are not
 equal: the ThinkPad's are held to about 20 W by its firmware and a Colab vCPU
@@ -169,12 +169,12 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   to be followed by a tenth as much with temporal coherence.
 - **On:** 16 threads, 1.1 GB. Stopped and resumed twice in its first three
   hours to pick up faster builds of the engine.
-- **Time so far:** 18.7 hours. 35.85M games, 312.5B moves, about a third of the
+- **Time so far:** 21.1 hours. 40.05M games, 354.8B moves, about 40% of the
   budget.
-- **So far:** training games average about 259,000, with 16384 in 63% and 32768
-  in 3.4%. The 32768 rate stayed under half a percent for the first 17 hours,
-  passed 1% at 33.1M games and has risen since. At depth 2, 48 games average 357,567 with 32768 in
-  12 of them. Copies of the weights are kept every two and a half hours.
+- **So far:** training games average about 263,000, with 16384 in 64% and 32768
+  in 4%. The 32768 rate stayed under half a percent for the first 17 hours,
+  passed 1% at 33.1M games and has risen since. At depth 2, 48 games average about 359,000 with
+  32768 in 8 of them. Copies of the weights are kept every two and a half hours.
 
 ### 15. Speed checks on Colab's CPU runtimes (10 October)
 
@@ -232,6 +232,20 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   temporal coherence phase, and was still climbing when it stopped. Half of
   this player is someone else's network, so it is a test of the pipeline and
   nothing more.
+
+### 20. Stage 2, started early (11 October onward, Colab, running)
+
+- **What:** the second network, for boards that hold a 16384. It reads stage 1
+  only through the boards where stage 1 hands over, and those are nearly empty
+  boards with one 16384 whatever stage 1's strength, so it does not have to
+  wait: a million hand-over boards are collected from run 14 as it stood at
+  40.05M games, and the second network trains from them with its own optimistic
+  start, plain TD at 0.1. When run 14 is finished its hand-over boards will be
+  compared with these, and the run moved onto them if they differ.
+- **On:** the high-RAM CPU runtime, 8 vCPUs, 2.2 GB, restarted by the watcher
+  on the ThinkPad whenever a session ends.
+- **Budget:** 440B moves, about 100 million games from these boards, which is
+  the published length for a stage. Started 01:06.
 
 ## Not training
 

@@ -78,6 +78,9 @@ def main(argv=None) -> None:
                    help="leading stages that keep temporal-coherence state (default: all, or 0 with --no-tc)")
     p.add_argument("--no-tc", action="store_true",
                    help="plain TD instead of temporal coherence (with --resume: drop the TC state, a third of the memory)")
+    p.add_argument("--expect-target", action="store_true",
+                   help="learn from the average over every tile that could appear instead of the one that did "
+                        "(single-stage, random-spawn runs; 10 to 15 times the cost per move); pass it again on resume")
     p.add_argument("--stages", default="", help="comma-separated boundaries for multi-stage tables, on the tiles a board holds: "
                         "16384 = a 16384 or larger, 24576 = a 16384 and an 8192, or larger")
     p.add_argument("--patterns", default="4x6", choices=sorted(nt.PATTERN_SETS), help="pattern set for a new network")
@@ -142,6 +145,10 @@ def main(argv=None) -> None:
     if packed:
         print(f"{packed[1]} saved boards; every game begins from one and its score counts from there", flush=True)
     base = nt.NTupleNet.load(args.base, keep_tc=False) if args.base and not choose else None
+    if args.expect_target:
+        if choose or net.boundaries:
+            p.error("--expect-target is for single-stage runs on the normal game")
+        net.expect_target = True
     locked = bool(args.lock_memory) and net.lock_memory()
     if args.lock_memory and not locked:
         print("warning: could not lock the tables in memory", flush=True)
@@ -177,7 +184,8 @@ def main(argv=None) -> None:
                                           "choose": choose, "max_moves": args.max_moves,
                                           "eval_prefix": args.eval_prefix, "explore": args.explore,
                                           "starts": args.starts, "start_frac": args.start_frac if starts else 0.0,
-                                          "base": args.base, "stage_tile": args.stage_tile if base else 0}))
+                                          "base": args.base, "stage_tile": args.stage_tile if base else 0,
+                                          "expect_target": bool(args.expect_target)}))
         os.replace(state_tmp, state_path)
 
     def evaluate() -> None:
@@ -195,7 +203,7 @@ def main(argv=None) -> None:
         stats = nt.summarize(played)
         row = {"games": games, "elapsed_s": round(elapsed(), 1), "mode": "choose" if choose else "random",
                "depth": args.eval_depth, "eval_games": args.eval_games,
-               **{k: stats[k] for k in EVAL_FIELDS if k in stats}}
+               **{k: stats[k] for k in EVAL_FIELDS if k in stats and k != "games"}}   # games = training games so far
         evlog.writerow(row)
         eval_f.flush()
         print(f"[eval depth {args.eval_depth}{' choose' if choose else ''}] {args.eval_games} games in {time.monotonic() - t:.0f}s | "

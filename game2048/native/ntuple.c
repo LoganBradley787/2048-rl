@@ -224,6 +224,7 @@ typedef struct net {
     double snake_decay;      /* weight ratio between consecutive cells on the snake path */
     double snake_w[16];      /* snake_decay^k */
     int downgrade;           /* exponent of the tile that switches tile downgrading on at the search root (0 = off) */
+    int expect;              /* training target: 0 = the tile that appeared, 1 = the average over every tile that could */
     int tt_bits;             /* transposition table size for searches on this network */
     int depth_cap[17];       /* random-spawn search: deepest search for a root with this many empty cells (0 = no cap) */
 } net_t;
@@ -686,12 +687,47 @@ static inline void feat_update(net_t *net, const uint32_t *idx, float delta, flo
     }
 }
 
+/* The expected-value target (Wang and Matsuzaki): what an afterstate is worth
+ * averaged over every tile that can appear on it, a 2 nine times in ten, each
+ * followed by the best move's reward and value (nothing when no move is left).
+ * Plain TD samples one of these outcomes per update; this uses them all, at the
+ * price of up to 30 times the lookups. */
+static float expected_target(const net_t *net, board_t after) {
+    int empty = 0;
+    double sum = 0.0;
+    for (int i = 0; i < 16; i++) {
+        if (cell(after, i)) continue;
+        empty++;
+        for (int v = 1; v <= 2; v++) {
+            board_t s = after | put(v, i);
+            float best = 0.0f;
+            int any = 0;
+            for (int d = 0; d < 4; d++) {
+                int r;
+                board_t a = do_move(s, d, &r);
+                if (a == s) continue;
+                float q = (float)r + net_value(net, a);
+                if (!any || q > best) { best = q; any = 1; }
+            }
+            sum += (v == 1 ? 0.9 : 0.1) * (double)best;
+        }
+    }
+    return empty ? (float)(sum / empty) : 0.0f;
+}
+
+float nt_expected_target(void *p, uint64_t lo, uint64_t hi) { return expected_target((net_t *)p, mk(lo, hi)); }
+
+/* Not for use while games are being played on other threads. Single-stage networks only. */
+void nt_set_expect(void *p, int on) { ((net_t *)p)->expect = on != 0; }
+int nt_get_expect(void *p) { return ((net_t *)p)->expect; }
+
 /* start: the board a game begins from, or 0 for a new game (two random tiles). */
 static void learn_game_single(net_t *net, board_t start, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
     const size_t fbytes = sizeof(uint32_t) * (size_t)net->K * 8;
     uint32_t idx[4][MAX_FEATS], pidx[MAX_FEATS];
     board_t b = start ? start : spawn(spawn(0, rng), rng);
     int have_prev = 0;
+    board_t pafter = 0;
     int64_t sc = 0;
     int32_t mv = 0;
     for (;;) {
@@ -709,12 +745,19 @@ static void learn_game_single(net_t *net, board_t start, float alpha, float alph
             float v = (float)r[d] + va;
             if (best < 0 || v > bestv) { bestv = v; best = d; bestval = va; }
         }
-        if (best < 0) {
-            if (have_prev) feat_update(net, pidx, 0.0f - feat_value(net, pidx), alpha, alpha_plain);
-            break;
+        if (have_prev && net->expect) {          /* every outcome of the previous afterstate, this one included */
+            float target = expected_target(net, pafter);
+            feat_update(net, pidx, target - feat_value(net, pidx), alpha, alpha_plain);
+            if (best < 0) break;
+        } else {
+            if (best < 0) {
+                if (have_prev) feat_update(net, pidx, 0.0f - feat_value(net, pidx), alpha, alpha_plain);
+                break;
+            }
+            if (have_prev) feat_update(net, pidx, (float)r[best] + bestval - feat_value(net, pidx), alpha, alpha_plain);
         }
-        if (have_prev) feat_update(net, pidx, (float)r[best] + bestval - feat_value(net, pidx), alpha, alpha_plain);
         memcpy(pidx, idx[best], fbytes);
+        pafter = after[best];
         have_prev = 1;
         sc += r[best];
         mv++;

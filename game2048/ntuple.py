@@ -221,6 +221,9 @@ def lib() -> ctypes.CDLL:
     L.nt_downgrade.argtypes = [u64, u64, P(u64), P(u64)]
     L.nt_set_downgrade.argtypes = [vp, i32]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
+    L.nt_expected_target.argtypes, L.nt_expected_target.restype = [vp, u64, u64], f32
+    L.nt_set_expect.argtypes = [vp, i32]
+    L.nt_get_expect.argtypes, L.nt_get_expect.restype = [vp], i32
     L.nt_set_tt_bits.argtypes = [vp, i32]
     L.nt_get_tt_bits.argtypes, L.nt_get_tt_bits.restype = [vp], i32
     L.nt_set_depth_caps.argtypes = [vp, P(i32)]
@@ -583,6 +586,23 @@ class NTupleNet:
     @downgrade.setter
     def downgrade(self, tile: int) -> None:
         self._lib.nt_set_downgrade(self._h, int(tile).bit_length() - 1 if tile else 0)
+
+    @property
+    def expect_target(self) -> bool:
+        """Train toward the expected-value target: the average, over every tile that can
+        appear on the previous afterstate, of the best move's reward and value, instead
+        of the one tile that did appear (Wang and Matsuzaki). The same answer in the
+        long run with less noise per update, at 10 to 15 times the cost per move.
+        Single-stage networks; `train` only. Set it between calls."""
+        return bool(self._lib.nt_get_expect(self._h))
+
+    @expect_target.setter
+    def expect_target(self, on: bool) -> None:
+        self._lib.nt_set_expect(self._h, int(bool(on)))
+
+    def expected_target(self, bits: int) -> float:
+        """The expected-value target of an afterstate under the current weights."""
+        return float(self._lib.nt_expected_target(self._h, *_lohi(bits)))
 
     @property
     def tt_bits(self) -> int:

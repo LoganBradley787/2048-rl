@@ -49,3 +49,33 @@ def test_evaluate_games_resumes_and_shards_add_up_to_the_same_games(tmp_path, ca
 
     with pytest.raises(SystemExit):                              # other settings do not mix into a file
         evaluate_games.main([*common[:2], "--depth", "2", "--seed", "11", "--games", "6", "--out", str(tmp_path / "a.csv")])
+
+
+def test_average_weights_is_the_mean_of_the_files(tmp_path):
+    import average_weights
+
+    pats = [[0, 1, 2, 3], [4, 5, 6]]
+    boards = [nt.spawn(nt.spawn(0, s), s + 1) for s in range(6)]
+    values = []
+    for i, v in enumerate((100.0, 400.0, 1000.0)):
+        n = nt.NTupleNet(patterns=pats, tc=False, v_init=v)
+        n.train(games=30, threads=1, seed=i, alpha_plain=0.1)
+        n.save(tmp_path / f"w{i}.bin", weights_only=True)
+        values.append([n.value(b) for b in boards])
+        if i == 0:
+            n.save(tmp_path / "state.bin")
+            nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False).save(tmp_path / "other.bin", weights_only=True)
+        n.close()
+    files = [str(tmp_path / f"w{i}.bin") for i in range(3)]
+    average_weights.main(["--weights", *files, "--out", str(tmp_path / "avg" / "weights.bin")])
+    avg = nt.NTupleNet.load(tmp_path / "avg" / "weights.bin")
+    assert avg.patterns == pats and avg.tc is False
+    assert [avg.value(b) for b in boards] == pytest.approx(np.mean(values, axis=0), rel=1e-5)
+    avg.close()
+    with pytest.raises(SystemExit):                              # a different shape
+        average_weights.main(["--weights", files[0], str(tmp_path / "other.bin"), "--out", str(tmp_path / "x.bin")])
+    n = nt.NTupleNet(patterns=pats)                              # learning state is not something to average
+    n.save(tmp_path / "tc.bin")
+    n.close()
+    with pytest.raises(SystemExit):
+        average_weights.main(["--weights", str(tmp_path / "tc.bin"), files[0], "--out", str(tmp_path / "x.bin")])

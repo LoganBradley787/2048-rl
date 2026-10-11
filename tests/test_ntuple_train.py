@@ -46,6 +46,7 @@ def test_train_cli_can_run_an_expectimax_eval(tmp_path):
              "--eval-games", "4", "--eval-depth", "1"])
     ev = rows(tmp_path / "eval.csv")
     assert len(ev) == 1 and int(ev[0]["depth"]) == 1 and int(ev[0]["eval_games"]) == 4
+    assert int(ev[0]["games"]) == 100                            # the training games so far, not the games evaluated
     assert float(ev[0]["mean_score"]) > 0
 
 
@@ -173,3 +174,10 @@ def test_total_moves_is_a_budget_across_resumes_and_saves_keep_the_previous_chec
     games = state["games"]
     tr.main(["--total-moves", str(budget), "--resume", str(tmp_path / "latest.bin"), *common])   # budget already met
     assert json.loads((tmp_path / "state.json").read_text())["games"] == games
+
+
+def test_train_cli_expect_target_flag(tmp_path):
+    tr.main(["--games", "100", "--chunk", "100", "--threads", "2", "--out", str(tmp_path), "--no-tc",
+             "--eval-every-min", "0", "--save-every-min", "0", "--expect-target"])
+    assert json.loads((tmp_path / "state.json").read_text())["expect_target"] is True
+    assert float(rows(tmp_path / "log.csv")[0]["mean_score"]) > 0

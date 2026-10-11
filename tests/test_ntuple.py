@@ -1280,3 +1280,37 @@ def test_depth_caps_limit_the_search_by_empty_cells():
     assert [n.best_move(b, depth=3) for b in boards] == [d if e <= 5 else s for d, s, e in zip(deep, shallow, empties)]
     n.depth_caps = []
     assert [n.best_move(b, depth=3) for b in boards] == deep
+
+
+def test_expected_target_averages_over_every_tile_that_can_appear():
+    n = _trained_small_net()
+    for b in _some_boards(12, seed=7):
+        valid = nt.afterstates_valid(b)
+        if not valid:
+            continue
+        after, _ = nt.move(b, valid[0])
+        empty = [i for i in range(16) if nt.cell(after, i) == 0]
+        total = 0.0
+        for i in empty:
+            for exp, prob in ((1, 0.9), (2, 0.1)):
+                s = nt.with_cell(after, i, exp)
+                options = [r + n.value(a) for a, r in (nt.move(s, d) for d in range(4)) if a != s]
+                total += prob * (max(options) if options else 0.0)
+        assert n.expected_target(after) == pytest.approx(total / len(empty), rel=1e-5)
+    n.close()
+
+
+def test_training_on_the_expected_target_learns_and_is_off_by_default():
+    pats = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]]
+    plain, again, expect = (nt.NTupleNet(patterns=pats, tc=False) for _ in range(3))
+    assert plain.expect_target is False
+    a = plain.train(games=300, threads=1, seed=2, alpha_plain=0.1)
+    b = again.train(games=300, threads=1, seed=2, alpha_plain=0.1)
+    assert (a["scores"] == b["scores"]).all()                    # the default path is untouched
+    expect.expect_target = True
+    assert expect.expect_target is True
+    c = expect.train(games=300, threads=1, seed=2, alpha_plain=0.1)
+    assert not (a["scores"] == c["scores"]).all()                # a different learner
+    assert c["scores"][-100:].mean() > 1.4 * c["scores"][:20].mean() # and it learns
+    for n in (plain, again, expect):
+        n.close()

@@ -48,6 +48,13 @@ uv run python -m game2048.ntuple_train --hours 4 --threads 12 --patterns 8x6
   played until their values come down. Meant for plain TD at a fixed rate,
   `--no-tc --alpha-plain 0.1`, followed by a shorter temporal coherence run:
   `--resume <out>/latest.bin --tc-stages 1`.
+- `--expect-target` learns from the average over every tile that could appear
+  after a move instead of the one that did (Wang and Matsuzaki): the same answer
+  in the long run with less noise per update, at about 12 times the cost per
+  move. Single-stage runs on the normal game. Not yet measured here.
+- `--total-moves 9e11` stops once the network has trained on that many moves in
+  all, earlier runs included, so a run that is stopped and resumed keeps one
+  budget. `--keep-previous` keeps the checkpoint before the latest.
 - `--no-tc` uses plain TD instead of temporal coherence learning. Temporal
   coherence keeps two extra numbers per weight and gives every weight its own
   learning rate, which falls as that weight's updates start to cancel out.
@@ -92,6 +99,19 @@ the two into one file for play:
 ```bash
 uv run python examples/stack_stages.py --weights checkpoints/ntuple/weights.bin checkpoints/ntuple_stage2/weights.bin --tiles 16384 --out checkpoints/ntuple_2stage/weights.bin
 ```
+
+### Averaging snapshots
+
+A network trained at a fixed rate keeps moving around the values it has
+learned. Copy `weights.bin` aside from time to time and the mean of the copies
+sits closer to them than any one copy:
+
+```bash
+uv run python examples/average_weights.py --weights checkpoints/ntuple/snapshots/*.bin --out checkpoints/ntuple_avg/weights.bin
+```
+
+On three early snapshots of an optimistic TD run this was worth 42,000 points
+with no search and about 7,000, inside the noise, at depth 2.
 
 ### Evaluate and build the report page
 

@@ -12,6 +12,15 @@ in progress and saves first.
 the choose search and evaluations play the choose game. Keep --max-moves far
 above the natural game length; games cut at the cap leave their late boards
 ungrounded, values inflate and the policy collapses.
+
+A later stage is trained as a network of its own, from the boards where an
+earlier one hands over (examples/collect_starts.py writes them):
+
+    uv run python -m game2048.ntuple_train --starts checkpoints/starts_16384.npy --base checkpoints/ntuple/weights.bin --stage-tile 16384 --out checkpoints/ntuple_stage2 ...
+
+Every game then begins from one of those boards, so the log's scores count from
+there; the evaluations play whole games with --base below the tile and this
+network from it on. examples/stack_stages.py joins the two for play.
 """
 
 from __future__ import annotations
@@ -31,11 +40,12 @@ from . import ntuple as nt
 LOG_FIELDS = [
     "games", "chunk_moves", "moves", "elapsed_s", "moves_per_s", "mean_score", "median_score",
     "max_score", "mean_length", "max_tile", "rate_2048", "rate_4096", "rate_8192", "rate_16384",
-    "rate_32768",
+    "rate_32768", "rate_65536",
 ]
 EVAL_FIELDS = [
     "games", "elapsed_s", "mode", "depth", "eval_games", "mean_score", "median_score", "max_score",
     "mean_length", "max_tile", "rate_2048", "rate_4096", "rate_8192", "rate_16384", "rate_32768",
+    "rate_65536",
 ]
 
 
@@ -56,6 +66,9 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--games", type=int, default=None, help="training games to play this run")
     p.add_argument("--hours", type=float, default=None, help="wall-clock budget for this run")
+    p.add_argument("--total-moves", type=float, default=None,
+                   help="stop once the network has trained on this many moves in all, earlier runs included "
+                        "(e.g. 9e11); the way to give a run that is stopped and resumed a fixed budget")
     p.add_argument("--chunk", type=int, default=5000, help="games per native call and per log row")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     p.add_argument("--alpha", type=float, default=1.0, help="step for temporal-coherence stages")
@@ -65,7 +78,8 @@ def main(argv=None) -> None:
                    help="leading stages that keep temporal-coherence state (default: all, or 0 with --no-tc)")
     p.add_argument("--no-tc", action="store_true",
                    help="plain TD instead of temporal coherence (with --resume: drop the TC state, a third of the memory)")
-    p.add_argument("--stages", default="", help="comma-separated tile-mass boundaries for multi-stage tables, e.g. 16384,24576,32768")
+    p.add_argument("--stages", default="", help="comma-separated boundaries for multi-stage tables, on the tiles a board holds: "
+                        "16384 = a 16384 or larger, 24576 = a 16384 and an 8192, or larger")
     p.add_argument("--patterns", default="4x6", choices=sorted(nt.PATTERN_SETS), help="pattern set for a new network")
     p.add_argument("--v-init", type=float, default=0.0,
                    help="value a new network gives every board (optimistic initialisation); 320000 for 8x6")
@@ -73,6 +87,8 @@ def main(argv=None) -> None:
     p.add_argument("--resume", default=None, help="weights file to continue from")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-every-min", type=float, default=10.0, help="0 = only at the end")
+    p.add_argument("--keep-previous", action="store_true",
+                   help="keep the checkpoint before the latest as previous.bin, in case the machine dies mid-save")
     p.add_argument("--eval-every-min", type=float, default=30.0, help="0 = never")
     p.add_argument("--eval-at-end", action="store_true")
     p.add_argument("--eval-games", type=int, default=12)
@@ -85,14 +101,19 @@ def main(argv=None) -> None:
     p.add_argument("--explore", type=float, default=0.0,
                    help="choose-mode training: probability per step of placing a random tile instead of the searched one")
     p.add_argument("--starts", default=None,
-                   help="choose-mode training: .npy of saved late boards (see ntuple.harvest_starts) to restart games from")
+                   help=".npy of saved boards to begin games from: every game (see examples/collect_starts.py), "
+                        "or in choose mode a --start-frac share of them (see ntuple.harvest_starts)")
     p.add_argument("--start-frac", type=float, default=0.5,
                    help="share of choose-mode games that begin from a saved board when --starts is given")
+    p.add_argument("--base", default=None,
+                   help="with --starts: weights of the earlier stage, so evaluations play whole games (implied on resume)")
+    p.add_argument("--stage-tile", type=int, default=16384,
+                   help="with --base: the tile from which this network takes over")
     p.add_argument("--eval-prefix", type=int, default=0,
                    help="choose-mode evaluations: kind random spawns for this many moves first (games still "
                         "funnel into one line, so 2 eval games are enough)")
     args = p.parse_args(argv)
-    if args.games is None and args.hours is None:
+    if args.games is None and args.hours is None and args.total_moves is None:
         args.hours = 1.0
 
     out = Path(args.out)
@@ -109,9 +130,18 @@ def main(argv=None) -> None:
                            tc_stages=tc_stages, v_init=args.v_init)
         state = {"v_init": args.v_init}
     choose = bool(args.choose or state.get("choose", False))
-    starts = nt.load_starts(args.starts) if args.starts else []
+    if not choose:                                     # a stage run keeps its boards and its base when resumed
+        args.starts = args.starts or (state.get("starts") if args.resume else None)
+        args.base = args.base or (state.get("base") if args.resume else None)
+        if args.resume and state.get("base"):
+            args.stage_tile = int(state.get("stage_tile", args.stage_tile))
+    starts = nt.load_starts(args.starts) if args.starts and choose else []
     if starts:
         print(f"{len(starts)} saved late boards; {args.start_frac:.0%} of games restart from one", flush=True)
+    packed = nt.pack_starts(np.load(args.starts)) if args.starts and not choose else None
+    if packed:
+        print(f"{packed[1]} saved boards; every game begins from one and its score counts from there", flush=True)
+    base = nt.NTupleNet.load(args.base, keep_tc=False) if args.base and not choose else None
     locked = bool(args.lock_memory) and net.lock_memory()
     if args.lock_memory and not locked:
         print("warning: could not lock the tables in memory", flush=True)
@@ -129,9 +159,16 @@ def main(argv=None) -> None:
     games_this_run = 0
 
     def save() -> None:
-        net.save(out / "latest.bin")
-        net.save(out / "weights.bin", weights_only=True)  # small deployment copy for the UI
-        state_path.write_text(json.dumps({"games": games, "moves": moves, "elapsed_s": elapsed(),
+        # Each file is written beside its place and renamed over it, so a run that is
+        # killed mid-save leaves the last complete checkpoint, never half of a new one.
+        net.save(out / "latest.bin.tmp")
+        if args.keep_previous and (out / "latest.bin").exists():
+            os.replace(out / "latest.bin", out / "previous.bin")
+        os.replace(out / "latest.bin.tmp", out / "latest.bin")
+        net.save(out / "weights.bin.tmp", weights_only=True)  # small deployment copy for the UI
+        os.replace(out / "weights.bin.tmp", out / "weights.bin")
+        state_tmp = out / "state.json.tmp"
+        state_tmp.write_text(json.dumps({"games": games, "moves": moves, "elapsed_s": elapsed(),
                                           "patterns": net.patterns, "tc": net.tc,
                                           "boundaries": net.boundaries, "threads": args.threads,
                                           "chunk": args.chunk, "alpha": args.alpha, "alpha_plain": args.alpha_plain,
@@ -139,7 +176,9 @@ def main(argv=None) -> None:
                                           "v_init": state.get("v_init", 0.0),
                                           "choose": choose, "max_moves": args.max_moves,
                                           "eval_prefix": args.eval_prefix, "explore": args.explore,
-                                          "starts": args.starts, "start_frac": args.start_frac if starts else 0.0}))
+                                          "starts": args.starts, "start_frac": args.start_frac if starts else 0.0,
+                                          "base": args.base, "stage_tile": args.stage_tile if base else 0}))
+        os.replace(state_tmp, state_path)
 
     def evaluate() -> None:
         t = time.monotonic()
@@ -147,6 +186,10 @@ def main(argv=None) -> None:
         if choose:
             played = net.play_choose(args.eval_games, depth=args.eval_depth, topk=4, threads=args.threads,
                                      seed=seed, max_moves=args.max_moves, prefix=args.eval_prefix)
+        elif base:                                     # whole games: the earlier stage, then this one
+            both = nt.NTupleNet.stack([base, net], [args.stage_tile])
+            played = both.play(args.eval_games, depth=args.eval_depth, threads=args.threads, seed=seed)
+            both.close()
         else:
             played = net.play(args.eval_games, depth=args.eval_depth, threads=args.threads, seed=seed)
         stats = nt.summarize(played)
@@ -157,8 +200,8 @@ def main(argv=None) -> None:
         eval_f.flush()
         print(f"[eval depth {args.eval_depth}{' choose' if choose else ''}] {args.eval_games} games in {time.monotonic() - t:.0f}s | "
               f"mean {stats['mean_score']:.0f}, max {stats['max_score']} | tile {stats['max_tile']} | "
-              f"2048 {stats['rate_2048']:.0%}, 4096 {stats['rate_4096']:.0%}, 8192 {stats['rate_8192']:.0%}, "
-              f"16384 {stats['rate_16384']:.0%}, 32768 {stats['rate_32768']:.0%}", flush=True)
+              f"2048 {nt.percent(stats['rate_2048'])}, 4096 {nt.percent(stats['rate_4096'])}, 8192 {nt.percent(stats['rate_8192'])}, "
+              f"16384 {nt.percent(stats['rate_16384'])}, 32768 {nt.percent(stats['rate_32768'], 1)}", flush=True)
 
     # A detached run (nohup ... &) starts with SIGINT ignored, so Python never installs
     # its Ctrl-C handler; take both signals here so `kill` stops the run with a save.
@@ -172,6 +215,8 @@ def main(argv=None) -> None:
                 break
             if args.hours is not None and time.monotonic() - t0 >= args.hours * 3600:
                 break
+            if args.total_moves is not None and moves >= args.total_moves:
+                break
             n = args.chunk if args.games is None else min(args.chunk, args.games - games_this_run)
             t = time.monotonic()
             if choose:
@@ -180,7 +225,7 @@ def main(argv=None) -> None:
                                       starts=starts, start_frac=args.start_frac if starts else 0.0)
             else:
                 st = net.train(n, threads=args.threads, alpha=args.alpha, seed=args.seed + games,
-                               alpha_plain=args.alpha_plain)
+                               alpha_plain=args.alpha_plain, starts=packed)
             dt = time.monotonic() - t
             chunk_moves = int(st["moves"].sum())
             games += n
@@ -191,13 +236,14 @@ def main(argv=None) -> None:
                    "moves_per_s": round(chunk_moves / dt), "mean_score": round(s["mean_score"]),
                    "median_score": round(s["median_score"]), "max_score": s["max_score"],
                    "mean_length": round(s["mean_length"]), "max_tile": s["max_tile"],
-                   **{k: round(s[k], 4) for k in ("rate_2048", "rate_4096", "rate_8192", "rate_16384", "rate_32768")}}
+                   **{k: round(s[k], 4) for k in ("rate_2048", "rate_4096", "rate_8192", "rate_16384", "rate_32768",
+                                                  "rate_65536")}}
             log.writerow(row)
             log_f.flush()
             print(f"games {games} | {moves / 1e6:.1f}M moves | {elapsed() / 60:.0f} min | {row['moves_per_s'] / 1e6:.2f}M moves/s "
                   f"| mean {row['mean_score']} | max {row['max_score']} | tile {row['max_tile']} "
-                  f"| 2048 {s['rate_2048']:.0%} 4096 {s['rate_4096']:.0%} 8192 {s['rate_8192']:.0%} "
-                  f"16384 {s['rate_16384']:.0%} 32768 {s['rate_32768']:.0%}", flush=True)
+                  f"| 2048 {nt.percent(s['rate_2048'])} 4096 {nt.percent(s['rate_4096'])} 8192 {nt.percent(s['rate_8192'])} "
+                  f"16384 {nt.percent(s['rate_16384'])} 32768 {nt.percent(s['rate_32768'], 1)}", flush=True)
             if args.save_every_min and time.monotonic() - last_save >= args.save_every_min * 60:
                 save()
                 last_save = time.monotonic()

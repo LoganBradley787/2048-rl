@@ -14,16 +14,23 @@ Two results:
   trained for 4 hours on a laptop.
 - **Cool mode**, a variant where you also choose where each new tile goes. A
   search with one hand-written rule and no training builds the **131072**
-  tile, the largest a 4x4 board can hold, and scores **3,931,768**. The upper
+  tile, the largest a 4x4 board can hold, and scores **3,932,100**. The upper
   bound is 3,932,164.
 
 For scale: a person who reaches the 2048 tile once has about 20,000 points.
 
+<!-- OUTDATED: docs/images/snake-cool-mode.gif shows the earlier 3,931,768 game. Re-record it with
+     the current snake agent (131,052 moves, 3,932,100 points, last tile a 4), then replace the caption
+     below with: "...from the first tile to the last: 131,052 moves, about four minutes in real time.
+     The last frame is as full as a board gets: one of every tile from 131072 down to 4." and delete
+     the "Recorded before" sentence and this comment. -->
 ![The snake agent playing a whole cool-mode game, sped up](docs/images/snake-cool-mode.gif)
 
 *The `snake` agent playing one cool-mode game from the first tile to the
 last: 130,969 moves, about four minutes in real time. The last frame is as
-full as a board gets: one of every tile from 131072 down to 8, and a final 2.*
+full as a board gets: one of every tile from 131072 down to 8, and a final 2.
+Recorded before the last improvement: the agent now finishes on a 4 and
+scores 3,932,100.*
 
 ## Try it
 
@@ -69,7 +76,7 @@ In cool mode:
 | Player | Score | Biggest tile |
 | --- | --- | --- |
 | `ntuple-cool`: tables trained on cool mode for 4 hours, plus a search | 1,528,428 | 65536 |
-| `snake` | **3,931,768** | **131072** |
+| `snake` | **3,932,100** | **131072** |
 
 Every number comes from a run of this code. The details are under
 [Results](#results).
@@ -132,19 +139,26 @@ by its final board and by how many of the placed tiles were 4s (a placed 4
 skips the 2+2 merge that would have paid 4 points). No final board beats one
 of every tile from 131072 down to 4, which caps the score at 3,932,164.
 
-The `snake` agent gets within 396 of that with a beam search: keep the 128
+The `snake` agent gets within 64 of that with a beam search: keep the 128
 most promising lines of play, extend each by one move and one placement,
 repeat 16 times, play the first 4 steps of the best line, and plan again. A
 line is ranked by the points it earned plus one hand-written term that
 rewards tiles laid out in descending order along a snake-shaped path, so that
 each merge sets up the next. It places 2s unless only a 4 keeps the game
-alive, which happens 98 times in 131,000 moves.
+alive, and then as few as will do: 15 times in 131,000 moves. The tile that
+fills the last cell is a 4 as well.
 
 The learned tables are not involved. Tables trained on cool mode did worse
 than no tables at all. [docs/COOL_MODE.md](docs/COOL_MODE.md) has the whole
-story, including where the 396 points went.
+story, including where the 64 points went.
 
+<!-- OUTDATED: docs/images/final-board.png is the last board of the earlier game (131072 down to 8,
+     a final 2, 3,931,768 points). Replace it with the current agent's last board and change the alt
+     text to "...: 131072 down to 4 in snake order, with 3,932,100 points", then delete the line
+     below the image and this comment. -->
 <img src="docs/images/final-board.png" alt="The last board of the snake agent's cool-mode game: 131072 down to 8 in snake order, with 3,931,768 points" width="380">
+
+*The board above is from the earlier 3,931,768 game, which ended on a 2.*
 
 ## Results
 

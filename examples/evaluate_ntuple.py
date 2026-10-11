@@ -33,6 +33,10 @@ def main(argv=None) -> None:
                    help="skip spawn branches whose cumulative probability is below this (0 = exact)")
     p.add_argument("--downgrade", type=int, default=0,
                    help="tile (e.g. 32768) from which the search picks its move on the downgraded board; 0 = off")
+    p.add_argument("--tt-bits", type=int, default=0,
+                   help="transposition table of 2**n entries (32 bytes each) per thread; 0 = the default, 20")
+    p.add_argument("--depth-caps", default="",
+                   help="deepest search by number of empty cells, from 0 up, e.g. 5,5,5,5,4,4,4,4,3 (the last value repeats)")
     p.add_argument("--json", default=None)
     p.add_argument("--choose", action="store_true", help="evaluate the choose game (cool mode) instead of random spawns")
     p.add_argument("--beam", default="", help="choose mode: comma-separated beams width:depth[:spread[:stride]]")
@@ -42,6 +46,9 @@ def main(argv=None) -> None:
     path = nt.resolve_weights(args.weights)
     net = nt.NTupleNet.load(path)
     net.downgrade = args.downgrade
+    if args.tt_bits:
+        net.tt_bits = args.tt_bits
+    net.depth_caps = [int(x) for x in args.depth_caps.split(",") if x.strip()]
     out_dir = path.parent
     state = json.loads((out_dir / "state.json").read_text()) if (out_dir / "state.json").exists() else {}
     mps = None
@@ -54,7 +61,8 @@ def main(argv=None) -> None:
     def show(label: str, stats: dict, t: float) -> None:
         print(f"{label}: {args.games} games in {time.time() - t:.0f}s | mean {stats['mean_score']:.0f}, "
               f"median {stats['median_score']:.0f}, max {stats['max_score']} | {stats['mean_length']:.0f} moves | "
-              f"8192 {stats['rate_8192']:.0%}, 16384 {stats['rate_16384']:.0%}, 32768 {stats['rate_32768']:.0%}", flush=True)
+              f"8192 {nt.percent(stats['rate_8192'])}, 16384 {nt.percent(stats['rate_16384'])}, "
+              f"32768 {nt.percent(stats['rate_32768'], 1)}, 65536 {nt.percent(stats['rate_65536'], 1)}", flush=True)
 
     evals = {}
     depths = [int(x) for x in args.depths.split(",") if x.strip()]

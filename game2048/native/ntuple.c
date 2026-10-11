@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#if defined(__AVX2__) && defined(__BMI2__)
+#include <immintrin.h>
+#define NT_SIMD 1                /* x86-64 with AVX2: the 8 symmetric samples of a pattern are indexed at once */
+#endif
 
 typedef __uint128_t board_t;
 typedef uint32_t row_t;
@@ -28,7 +32,8 @@ typedef uint32_t row_t;
 #define MAX_PATTERNS 16
 #define MAX_LEN 8
 #define MAX_STAGES 8
-#define TT_BITS 20
+#define TT_BITS 20               /* default transposition table: 2^20 entries (32 MB) per search thread */
+#define TT_BITS_MAX 28
 
 static inline int cell(board_t b, int i) { return (int)((b >> (CB * i)) & CMASK); }
 static inline board_t put(int v, int i) { return (board_t)v << (CB * i); }
@@ -38,7 +43,6 @@ static inline uint64_t hi64(board_t b) { return (uint64_t)(b >> 64); }
 static inline uint64_t hash128(board_t b) {
     return (lo64(b) * 0x9E3779B97F4A7C15ULL) ^ (hi64(b) * 0xD1B54A32D192ED03ULL + 0x632BE59BD9B4E019ULL);
 }
-static inline size_t tt_hash(board_t b) { return (size_t)(hash128(b) >> (64 - TT_BITS)); }
 
 /* ---------------------------------------------------------------- engine --- */
 
@@ -83,11 +87,15 @@ static void init_tables(void) {
     pthread_mutex_unlock(&tables_lock);
 }
 
+/* Two rounds of masked swaps: cells 1-4, 3-6, 9-12, 11-14 (within each 2x2 block),
+ * then the top-right 2x2 block with the bottom-left one. */
 static inline board_t transpose(board_t x) {
-    board_t out = 0;
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 4; c++) out |= put(cell(x, r * 4 + c), c * 4 + r);
-    return out;
+    const board_t m1 = put(CMASK, 1) | put(CMASK, 3) | put(CMASK, 9) | put(CMASK, 11);
+    const board_t m2 = put(CMASK, 2) | put(CMASK, 3) | put(CMASK, 6) | put(CMASK, 7);
+    board_t t = ((x >> (3 * CB)) ^ x) & m1;
+    x ^= t ^ (t << (3 * CB));
+    t = ((x >> (6 * CB)) ^ x) & m2;
+    return x ^ t ^ (t << (6 * CB));
 }
 
 static inline board_t slide_left(board_t b, int *reward) {
@@ -146,6 +154,16 @@ static inline uint64_t rng_next(uint64_t *s) {  /* splitmix64 */
 }
 
 static inline board_t spawn(board_t b, uint64_t *rng) {
+#ifdef NT_SIMD
+    /* the empty cells as a bit mask, and the k-th of them by depositing bit k into it */
+    __m128i cells = _mm_set_epi64x((long long)_pdep_u64((uint64_t)(b >> 40), 0x1F1F1F1F1F1F1F1FULL),
+                                   (long long)_pdep_u64((uint64_t)b, 0x1F1F1F1F1F1F1F1FULL));
+    unsigned free_mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(cells, _mm_setzero_si128()));
+    if (!free_mask) return b;
+    uint64_t r0 = rng_next(rng);
+    unsigned k0 = (unsigned)((r0 & 0xFFFFFFFFULL) % (uint64_t)__builtin_popcount(free_mask));
+    return b | put(((r0 >> 32) % 10 == 0) ? 2 : 1, __builtin_ctz(_pdep_u32(1u << k0, free_mask)));
+#else
     int empty = count_empty(b);
     if (!empty) return b;
     uint64_t r = rng_next(rng);
@@ -155,6 +173,7 @@ static inline board_t spawn(board_t b, uint64_t *rng) {
         if (cell(b, i) == 0 && k-- == 0) return b | put(val, i);
     }
     return b;
+#endif
 }
 
 static inline uint64_t game_seed(uint64_t seed, long g) {
@@ -165,20 +184,20 @@ static inline uint64_t game_seed(uint64_t seed, long g) {
 
 typedef struct {
     board_t key;
-    float val;
+    double val;
     uint8_t depth;
 } tt_entry_t;
 
 typedef struct search_ctx {
     tt_entry_t *tt;
-    size_t mask;
+    int bits;                /* the table holds 2^bits entries */
     double cutoff;
     struct net *net;
     uint64_t version;
 } search_ctx_t;
 
-/* Stages: a board's stage is the number of tile-mass boundaries it has passed;
- * each stage owns a table set. The first `tc_stages` stages learn with temporal
+/* Stages: a board's stage is the number of boundaries its tile set has reached
+ * (see board_scale); each stage owns a table set. The first `tc_stages` stages learn with temporal
  * coherence (per-entry E/A sums, 8 extra bytes per weight); the rest with plain
  * TD and one "touched" bit per entry. Promotion: an entry a stage never touched
  * reads through to the previous stage. `flags` is 0 for weights-only nets, where
@@ -193,6 +212,8 @@ typedef struct net {
     int len[MAX_PATTERNS];
     int orig[MAX_PATTERNS][MAX_LEN];
     int cells[MAX_PATTERNS][8][MAX_LEN];
+    uint8_t shuf[MAX_PATTERNS][MAX_LEN][16];   /* shuf[k][j][s] = cells[k][s][j]: byte shuffles for the vector path */
+    uint8_t pair[MAX_PATTERNS][48];            /* 6-cell patterns: cells (0,1), (2,3), (4,5) of each symmetry, side by side */
     size_t size[MAX_PATTERNS];
     float *w[MAX_STAGES][MAX_PATTERNS], *e[MAX_STAGES][MAX_PATTERNS], *a[MAX_STAGES][MAX_PATTERNS];
     uint8_t *bits[MAX_STAGES][MAX_PATTERNS];
@@ -203,20 +224,27 @@ typedef struct net {
     double snake_decay;      /* weight ratio between consecutive cells on the snake path */
     double snake_w[16];      /* snake_decay^k */
     int downgrade;           /* exponent of the tile that switches tile downgrading on at the search root (0 = off) */
+    int tt_bits;             /* transposition table size for searches on this network */
+    int depth_cap[17];       /* random-spawn search: deepest search for a root with this many empty cells (0 = no cap) */
 } net_t;
 
-static inline int64_t board_mass(board_t b) {
+static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
+
+/* Which tiles are on the board: the sum of the distinct tile values present. A
+ * boundary is compared with it, so 16384 means "holds a 16384 or larger" and
+ * 49152 "holds a 32768 and a 16384, or larger" (the convention of Guei et al.). */
+static inline int64_t board_scale(board_t b) {
     int64_t m = 0;
     for (int i = 0; i < 16; i++) {
         int v = (int)cell(b, i);
-        if (v) m += (int64_t)1 << v;
+        if (v) m |= (int64_t)1 << v;
     }
     return m;
 }
 
 static inline int stage_of(board_t b, const int64_t *bounds, int n_bounds) {
     if (n_bounds == 0) return 0;
-    int64_t m = board_mass(b);
+    int64_t m = board_scale(b);
     int s = 0;
     while (s < n_bounds && m >= bounds[s]) s++;
     return s;
@@ -282,6 +310,18 @@ static inline size_t bits_bytes(size_t entries) { return (entries + 7) / 8; }
 
 void nt_free(void *p);
 
+/* The tables are gigabytes of random access. Where Linux gives huge pages only on
+ * request, ask for them: far fewer TLB misses per lookup. A hint; failure is harmless. */
+static void *table_calloc(size_t n, size_t size) {
+    void *p = calloc(n, size);
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    const uintptr_t huge = (uintptr_t)2 << 20;
+    uintptr_t lo = ((uintptr_t)p + huge - 1) & ~(huge - 1), hi = ((uintptr_t)p + n * size) & ~(huge - 1);
+    if (p && hi > lo) madvise((void *)lo, hi - lo, MADV_HUGEPAGE);
+#endif
+    return p;
+}
+
 static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_stages, int flags,
                         const int64_t *bounds, int n_bounds) {
     init_tables();
@@ -307,28 +347,53 @@ static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_st
         }
         for (int s = 0; s < 8; s++)
             for (int j = 0; j < n; j++) net->cells[k][s][j] = sym_cell(net->orig[k][j], s);
+        for (int j = 0; j < n; j++)
+            for (int s = 0; s < 16; s++) net->shuf[k][j][s] = s < 8 ? (uint8_t)net->cells[k][s][j] : 0x80;
+        if (n == 6)
+            for (int s = 0; s < 8; s++)
+                for (int j = 0; j < 6; j++) net->pair[k][16 * (j / 2) + 2 * s + (j & 1)] = (uint8_t)net->cells[k][s][j];
         net->size[k] = 1;
         for (int j = 0; j < n; j++) net->size[k] *= RADIX;
         for (int st = 0; st < net->n_stages; st++) {
-            int ok = (net->w[st][k] = (float *)calloc(net->size[k], sizeof(float))) != NULL;
+            int ok = (net->w[st][k] = (float *)table_calloc(net->size[k], sizeof(float))) != NULL;
             if (stage_is_tc(net, st)) {
-                ok &= (net->e[st][k] = (float *)calloc(net->size[k], sizeof(float))) != NULL;
-                ok &= (net->a[st][k] = (float *)calloc(net->size[k], sizeof(float))) != NULL;
+                ok &= (net->e[st][k] = (float *)table_calloc(net->size[k], sizeof(float))) != NULL;
+                ok &= (net->a[st][k] = (float *)table_calloc(net->size[k], sizeof(float))) != NULL;
             }
             if (stage_has_bits(net, st))
-                ok &= (net->bits[st][k] = (uint8_t *)calloc(bits_bytes(net->size[k]), 1)) != NULL;
+                ok &= (net->bits[st][k] = (uint8_t *)table_calloc(bits_bytes(net->size[k]), 1)) != NULL;
             if (!ok) { nt_free(net); return NULL; }           /* out of memory: the tables are large */
         }
     }
     net->snake_decay = SNAKE_DECAY_DEFAULT;
     snake_weights(net->snake_decay, net->snake_w);
     net->version = 1;
+    net->tt_bits = TT_BITS;
     return net;
 }
 
 void *nt_create_ex(const int *cells_flat, const int *lens, int K, int tc_stages,
                    const int64_t *bounds, int n_bounds) {
     return net_alloc(cells_flat, lens, K, tc_stages, 1, bounds, n_bounds);
+}
+
+/* One network per stage, from n single-stage networks with the same patterns:
+ * nets[s] becomes stage s, with nothing read through from an earlier stage.
+ * Weights only; this is for play, each stage having been trained on its own. */
+void *nt_stack(void **nets, int n, const int64_t *bounds) {
+    if (n < 1 || n > MAX_STAGES) return NULL;
+    net_t *first = (net_t *)nets[0];
+    for (int s = 0; s < n; s++) {
+        net_t *x = (net_t *)nets[s];
+        if (x->n_stages != 1 || x->K != first->K || memcmp(x->len, first->len, sizeof(first->len)) != 0 ||
+            memcmp(x->orig, first->orig, sizeof(first->orig)) != 0) return NULL;
+    }
+    net_t *net = net_alloc(&first->orig[0][0], first->len, first->K, 0, 0, bounds, n - 1);
+    if (!net) return NULL;
+    for (int s = 0; s < n; s++)
+        for (int k = 0; k < net->K; k++)
+            memcpy(net->w[s][k], ((net_t *)nets[s])->w[0][k], net->size[k] * sizeof(float));
+    return net;
 }
 
 /* Optimistic initialisation: every weight of every stage starts at v, so a board
@@ -412,8 +477,82 @@ static inline float net_value_stage(const net_t *net, board_t b, int st) {
     return v;
 }
 
+/* A board's cells as bytes, and from them the table index of every pattern under
+ * every symmetry: idx[8k + s], with the entries of stage st requested from memory
+ * on the way. Reading a board this way, once, is several times faster than
+ * tuple_index per pattern, and gives the same indices. */
+static inline void unpack_cells(board_t b, uint8_t *c) {
+#ifdef NT_SIMD
+    uint64_t h[2] = {_pdep_u64((uint64_t)b, 0x1F1F1F1F1F1F1F1FULL), _pdep_u64((uint64_t)(b >> 40), 0x1F1F1F1F1F1F1F1FULL)};
+    memcpy(c, h, 16);
+#else
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
+#endif
+}
+
+static inline void cells_indices(const net_t *net, const uint8_t *c, int st, uint32_t *idx) {
+#ifdef NT_SIMD
+    _Static_assert(RADIX == 18, "the shifts below multiply by 18");
+    const __m128i bytes = _mm_loadu_si128((const __m128i *)c);
+    const __m256i both = _mm256_broadcastsi128_si256(bytes);
+    const __m256i w18 = _mm256_set1_epi16(0x0112), w324 = _mm256_set1_epi32(RADIX * RADIX);
+    for (int k = 0; k < net->K; k++) {
+        __m256i acc = _mm256_setzero_si256();
+        if (net->len[k] == 6) {
+            /* two cells at a time: a*18 + b for cells (0,1) and (2,3) of the 8 symmetries
+             * in one multiply-add, (4,5) in another, then (p0*324 + p1)*324 + p2 */
+            __m256i p01 = _mm256_maddubs_epi16(_mm256_shuffle_epi8(both, _mm256_loadu_si256((const __m256i *)net->pair[k])), w18);
+            __m128i p2 = _mm_maddubs_epi16(_mm_shuffle_epi8(bytes, _mm_loadu_si128((const __m128i *)(net->pair[k] + 32))),
+                                           _mm256_castsi256_si128(w18));
+            acc = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(p01));
+            acc = _mm256_add_epi32(_mm256_mullo_epi32(acc, w324), _mm256_cvtepu16_epi32(_mm256_extracti128_si256(p01, 1)));
+            acc = _mm256_add_epi32(_mm256_mullo_epi32(acc, w324), _mm256_cvtepu16_epi32(p2));
+        } else for (int j = 0; j < net->len[k]; j++) {
+            __m128i pick = _mm_shuffle_epi8(bytes, _mm_loadu_si128((const __m128i *)net->shuf[k][j]));
+            acc = _mm256_add_epi32(_mm256_add_epi32(_mm256_slli_epi32(acc, 4), _mm256_slli_epi32(acc, 1)),
+                                   _mm256_cvtepu8_epi32(pick));
+        }
+        _mm256_storeu_si256((__m256i *)(idx + 8 * k), acc);
+        const float *w = net->w[st][k];
+        for (int s = 0; s < 8; s++) __builtin_prefetch(&w[idx[8 * k + s]]);
+    }
+#else
+    int f = 0;
+    for (int k = 0; k < net->K; k++) {
+        const int n = net->len[k];
+        const float *w = net->w[st][k];
+        for (int s = 0; s < 8; s++) {
+            const int *cells = net->cells[k][s];
+            uint32_t i = 0;
+            for (int j = 0; j < n; j++) i = i * RADIX + c[cells[j]];
+            __builtin_prefetch(&w[i]);
+            idx[f++] = i;
+        }
+    }
+#endif
+}
+
+/* The value of a board. Without promotion every entry is read from the board's own
+ * stage: index once, then sum in the order net_value_stage uses. The same number. */
 static inline float net_value(const net_t *net, board_t b) {
-    return net_value_stage(net, b, stage_of(b, net->bounds, net->n_bounds));
+    if (net->flags) return net_value_stage(net, b, stage_of(b, net->bounds, net->n_bounds));
+    uint8_t c[16];
+    uint32_t idx[MAX_PATTERNS * 8];
+    unpack_cells(b, c);
+    int st = 0;
+    if (net->n_bounds) {
+        int64_t scale = 0;
+        for (int i = 0; i < 16; i++) scale |= (int64_t)1 << c[i];
+        while (st < net->n_bounds && (scale & ~(int64_t)1) >= net->bounds[st]) st++;
+    }
+    cells_indices(net, c, st, idx);
+    float v = 0.0f;
+    int f = 0;
+    for (int k = 0; k < net->K; k++) {
+        const float *w = net->w[st][k];
+        for (int s = 0; s < 8; s++) v += w[idx[f++]];
+    }
+    return v;
 }
 
 static inline void net_update_stage(net_t *net, board_t b, float delta, float alpha, float alpha_plain, int st) {
@@ -512,19 +651,8 @@ static void run_workers(void *(*fn)(void *), void *job, int threads) {
 
 static inline void feat_indices(const net_t *net, board_t b, uint32_t *idx) {
     uint8_t c[16];
-    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
-    int f = 0;
-    for (int k = 0; k < net->K; k++) {
-        const int n = net->len[k];
-        const float *w = net->w[0][k];
-        for (int s = 0; s < 8; s++) {
-            const int *cells = net->cells[k][s];
-            uint32_t i = 0;
-            for (int j = 0; j < n; j++) i = i * RADIX + c[cells[j]];
-            __builtin_prefetch(&w[i]);
-            idx[f++] = i;
-        }
-    }
+    unpack_cells(b, c);
+    cells_indices(net, c, 0, idx);
 }
 
 static inline float feat_value(const net_t *net, const uint32_t *idx) {
@@ -558,10 +686,11 @@ static inline void feat_update(net_t *net, const uint32_t *idx, float delta, flo
     }
 }
 
-static void learn_game_single(net_t *net, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
+/* start: the board a game begins from, or 0 for a new game (two random tiles). */
+static void learn_game_single(net_t *net, board_t start, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
     const size_t fbytes = sizeof(uint32_t) * (size_t)net->K * 8;
     uint32_t idx[4][MAX_FEATS], pidx[MAX_FEATS];
-    board_t b = spawn(spawn(0, rng), rng);
+    board_t b = start ? start : spawn(spawn(0, rng), rng);
     int have_prev = 0;
     int64_t sc = 0;
     int32_t mv = 0;
@@ -596,9 +725,9 @@ static void learn_game_single(net_t *net, float alpha, float alpha_plain, uint64
     *nmoves = mv;
 }
 
-static void learn_game(net_t *net, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
-    if (net->n_stages == 1) { learn_game_single(net, alpha, alpha_plain, rng, score, maxtile, nmoves); return; }
-    board_t b = spawn(spawn(0, rng), rng);
+static void learn_game(net_t *net, board_t start, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
+    if (net->n_stages == 1) { learn_game_single(net, start, alpha, alpha_plain, rng, score, maxtile, nmoves); return; }
+    board_t b = start ? start : spawn(spawn(0, rng), rng);
     board_t prev = 0;
     int have_prev = 0;
     int64_t sc = 0;
@@ -636,6 +765,8 @@ typedef struct {
     long *next, n;   /* next: the shared game counter */
     float alpha, alpha_plain;
     uint64_t seed;
+    const board_t *starts;
+    long n_starts;
     int64_t *scores;
     int32_t *maxtiles, *moves;
 } train_job_t;
@@ -646,18 +777,37 @@ static void *train_worker(void *arg) {
         long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
         if (g >= j->n) break;
         uint64_t rng = game_seed(j->seed, g);
-        learn_game(j->net, j->alpha, j->alpha_plain, &rng, &j->scores[g], &j->maxtiles[g], &j->moves[g]);
+        board_t start = j->n_starts > 0 ? j->starts[rng_next(&rng) % (uint64_t)j->n_starts] : 0;
+        learn_game(j->net, start, j->alpha, j->alpha_plain, &rng, &j->scores[g], &j->maxtiles[g], &j->moves[g]);
     }
     return NULL;
 }
 
+static board_t *unpack_boards(const uint64_t *lohi, long *n) {
+    board_t *b = (*n > 0 && lohi) ? (board_t *)malloc(sizeof(board_t) * (size_t)*n) : NULL;
+    if (!b) { *n = 0; return NULL; }
+    for (long i = 0; i < *n; i++) b[i] = mk(lohi[2 * i], lohi[2 * i + 1]);
+    return b;
+}
+
+/* starts_lohi: n_starts boards as (lo, hi) pairs. When given, every game begins
+ * from one of them, drawn at random, and its score counts from there. This is how
+ * a later stage is trained on its own: from boards an earlier network reached. */
+void nt_train_from(void *p, long games, int threads, float alpha, float alpha_plain, uint64_t seed,
+                   const uint64_t *starts_lohi, long n_starts,
+                   int64_t *scores, int32_t *maxtiles, int32_t *moves) {
+    net_t *net = (net_t *)p;
+    board_t *starts = unpack_boards(starts_lohi, &n_starts);
+    long next = 0;
+    train_job_t job = {net, &next, games, alpha, alpha_plain, seed, starts, n_starts, scores, maxtiles, moves};
+    run_workers(train_worker, &job, threads);
+    free(starts);
+    net->version++;
+}
+
 void nt_train(void *p, long games, int threads, float alpha, float alpha_plain, uint64_t seed,
               int64_t *scores, int32_t *maxtiles, int32_t *moves) {
-    net_t *net = (net_t *)p;
-    long next = 0;
-    train_job_t job = {net, &next, games, alpha, alpha_plain, seed, scores, maxtiles, moves};
-    run_workers(train_worker, &job, threads);
-    net->version++;
+    nt_train_from(p, games, threads, alpha, alpha_plain, seed, NULL, 0, scores, maxtiles, moves);
 }
 
 /* ------------------------------------------------------------- expectimax --- */
@@ -666,8 +816,8 @@ void nt_train(void *p, long games, int threads, float alpha, float alpha_plain, 
  * while the weights are being updated (cached values would go stale at once). */
 static search_ctx_t *ctx_create_tt(net_t *net, double cutoff, int use_tt) {
     search_ctx_t *c = (search_ctx_t *)calloc(1, sizeof(search_ctx_t));
-    c->tt = use_tt ? (tt_entry_t *)calloc((size_t)1 << TT_BITS, sizeof(tt_entry_t)) : NULL;
-    c->mask = ((size_t)1 << TT_BITS) - 1;
+    c->bits = net->tt_bits;
+    c->tt = use_tt ? (tt_entry_t *)table_calloc((size_t)1 << c->bits, sizeof(tt_entry_t)) : NULL;
     c->cutoff = cutoff;
     c->net = net;
     c->version = net->version;
@@ -680,7 +830,7 @@ static search_ctx_t *ctx_create(net_t *net, double cutoff) {
 
 static void ctx_sync(search_ctx_t *c, double cutoff) {
     if (c->version != c->net->version || c->cutoff != cutoff) {
-        if (c->tt) memset(c->tt, 0, ((size_t)1 << TT_BITS) * sizeof(tt_entry_t));
+        if (c->tt) memset(c->tt, 0, ((size_t)1 << c->bits) * sizeof(tt_entry_t));
         c->version = c->net->version;
         c->cutoff = cutoff;
     }
@@ -724,10 +874,21 @@ void nt_set_leaf_snake(void *p, double w) {
 
 double nt_leaf_snake(void *p) { return ((net_t *)p)->leaf_snake; }
 
+/* The table keeps values exactly as computed (doubles), so a hit returns what the
+ * search would have found again and, with no probability cutoff, the move chosen
+ * never depends on what the table happens to hold: play is the same for any table
+ * size or thread count.
+ * Leaves are kept too (as depth 0, stored +1 so an empty slot matches nothing):
+ * one probe is far cheaper than a board's table lookups. */
 static double chance_node(search_ctx_t *c, board_t after, int depth, double prob) {
-    if (depth == 0 || prob < c->cutoff) return leaf_value(c->net, after);
-    tt_entry_t *e = c->tt ? &c->tt[tt_hash(after)] : NULL;
-    if (e && e->key == after && e->depth == depth) return e->val;
+    if (prob < c->cutoff) depth = 0;
+    tt_entry_t *e = c->tt ? &c->tt[tt_hash(c, after)] : NULL;
+    if (e && e->key == after && e->depth == depth + 1) return e->val;
+    if (depth == 0) {
+        double v = leaf_value(c->net, after);
+        if (e) { e->key = after; e->depth = 1; e->val = v; }
+        return v;
+    }
     int empty = count_empty(after);
     double p2 = prob * 0.9 / empty, p4 = prob * 0.1 / empty, sum = 0.0;
     for (int i = 0; i < 16; i++) {
@@ -738,8 +899,8 @@ static double chance_node(search_ctx_t *c, board_t after, int depth, double prob
     double v = sum / empty;
     if (e) {
         e->key = after;
-        e->depth = (uint8_t)depth;
-        e->val = (float)v;
+        e->depth = (uint8_t)(depth + 1);
+        e->val = v;
     }
     return v;
 }
@@ -786,8 +947,39 @@ void nt_downgrade(uint64_t lo, uint64_t hi, uint64_t *out_lo, uint64_t *out_hi) 
 void nt_set_downgrade(void *p, int exp) { ((net_t *)p)->downgrade = exp < 0 ? 0 : exp; }
 int nt_get_downgrade(void *p) { return ((net_t *)p)->downgrade; }
 
+/* Not for use while games are being played on other threads. bits: 2^bits entries
+ * of 32 bytes per search thread. caps: 17 depths indexed by the root's empty cells
+ * (0 = no cap), or NULL to clear: crowded boards get the deep search, open ones,
+ * where a spawn rarely decides anything, a shallow one. */
+static void drop_ctx(search_ctx_t **c) {
+    if (*c) { free((*c)->tt); free(*c); *c = NULL; }
+}
+
+void nt_set_tt_bits(void *p, int bits) {
+    net_t *net = (net_t *)p;
+    if (bits < 10) bits = 10;
+    if (bits > TT_BITS_MAX) bits = TT_BITS_MAX;
+    if (bits == net->tt_bits) return;
+    net->tt_bits = bits;
+    drop_ctx(&net->main_ctx);                            /* rebuilt at the new size on the next search */
+    drop_ctx(&net->choose_ctx);
+}
+
+int nt_get_tt_bits(void *p) { return ((net_t *)p)->tt_bits; }
+
+void nt_set_depth_caps(void *p, const int *caps) {
+    net_t *net = (net_t *)p;
+    for (int i = 0; i < 17; i++) net->depth_cap[i] = caps && caps[i] > 0 ? caps[i] : 0;
+}
+
+void nt_get_depth_caps(void *p, int *out) {
+    for (int i = 0; i < 17; i++) out[i] = ((net_t *)p)->depth_cap[i];
+}
+
 static int best_move(search_ctx_t *c, board_t b, int depth) {
     if (c->net->downgrade && max_exp(b) >= c->net->downgrade) b = downgrade(b);
+    int cap = c->net->depth_cap[count_empty(b)];
+    if (cap && depth > cap) depth = cap;
     int best = -1;
     double bestv = 0.0;
     for (int d = 0; d < 4; d++) {
@@ -820,7 +1012,7 @@ typedef struct {
     net_t *net;
     int depth;
     double cutoff;
-    long *next, n;
+    long *next, n, first;   /* game g of the job is game first + g of the seed */
     uint64_t seed;
     int64_t *scores;
     int32_t *maxtiles, *moves;
@@ -832,7 +1024,7 @@ static void *play_worker(void *arg) {
     for (;;) {
         long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
         if (g >= j->n) break;
-        uint64_t rng = game_seed(j->seed, g);
+        uint64_t rng = game_seed(j->seed, j->first + g);
         board_t b = spawn(spawn(0, &rng), &rng);
         int64_t sc = 0;
         int32_t mv = 0;
@@ -852,11 +1044,65 @@ static void *play_worker(void *arg) {
     return NULL;
 }
 
+/* Games first .. first + games - 1 of the seed. A game depends on its number and
+ * the seed alone, so an evaluation can be cut into pieces, run anywhere in any
+ * order, and add up to the same games. */
+void nt_play_from(void *p, long games, long first, int depth, double cutoff, int threads, uint64_t seed,
+                  int64_t *scores, int32_t *maxtiles, int32_t *moves) {
+    long next = 0;
+    play_job_t job = {(net_t *)p, depth, cutoff, &next, games, first, seed, scores, maxtiles, moves};
+    run_workers(play_worker, &job, threads);
+}
+
 void nt_play(void *p, long games, int depth, double cutoff, int threads, uint64_t seed,
              int64_t *scores, int32_t *maxtiles, int32_t *moves) {
+    nt_play_from(p, games, 0, depth, cutoff, threads, seed, scores, maxtiles, moves);
+}
+
+/* Play games and keep, from each, the first board that holds a tile of exponent
+ * `exp` or larger (after the spawn, as the player sees it): cells[16g..16g+15]
+ * get its exponents and scores[g] the points so far. A game that ends first
+ * leaves its cells at zero. */
+typedef struct {
+    net_t *net;
+    int depth, exp;
+    double cutoff;
+    long *next, n;
+    uint64_t seed;
+    uint8_t *cells;
+    int64_t *scores;
+} collect_job_t;
+
+static void *collect_worker(void *arg) {
+    collect_job_t *j = (collect_job_t *)arg;
+    search_ctx_t *c = ctx_create(j->net, j->cutoff);
+    for (;;) {
+        long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
+        if (g >= j->n) break;
+        uint64_t rng = game_seed(j->seed, g);
+        board_t b = spawn(spawn(0, &rng), &rng);
+        int64_t sc = 0;
+        while (max_exp(b) < j->exp) {
+            int d = best_move(c, b, j->depth);
+            if (d < 0) break;
+            int r;
+            b = spawn(do_move(b, d, &r), &rng);
+            sc += r;
+        }
+        if (max_exp(b) >= j->exp)
+            for (int i = 0; i < 16; i++) j->cells[16 * g + i] = (uint8_t)cell(b, i);
+        j->scores[g] = sc;
+    }
+    ctx_free(c);
+    return NULL;
+}
+
+void nt_collect(void *p, long games, int depth, double cutoff, int threads, uint64_t seed, int exp,
+                uint8_t *cells, int64_t *scores) {
     long next = 0;
-    play_job_t job = {(net_t *)p, depth, cutoff, &next, games, seed, scores, maxtiles, moves};
-    run_workers(play_worker, &job, threads);
+    memset(cells, 0, (size_t)games * 16);
+    collect_job_t job = {(net_t *)p, depth, exp, cutoff, &next, games, seed, cells, scores};
+    run_workers(collect_worker, &job, threads);
 }
 
 /* A random spawn that never ends the game when it can be avoided: uniform over
@@ -926,7 +1172,7 @@ static double choose_av(search_ctx_t *c, board_t a, int depth, int topk) {
     if (depth == 0) return net_value(c->net, a);
     tt_entry_t *e = NULL;
     if (c->tt) {
-        size_t h = tt_hash(a);
+        size_t h = tt_hash(c, a);
         e = &c->tt[h];
         if (e->key == a && e->depth == depth) return e->val;
     }
@@ -1060,6 +1306,7 @@ typedef struct {
     int32_t parent;          /* index in the previous level */
     int8_t alive;            /* 0 when s has no legal move */
     int8_t m, cell, val;     /* the step that produced s; m = -1 for a carried dead entry */
+    int16_t fours;           /* 4s placed along the line */
 } beam_t;
 
 static inline int next_value(net_t *net, board_t s, double snake, double *out) {
@@ -1088,10 +1335,11 @@ static int beam_cmp(const void *x, const void *y) {
 /* tiles: bitmask of placements allowed, 1 = a 2, 2 = a 4 (3 = both). Placing only 2s
  * earns every 2+2 merge and approaches the theoretical maximum score, but the
  * 131072 needs one 4 at the very end; bit 4 charges each placed 4 the 4 points it
- * forfeits (in the ranking only). Bit 8 is handled by beam_search below.
+ * forfeits (in the ranking only). Bits 8 and 16 are handled by beam_search below.
+ * max_fours: a line may place at most this many 4s (negative = no limit).
  * *alive gets whether the best line can still move at the end of the horizon. */
 static int beam_search_raw(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
-                           int *moves, int *cells, int *values, double *score, int *alive) {
+                           int max_fours, int *moves, int *cells, int *values, double *score, int *alive) {
     if (width < 1) width = 1;
     if (depth < 1) depth = 1;
     if (spread < 0) spread = 0;
@@ -1105,7 +1353,7 @@ static int beam_search_raw(net_t *net, board_t b, int width, int depth, int spre
     beam_t *cand = (beam_t *)malloc(sizeof(beam_t) * cap);
     board_t *seen = (board_t *)malloc(sizeof(board_t) * hcap);
     int *kids = (int *)malloc(sizeof(int) * (size_t)width);
-    lev[0] = (beam_t){b, 0.0, 0, -1, 1, -1, -1, 0};
+    lev[0] = (beam_t){b, 0.0, 0, -1, 1, -1, -1, 0, 0};
     int n_cur = 1, L = 0;
     for (int d = 0; d < depth; d++) {
         beam_t *cur = lev + (size_t)d * width;
@@ -1130,6 +1378,7 @@ static int beam_search_raw(net_t *net, board_t b, int width, int depth, int spre
                     if (cell(a, c)) continue;
                     for (board_t v = 1; v <= 2; v++) {
                         if (!(tiles & (1 << (v - 1)))) continue;
+                        if (v == 2 && max_fours >= 0 && e->fours >= max_fours) continue;
                         board_t s2 = a | put((int)v, c);
                         size_t h = (size_t)(hash128(s2) >> (64 - hbits));
                         while (seen[h] && seen[h] != s2) h = (h + 1) & (hcap - 1);
@@ -1145,6 +1394,7 @@ static int beam_search_raw(net_t *net, board_t b, int width, int depth, int spre
                         ne.m = (int8_t)m;
                         ne.cell = (int8_t)c;
                         ne.val = (int8_t)v;
+                        ne.fours = (int16_t)(e->fours + (v == 2));
                         cand[n_cand++] = ne;
                     }
                 }
@@ -1202,15 +1452,36 @@ static int beam_search_raw(net_t *net, board_t b, int width, int depth, int spre
  * them). With a snake bonus and no negative values a live line always outranks a
  * dead one, so that means every 2s-only line in the beam dies. A fallback plan is
  * cut to its first step, so the next plan tries 2s again: 4s are placed only when
- * 2s cannot keep the game going. */
+ * 2s cannot keep the game going.
+ *
+ * Bit 16 = as few 4s as possible: the fallback first looks for a line that
+ * survives the horizon with a single 4, then two, and so on, before it allows any
+ * number. A free fallback takes a 4 at every step it is asked, seven or eight per
+ * cascade, where one is what the cascade needs. And a tile that ends the game
+ * whatever it is, the last cell of a full board, is placed as a 4: the score is
+ * the same, and the final board is the one the score formula is built on. */
 static int beam_search(net_t *net, board_t b, int width, int depth, int spread, double snake, int tiles,
                        int *moves, int *cells, int *values, double *score) {
     int alive;
     if (!(tiles & 8))
-        return beam_search_raw(net, b, width, depth, spread, snake, tiles, moves, cells, values, score, &alive);
-    int len = beam_search_raw(net, b, width, depth, spread, snake, 1, moves, cells, values, score, &alive);
+        return beam_search_raw(net, b, width, depth, spread, snake, tiles, -1, moves, cells, values, score, &alive);
+    int len = beam_search_raw(net, b, width, depth, spread, snake, 1, -1, moves, cells, values, score, &alive);
     if (len > 0 && alive) return len;
-    len = beam_search_raw(net, b, width, depth, spread, snake, 3 | (tiles & 4), moves, cells, values, score, &alive);
+    if (tiles & 16) {
+        for (int k = 1; k <= depth; k++) {
+            len = beam_search_raw(net, b, width, depth, spread, snake, 3 | (tiles & 4), k, moves, cells, values, score, &alive);
+            if (len > 0 && alive) return 1;
+        }
+    }
+    len = beam_search_raw(net, b, width, depth, spread, snake, 3 | (tiles & 4), -1, moves, cells, values, score, &alive);
+    if (len > 0 && (tiles & 16) && values[0] == 1) {
+        int r;
+        board_t a = do_move(b, moves[0], &r);
+        double nv;
+        if (count_empty(a) == 1 && !next_value(net, a | put(1, cells[0]), snake, &nv) &&
+            !next_value(net, a | put(2, cells[0]), snake, &nv))
+            values[0] = 2;
+    }
     return len < 1 ? len : 1;
 }
 
@@ -1386,14 +1657,7 @@ void nt_train_choose(void *p, long games, int threads, float alpha, float alpha_
     net_t *net = (net_t *)p;
     if (depth < 1) depth = 1;
     if (topk < 1) topk = 1;
-    board_t *starts = NULL;
-    if (n_starts > 0 && starts_lohi) {
-        starts = (board_t *)malloc(sizeof(board_t) * (size_t)n_starts);
-        if (!starts) n_starts = 0;
-        for (long i = 0; i < n_starts; i++) starts[i] = mk(starts_lohi[2 * i], starts_lohi[2 * i + 1]);
-    } else {
-        n_starts = 0;
-    }
+    board_t *starts = unpack_boards(starts_lohi, &n_starts);
     long next = 0;
     choose_train_job_t job = {net, depth, topk, &next, games, max_moves, explore, starts, n_starts, start_frac,
                               alpha, alpha_plain, seed, scores, maxtiles, moves};

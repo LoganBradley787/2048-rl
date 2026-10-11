@@ -872,7 +872,7 @@ def build_ntuple_report(log_rows: list[dict], evals: dict, meta: dict) -> str:
     rates_txt = (f"{fmt_pct(hero.get('rate_8192', 0))} of games reach 8192, "
                  f"{fmt_pct(hero.get('rate_16384', 0))} reach 16384 and "
                  f"{fmt_pct(hero.get('rate_32768', 0))} reach 32768.") if hero else ""
-    stages_note = (f" Boards whose tile mass has passed {', '.join(fmt_int(b) for b in bounds)} use their own "
+    stages_note = (f" Boards whose tiles have reached {', '.join(fmt_int(b) for b in bounds)} use their own "
                    f"tables, seeded from the previous stage the first time an entry is touched." if bounds else "")
 
     data = json.dumps({"log": rows, "evals": evals, "meta": meta})

@@ -128,3 +128,48 @@ def test_kill_stops_a_detached_run_with_a_save(tmp_path):
     assert proc.returncode == 0 and "interrupted; saving" in out
     assert json.loads((tmp_path / "state.json").read_text())["games"] >= 20
     assert (tmp_path / "latest.bin").exists()
+
+
+def test_train_cli_trains_a_later_stage_from_saved_boards(tmp_path):
+    base_dir, out = tmp_path / "base", tmp_path / "stage2"
+    common = ["--chunk", "100", "--threads", "2", "--save-every-min", "0", "--no-tc", "--alpha-plain", "0.1"]
+    tr.main(["--games", "300", "--out", str(base_dir), "--eval-every-min", "0", *common])
+    base = nt.NTupleNet.load(base_dir / "weights.bin")
+    grids, _ = base.collect_starts(games=40, tile=128, threads=2, seed=1)
+    base.close()
+    assert len(grids) > 0
+    nt.save_starts(tmp_path / "starts.npy", grids)
+
+    stage = ["--out", str(out), "--eval-every-min", "0", "--eval-at-end", "--eval-games", "4", "--eval-depth", "1", *common]
+    tr.main(["--games", "200", "--starts", str(tmp_path / "starts.npy"), "--base", str(base_dir / "weights.bin"),
+             "--stage-tile", "128", "--v-init", "2000", *stage])
+    log = rows(out / "log.csv")
+    assert all(int(r["max_tile"]) >= 128 for r in log)           # every game began with the 128 on the board
+    state = json.loads((out / "state.json").read_text())
+    assert state["starts"] == str(tmp_path / "starts.npy") and state["stage_tile"] == 128
+    assert len(rows(out / "eval.csv")) == 1                      # whole games, played by both networks
+
+    tr.main(["--games", "100", "--resume", str(out / "latest.bin"), *stage])   # the boards and the base carry over
+    assert [int(r["games"]) for r in rows(out / "log.csv")] == [100, 200, 300]
+    assert all(int(r["max_tile"]) >= 128 for r in rows(out / "log.csv"))
+    assert len(rows(out / "eval.csv")) == 2
+    assert json.loads((out / "state.json").read_text())["base"] == str(base_dir / "weights.bin")
+
+
+def test_total_moves_is_a_budget_across_resumes_and_saves_keep_the_previous_checkpoint(tmp_path):
+    common = ["--chunk", "50", "--threads", "2", "--out", str(tmp_path), "--eval-every-min", "0", "--no-tc",
+              "--save-every-min", "0", "--keep-previous"]
+    tr.main(["--games", "100", *common])
+    first = json.loads((tmp_path / "state.json").read_text())["moves"]
+    assert not (tmp_path / "previous.bin").exists()              # nothing came before the first save
+    budget = first * 3
+    tr.main(["--total-moves", str(budget), "--resume", str(tmp_path / "latest.bin"), *common])
+    state = json.loads((tmp_path / "state.json").read_text())
+    last_chunk = int(rows(tmp_path / "log.csv")[-1]["chunk_moves"])
+    assert budget <= state["moves"] < budget + last_chunk        # stopped at the first chunk past the budget
+    assert (tmp_path / "previous.bin").exists()
+    assert not list(tmp_path.glob("*.tmp"))
+    nt.NTupleNet.load(tmp_path / "previous.bin").close()         # a complete checkpoint, loadable
+    games = state["games"]
+    tr.main(["--total-moves", str(budget), "--resume", str(tmp_path / "latest.bin"), *common])   # budget already met
+    assert json.loads((tmp_path / "state.json").read_text())["games"] == games

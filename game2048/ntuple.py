@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import subprocess
 import sys
@@ -98,6 +99,15 @@ PATTERN_SETS = {
         [0, 1, 4, 8, 9, 10],
     ],
 }
+# The same eight with smaller patterns beside them (redundant encoding, Jaśkowski
+# 2017): the two straight 4-cell lines, the three 2x2 squares and the two straight
+# 3-cell lines that differ under symmetry. Their tables are tiny and learn fast;
+# the price is twice the lookups per board.
+PATTERN_SETS["8x6-matsuzaki-redundant"] = PATTERN_SETS["8x6-matsuzaki"] + [
+    [0, 1, 2, 3], [4, 5, 6, 7],
+    [0, 1, 4, 5], [1, 2, 5, 6], [5, 6, 9, 10],
+    [0, 1, 2], [4, 5, 6],
+]
 MAX_PATTERNS, MAX_LEN, MAX_STAGES = 16, 8, 8   # MAX_LEN is the C struct stride; at most MAX_CELLS cells are usable
 MAX_CELLS = 7                                  # 18**7 entries is the most a 32-bit table index can hold
 CELL_BITS, CELL_MASK, MAX_EXP = 5, 31, 17   # five bits per cell: tiles up to 131072 (2**17)
@@ -131,12 +141,28 @@ def sym_cell(cell: int, k: int) -> int:
 _lib = None
 
 
+def _cpu_has(*wanted: str) -> bool:
+    """True when /proc/cpuinfo (Linux, x86) lists every one of these CPU flags."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("flags"):
+                return set(wanted) <= set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return False
+
+
 def _build() -> None:
     cc = os.environ.get("CC", "cc")
     tmp = LIB.with_suffix(LIB.suffix + ".tmp")
     # -ffp-contract=off: no fused multiply-add, so every CPU does the same arithmetic.
     # Self-play is chaotic; with fusing on, an arm64 and an x86-64 build train different tables.
     flags = ["-O3", "-ffp-contract=off", "-shared", "-fPIC"]
+    # The library is built on the machine that runs it, so it may use that CPU's
+    # integer vector instructions; the engine has a vector path for indexing the
+    # tables. Floating point is untouched: same results with or without.
+    if os.environ.get("GAME2048_NO_SIMD") != "1" and _cpu_has("avx2", "bmi2"):
+        flags += ["-mavx2", "-mbmi2"]
     try:
         subprocess.run([cc, *flags, "-o", str(tmp), str(SRC), "-lpthread", "-lm"], check=True)
     except (OSError, subprocess.CalledProcessError) as e:
@@ -174,9 +200,13 @@ def lib() -> ctypes.CDLL:
     L.nt_value.argtypes, L.nt_value.restype = [vp, u64, u64], f32
     L.nt_update.argtypes = [vp, u64, u64, f32, f32, f32]
     L.nt_train.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(i64), P(i32), P(i32)]
+    L.nt_train_from.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(u64), ctypes.c_long, P(i64), P(i32), P(i32)]
+    L.nt_collect.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, i32, P(ctypes.c_uint8), P(i64)]
+    L.nt_stack.argtypes, L.nt_stack.restype = [P(vp), i32, P(i64)], vp
     L.nt_best_move.argtypes, L.nt_best_move.restype = [vp, u64, u64, i32, f64], i32
     L.nt_search_value.argtypes, L.nt_search_value.restype = [vp, u64, u64, i32, f64], f64
     L.nt_play.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, P(i64), P(i32), P(i32)]
+    L.nt_play_from.argtypes = [vp, ctypes.c_long, ctypes.c_long, i32, f64, i32, u64, P(i64), P(i32), P(i32)]
     L.nt_best_choose.argtypes, L.nt_best_choose.restype = [vp, u64, u64, i32, i32, P(i32), P(i32)], i32
     L.nt_choose_value.argtypes, L.nt_choose_value.restype = [vp, u64, u64, i32, i32], f64
     L.nt_play_choose.argtypes = [vp, ctypes.c_long, i32, i32, i32, u64, ctypes.c_long, ctypes.c_long,
@@ -191,6 +221,10 @@ def lib() -> ctypes.CDLL:
     L.nt_downgrade.argtypes = [u64, u64, P(u64), P(u64)]
     L.nt_set_downgrade.argtypes = [vp, i32]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
+    L.nt_set_tt_bits.argtypes = [vp, i32]
+    L.nt_get_tt_bits.argtypes, L.nt_get_tt_bits.restype = [vp], i32
+    L.nt_set_depth_caps.argtypes = [vp, P(i32)]
+    L.nt_get_depth_caps.argtypes = [vp, P(i32)]
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
     L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32), P(i32)], i32
@@ -295,6 +329,24 @@ def load_starts(path) -> list[int]:
     return [to_bits(g) for g in np.load(path)]
 
 
+def pack_starts(starts):
+    """Bitboards, or an (n, 4, 4) array of exponent grids as `save_starts` writes
+    them -> (array of lo/hi halves, count), the form the native calls take. Pack a
+    large set once and pass the result to `train(starts=...)` every chunk."""
+    if isinstance(starts, np.ndarray):
+        c = starts.reshape(-1, 16).astype(np.uint64)             # cell i sits in bits 5i..5i+4
+        lohi = np.zeros((len(c), 2), dtype=np.uint64)
+        for i in range(16):
+            if 5 * i < 64:
+                lohi[:, 0] |= c[:, i] << np.uint64(5 * i)        # cell 12 straddles: its low 4 bits land here
+            if 5 * i + 5 > 64:
+                lohi[:, 1] |= c[:, i] >> np.uint64(64 - 5 * i) if 5 * i < 64 else c[:, i] << np.uint64(5 * i - 64)
+        flat = np.ascontiguousarray(lohi).reshape(-1)
+        return (ctypes.c_uint64 * max(2, len(flat))).from_buffer_copy(flat.tobytes().ljust(16, b"\0")), len(c)
+    starts = list(starts if starts is not None else [])
+    return (ctypes.c_uint64 * max(2, 2 * len(starts)))(*[h for b in starts for h in _lohi(b)]), len(starts)
+
+
 def cool_search_settings(weights) -> dict:
     """Beam settings for cool-mode play: `best.json` beside the weights when the
     snapshot loop wrote one (the config that scored best on those tables), else
@@ -315,7 +367,9 @@ def snake_score(bits: int, decay: float = SNAKE_DECAY) -> float:
 
 
 def stage_of(bits: int, boundaries: list[int]) -> int:
-    """Stage index: how many mass boundaries (sum of all tiles) the board has reached."""
+    """Stage index: how many boundaries the board's tile set has reached. The set is
+    measured as the sum of the distinct tile values present, so the boundary 16384
+    means "holds a 16384 or larger" and 49152 "holds a 32768 and a 16384, or larger"."""
     arr = (ctypes.c_int64 * max(1, len(boundaries)))(*boundaries)
     return int(lib().nt_stage_of(*_lohi(bits), arr, len(boundaries)))
 
@@ -333,7 +387,7 @@ def _stats(scores, maxtiles, moves) -> dict:
 # --- network --------------------------------------------------------------------
 
 class NTupleNet:
-    """`boundaries` are tile-mass thresholds (sum of all tiles on the board) that
+    """`boundaries` are thresholds on which tiles the board holds (see `stage_of`) that
     switch to a fresh set of weight tables, e.g. [16384, 24576, 32768]. Entries a
     later stage has never updated read through to the previous stage.
 
@@ -392,6 +446,20 @@ class NTupleNet:
         if not h:
             raise ValueError(f"{path} could not be loaded" + (f" with boundaries {bl}" if bl else "") +
                              ": not a valid weights file, or a staged file with different boundaries")
+        return cls(_handle=h)
+
+    @classmethod
+    def stack(cls, nets, boundaries) -> "NTupleNet":
+        """A multi-stage network for play from single-stage networks trained one
+        stage at a time: `nets[s]` becomes stage s, and nothing is read through from
+        an earlier stage. Weights only. The inputs are copied and stay usable."""
+        nets, bl = list(nets), [int(b) for b in boundaries]
+        if len(bl) != len(nets) - 1 or bl != sorted(bl):
+            raise ValueError("stack needs one ascending boundary between each pair of networks")
+        handles = (ctypes.c_void_p * len(nets))(*[n._h for n in nets])
+        h = lib().nt_stack(handles, len(nets), (ctypes.c_int64 * max(1, len(bl)))(*bl))
+        if not h:
+            raise ValueError("stack needs single-stage networks with the same patterns")
         return cls(_handle=h)
 
     def save(self, path, weights_only: bool = False) -> None:
@@ -458,13 +526,29 @@ class NTupleNet:
         self._lib.nt_update_stage(self._h, *_lohi(bits), float(delta), float(alpha), float(ap), int(stage))
 
     def train(self, games: int, threads: int = 1, alpha: float = 1.0, seed: int = 0,
-              alpha_plain: float | None = None) -> dict:
-        """Play `games` self-play games with TD(0) learning; returns per-game stats."""
+              alpha_plain: float | None = None, starts=None) -> dict:
+        """Play `games` self-play games with TD(0) learning; returns per-game stats.
+        `starts` (bitboards, or `pack_starts` of them) makes every game begin from
+        one of those boards, drawn at random, with its score counted from there."""
         ap = alpha if alpha_plain is None else alpha_plain
         scores, maxtiles, moves = _game_buffers(games)
-        self._lib.nt_train(self._h, games, threads, float(alpha), float(ap), seed & 0xFFFFFFFFFFFFFFFF,
-                           scores, maxtiles, moves)
+        packed, n = starts if isinstance(starts, tuple) else pack_starts(starts)
+        self._lib.nt_train_from(self._h, games, threads, float(alpha), float(ap), seed & 0xFFFFFFFFFFFFFFFF,
+                                packed, n, scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
+
+    def collect_starts(self, games: int, tile: int = 16384, depth: int = 0, cutoff: float = 0.0,
+                       threads: int = 1, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """Play `games` games and keep from each the first board that holds `tile`
+        or larger. Returns (grids, scores): (n, 4, 4) uint8 exponent grids for
+        `save_starts`, and the points each game had at that board. Games that end
+        before reaching the tile are left out."""
+        cells = np.zeros((games, 16), dtype=np.uint8)
+        scores = (ctypes.c_int64 * games)()
+        self._lib.nt_collect(self._h, games, int(depth), float(cutoff), threads, seed & 0xFFFFFFFFFFFFFFFF,
+                             int(tile).bit_length() - 1, cells.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), scores)
+        reached = cells.any(axis=1)
+        return cells[reached].reshape(-1, 4, 4), np.ctypeslib.as_array(scores).copy()[reached]
 
     @property
     def snake_decay(self) -> float:
@@ -499,6 +583,34 @@ class NTupleNet:
     @downgrade.setter
     def downgrade(self, tile: int) -> None:
         self._lib.nt_set_downgrade(self._h, int(tile).bit_length() - 1 if tile else 0)
+
+    @property
+    def tt_bits(self) -> int:
+        """Size of the search's transposition table: 2**tt_bits entries of 32 bytes
+        for each search thread (20 by default, 32 MB). Deep searches want more.
+        It changes the speed only, never the move chosen. Set it between searches."""
+        return int(self._lib.nt_get_tt_bits(self._h))
+
+    @tt_bits.setter
+    def tt_bits(self, bits: int) -> None:
+        self._lib.nt_set_tt_bits(self._h, int(bits))
+
+    @property
+    def depth_caps(self) -> list[int]:
+        """Random-spawn search: the deepest search allowed for a board with i empty
+        cells, for i = 0..16 (0 = no cap). `[5, 5, 5, 5, 4, 4, 4, 4, 3]` searches
+        crowded boards at up to depth 5 and boards with 8 or more empty cells at 3;
+        a list shorter than 17 is extended with its last value. Set it between searches."""
+        out = (ctypes.c_int32 * 17)()
+        self._lib.nt_get_depth_caps(self._h, out)
+        return list(out)
+
+    @depth_caps.setter
+    def depth_caps(self, caps) -> None:
+        caps = [int(c) for c in (caps or [])]
+        if caps:
+            caps = (caps + [caps[-1]] * 17)[:17]
+        self._lib.nt_set_depth_caps(self._h, (ctypes.c_int32 * 17)(*caps) if caps else None)
 
     def best_move(self, bits: int, depth: int = 1, cutoff: float = 0.0) -> int:
         """Expectimax move for the board, -1 if none is legal. depth = spawn layers searched."""
@@ -543,7 +655,10 @@ class NTupleNet:
         placed 4 the 4 points it forfeits (ranking only). Adding 8 plans with 2s first and
         allows 4s only when the best 2s-only line dies within `depth` steps; such a fallback
         plan is one step long, so the next plan tries 2s again (8 or 12 play a whole game
-        with only the 4s that survival, e.g. the final cascade to 131072, needs)."""
+        with only the 4s that survival, e.g. the final cascade to 131072, needs). Adding
+        16 to that makes the fallback sparing: it looks for a line that survives with one
+        4, then two, and so on, and a tile that ends the game whatever it is goes down as
+        a 4 (28 = 2s first, 4s charged, as few as possible)."""
         return float(self._lib.nt_beam_value(self._h, *_lohi(bits), int(width), int(depth), int(spread), float(snake),
                                              int(tiles)))
 
@@ -594,11 +709,21 @@ class NTupleNet:
                                   packed, len(starts), float(start_frac), scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
 
-    def play(self, games: int, depth: int = 1, cutoff: float = 0.0, threads: int = 1, seed: int = 0) -> dict:
+    def play(self, games: int, depth: int = 1, cutoff: float = 0.0, threads: int = 1, seed: int = 0,
+             first: int = 0) -> dict:
+        """Play games `first .. first + games - 1` of `seed` with expectimax at `depth`.
+        A game depends only on the seed and its number (with cutoff 0), not on the
+        threads or on which other games are played with it."""
         scores, maxtiles, moves = _game_buffers(games)
-        self._lib.nt_play(self._h, games, int(depth), float(cutoff), threads, seed & 0xFFFFFFFFFFFFFFFF,
-                          scores, maxtiles, moves)
+        self._lib.nt_play_from(self._h, games, int(first), int(depth), float(cutoff), threads,
+                               seed & 0xFFFFFFFFFFFFFFFF, scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
+
+
+def percent(rate: float, digits: int = 0) -> str:
+    """A rate as a percentage, rounded down: a report never claims a level not yet reached."""
+    scale = 10 ** digits
+    return f"{math.floor(rate * 100 * scale + 1e-9) / scale:.{digits}f}%"
 
 
 def summarize(stats: dict) -> dict:
@@ -612,7 +737,7 @@ def summarize(stats: dict) -> dict:
         "mean_length": float(stats["moves"].mean()),
         "max_tile": int(t.max()),
         "tile_counts": {int(a): int(b) for a, b in zip(uniq, counts)},
-        **{f"rate_{v}": float((t >= v).mean()) for v in (1024, 2048, 4096, 8192, 16384, 32768)},
+        **{f"rate_{v}": float((t >= v).mean()) for v in (1024, 2048, 4096, 8192, 16384, 32768, 65536)},
     }
 
 
@@ -642,7 +767,7 @@ class NTupleAgent:
         self.beam_stride = beam_stride    # steps of a plan to follow before planning again
         self.beam_spread = beam_spread    # survivors per parent (0 = unlimited)
         self.beam_snake = beam_snake      # weight of the snake-order bonus at the leaves
-        self.beam_tiles = beam_tiles      # placement mask, see NTupleNet.beam_value (12 = 2s first)
+        self.beam_tiles = beam_tiles      # placement mask, see NTupleNet.beam_value (28 = 2s first, as few 4s as possible)
         if snake_decay is not None:       # how fast the snake weights fall off along the path
             self.net.snake_decay = snake_decay
         if leaf_snake:                    # snake bonus at the random-spawn search leaves

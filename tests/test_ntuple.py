@@ -241,13 +241,95 @@ def board_with(tiles):
     return b
 
 
-def test_stage_is_number_of_mass_boundaries_reached():
+def test_stage_is_number_of_boundaries_the_tiles_present_reach():
     bounds = [16384, 24576]
     assert nt.stage_of(nt.to_bits(board_with([8192, 4096, 2048])), bounds) == 0
+    assert nt.stage_of(nt.to_bits(board_with([8192, 8192, 8192])), bounds) == 0     # 24576 in tiles, no 16384
     assert nt.stage_of(nt.to_bits(board_with([16384])), bounds) == 1
     assert nt.stage_of(nt.to_bits(board_with([16384, 8192])), bounds) == 2
-    assert nt.stage_of(nt.to_bits(board_with([16384, 4096, 2048, 2048])), bounds) == 2
+    assert nt.stage_of(nt.to_bits(board_with([16384, 4096, 2048, 2048])), bounds) == 1  # no 8192
+    assert nt.stage_of(nt.to_bits(board_with([16384, 16384])), bounds) == 1         # a second 16384 adds nothing
+    assert nt.stage_of(nt.to_bits(board_with([32768])), bounds) == 2
+    assert nt.stage_of(nt.to_bits(board_with([32768, 16384])), [16384, 49152]) == 2
+    assert nt.stage_of(nt.to_bits(board_with([32768, 8192])), [16384, 49152]) == 1
     assert nt.stage_of(nt.to_bits(board_with([2])), []) == 0
+
+
+def test_training_from_starts_begins_every_game_on_one_of_them():
+    n = nt.NTupleNet(tc=False)
+    start = nt.to_bits(board_with([4096, 2048, 1024, 512, 2, 4]))
+    stats = n.train(games=40, threads=2, seed=3, alpha_plain=0.1, starts=[start])
+    assert (stats["max_tiles"] >= 4096).all()                    # the 4096 was there from the first move
+    assert stats["moves"].mean() < 600                           # and no game had to build it
+    fresh = nt.NTupleNet(tc=False).train(games=40, threads=2, seed=3, alpha_plain=0.1)
+    assert (fresh["max_tiles"] < 4096).all()
+
+
+def test_training_without_starts_is_unchanged_by_the_starts_argument():
+    a, b = nt.NTupleNet(tc=False), nt.NTupleNet(tc=False)
+    sa = a.train(games=30, threads=1, seed=5, alpha_plain=0.1)
+    sb = b.train(games=30, threads=1, seed=5, alpha_plain=0.1, starts=[])
+    assert (sa["scores"] == sb["scores"]).all()
+
+
+def test_collect_starts_keeps_the_first_board_with_the_tile():
+    n = nt.NTupleNet(tc=False)
+    n.train(games=300, threads=2, seed=1, alpha_plain=0.1)
+    grids, scores = n.collect_starts(games=20, tile=128, threads=2, seed=9)
+    assert grids.shape[1:] == (4, 4) and len(grids) == len(scores) > 0
+    for g in grids:
+        assert g.max() == 7                                      # 128 itself: the first time one appears
+        assert (g == 7).sum() == 1
+    assert (scores > 0).all()
+    again, _ = n.collect_starts(games=20, tile=128, threads=1, seed=9)
+    assert (again == grids).all()                                # the seed fixes the games, not the thread count
+    none, _ = n.collect_starts(games=5, tile=131072, threads=1, seed=9)
+    assert len(none) == 0
+
+
+def test_stack_plays_each_board_with_its_own_stage_network():
+    pats = [[0, 1, 2, 3], [4, 5, 6, 7]]
+    a, b = nt.NTupleNet(patterns=pats, tc=False, v_init=100.0), nt.NTupleNet(patterns=pats, tc=False, v_init=900.0)
+    s = nt.NTupleNet.stack([a, b], [16384])
+    assert s.boundaries == [16384] and s.tc is False
+    lo, hi = nt.to_bits(board_with([8192, 4])), nt.to_bits(board_with([16384, 4]))
+    assert s.value(lo) == pytest.approx(100.0) and s.value(hi) == pytest.approx(900.0)
+    b.update(hi, 50.0, alpha_plain=1.0)                          # the stack holds copies
+    assert s.value(hi) == pytest.approx(900.0)
+    with pytest.raises(ValueError):
+        nt.NTupleNet.stack([a, nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)], [16384])
+    with pytest.raises(ValueError):
+        nt.NTupleNet.stack([a, b], [])
+
+
+def test_stacked_network_survives_a_save_and_load(tmp_path):
+    pats = [[0, 1, 2, 3]]
+    a, b = nt.NTupleNet(patterns=pats, tc=False, v_init=10.0), nt.NTupleNet(patterns=pats, tc=False, v_init=70.0)
+    nt.NTupleNet.stack([a, b], [16384]).save(tmp_path / "s.bin", weights_only=True)
+    m = nt.NTupleNet.load(tmp_path / "s.bin")
+    assert m.boundaries == [16384]
+    assert m.value(nt.to_bits(board_with([16384]))) == pytest.approx(70.0)
+    assert m.value(nt.to_bits(board_with([8192]))) == pytest.approx(10.0)
+
+
+def test_pack_starts_packs_grids_like_bitboards():
+    rng = np.random.default_rng(0)
+    grids = rng.integers(0, 18, size=(50, 4, 4), dtype=np.uint8)
+    fast, n = nt.pack_starts(grids)
+    slow, m = nt.pack_starts([nt.to_bits(g) for g in grids])
+    assert n == m == 50 and list(fast) == list(slow)
+    assert nt.pack_starts(np.zeros((0, 4, 4), dtype=np.uint8))[1] == 0
+
+
+def test_percent_rounds_down():
+    assert nt.percent(0.0055) == "0%" and nt.percent(0.0055, 1) == "0.5%"
+    assert nt.percent(0.01) == "1%" and nt.percent(0.999) == "99%" and nt.percent(1.0) == "100%"
+    assert nt.percent(0.29) == "29%" and nt.percent(0.0141, 1) == "1.4%"   # 0.29 * 100 is 28.999... in floating point
+
+
+def test_summarize_reports_the_65536_rate():
+    stats = {"scores": np.array([10, 20]), "max_tiles": np.array([65536, 32768]), "moves": np.array([5, 6])}
+    assert nt.summarize(stats)["rate_65536"] == 0.5
 
 
 def test_untouched_stage_entries_read_through_from_the_previous_stage():
@@ -494,11 +576,13 @@ def test_pattern_sets_are_distinct_under_symmetry():
     for name, pats in nt.PATTERN_SETS.items():
         orbits = set()
         for p in pats:
-            assert len(p) == 6 and len(set(p)) == 6
+            assert len(set(p)) == len(p) and (len(p) == 6 or (name.endswith("-redundant") and 3 <= len(p) < 6))
             orbit = frozenset(frozenset(nt.sym_cell(c, k) for c in p) for k in range(8))
             assert orbit not in orbits, f"{name}: {p} repeats another pattern's symmetry orbit"
             orbits.add(orbit)
     assert nt.PATTERN_SETS["4x6"] == nt.DEFAULT_PATTERNS and len(nt.PATTERN_SETS["8x6"]) == 8
+    extra = nt.PATTERN_SETS["8x6-matsuzaki-redundant"]
+    assert extra[:8] == nt.PATTERN_SETS["8x6-matsuzaki"] and sorted(len(p) for p in extra[8:]) == [3, 3, 4, 4, 4, 4, 4]
 
 
 def test_bigger_pattern_set_trains_and_round_trips(tmp_path):
@@ -1027,12 +1111,34 @@ def test_beam_twos_first_places_a_four_only_when_a_two_dead_ends():
     try:
         twos = n.beam_plan(bits, width=64, depth=3, snake=2.0, tiles=1)
         assert len(twos) == 1 and twos[0][2] == 1                       # a dead line: the board fills
-        for tiles in (8, 12):
+        for tiles in (8, 12, 24, 28):
             plan = n.beam_plan(bits, width=64, depth=3, snake=2.0, tiles=tiles)
             assert len(plan) == 1 and plan[0][2] == 2                   # the fallback: one step, a 4
             after, _ = nt.move(bits, plan[0][0])
             board = nt.with_cell(after, plan[0][1], plan[0][2])
             assert any(nt.move(board, m)[0] != board for m in range(4))  # and the game goes on
+    finally:
+        n.close()
+
+
+def test_beam_fewest_fours_matches_twos_first_while_twos_survive_and_ends_the_game_on_a_four():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    rng = np.random.default_rng(39)
+    try:
+        for _ in range(6):                                           # bit 16 only changes the fallback
+            bits = nt.to_bits(rand_exps(rng, density=0.3))
+            assert n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=28) == \
+                n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=12)
+        # one gap in a board with no two equal neighbours, before or after the only two
+        # slides: the cell left over takes a 2 or a 4 without a merge, and the game ends
+        last = np.array([[0, 5, 6, 7], [8, 3, 4, 3], [9, 4, 3, 4], [10, 3, 4, 3]], dtype=np.uint8)
+        bits = nt.to_bits(last)
+        (m, c, v), = n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=12)
+        assert v == 1                                                # the plain fallback saves its 4 points
+        (m2, c2, v2), = n.beam_plan(bits, width=16, depth=6, snake=2.0, tiles=28)
+        assert (m2, c2, v2) == (m, c, 2)                             # same step, the tile a 4
+        end = nt.with_cell(nt.move(bits, m2)[0], c2, v2)
+        assert not nt.afterstates_valid(end)
     finally:
         n.close()
 
@@ -1119,3 +1225,58 @@ def test_search_plays_the_downgraded_board_once_the_threshold_tile_is_there():
     n.downgrade = 32768
     assert n.best_move(b, depth=1) == other
     n.close()
+
+
+def _trained_small_net():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(games=400, threads=2, seed=2, alpha_plain=0.1)
+    return n
+
+
+def _some_boards(count, seed=0):
+    """Boards from random play, a few moves apart."""
+    boards, b, k = [], nt.spawn(nt.spawn(0, seed), seed + 1), seed + 2
+    while len(boards) < count:
+        valid = nt.afterstates_valid(b)
+        if not valid:
+            b = nt.spawn(nt.spawn(0, k), k + 1)
+            continue
+        b = nt.spawn(nt.move(b, valid[k % len(valid)])[0], k)
+        k += 1
+        if k % 7 == 0:
+            boards.append(b)
+    return boards
+
+
+def test_search_play_does_not_depend_on_threads_or_table_size():
+    n = _trained_small_net()
+    one = n.play(games=6, depth=2, threads=1, seed=4)
+    three = n.play(games=6, depth=2, threads=3, seed=4)
+    assert (one["scores"] == three["scores"]).all() and (one["moves"] == three["moves"]).all()
+    n.tt_bits = 10                                               # a table far too small for the search
+    assert n.tt_bits == 10
+    tiny = n.play(games=6, depth=2, threads=2, seed=4)
+    assert (one["scores"] == tiny["scores"]).all()
+    for b in _some_boards(20):
+        v = n.search_value(b, depth=2)
+        n.tt_bits = 14
+        assert n.search_value(b, depth=2) == v
+        n.tt_bits = 10
+
+
+def test_depth_caps_limit_the_search_by_empty_cells():
+    n = _trained_small_net()
+    assert n.depth_caps == [0] * 17
+    boards = _some_boards(40, seed=5)
+    deep = [n.best_move(b, depth=3) for b in boards]
+    shallow = [n.best_move(b, depth=1) for b in boards]
+    assert deep != shallow                                       # the depth matters on these boards
+    n.depth_caps = [1]
+    assert n.depth_caps == [1] * 17
+    assert [n.best_move(b, depth=3) for b in boards] == shallow
+    n.depth_caps = [3, 3, 3, 3, 3, 3, 1]                         # deep with 0-5 empty cells, shallow from 6
+    empties = [sum(nt.cell(b, i) == 0 for i in range(16)) for b in boards]
+    assert min(empties) <= 5 < max(empties)
+    assert [n.best_move(b, depth=3) for b in boards] == [d if e <= 5 else s for d, s, e in zip(deep, shallow, empties)]
+    n.depth_caps = []
+    assert [n.best_move(b, depth=3) for b in boards] == deep

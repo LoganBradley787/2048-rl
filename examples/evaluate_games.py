@@ -1,0 +1,157 @@
+"""A large evaluation that can be stopped, resumed and split across machines.
+
+Every game is written to a CSV as it finishes. Run the same command again and
+it plays only the games that are missing. A game depends on the seed and its
+number alone, so shards run on different machines add up to one evaluation:
+
+    uv run python examples/evaluate_games.py --weights checkpoints/ntuple/weights.bin --depth 3 --games 1000 --shard 0/2 --out checkpoints/eval/d3-a.csv
+    uv run python examples/evaluate_games.py --weights checkpoints/ntuple/weights.bin --depth 3 --games 1000 --shard 1/2 --out checkpoints/eval/d3-b.csv
+    uv run python examples/evaluate_games.py --summary checkpoints/eval/d3-a.csv checkpoints/eval/d3-b.csv
+
+The settings are kept in a .json beside each CSV; a resumed run or a summary
+refuses files whose settings differ.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+from game2048 import ntuple as nt
+
+FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
+SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps"]
+
+
+def weights_md5(path: Path) -> str:
+    """Fingerprint of a weights file: its size and its first and last megabyte."""
+    size, h = path.stat().st_size, hashlib.md5()
+    with open(path, "rb") as f:
+        h.update(f.read(1 << 20))
+        f.seek(max(0, size - (1 << 20)))
+        h.update(f.read(1 << 20))
+    return f"{size}-{h.hexdigest()[:16]}"
+
+
+def read_games(path: Path) -> dict[int, dict]:
+    if not path.exists():
+        return {}
+    with open(path, newline="") as f:
+        return {int(r["game"]): r for r in csv.DictReader(f)}
+
+
+def summarize(paths: list[Path]) -> dict:
+    settings, games = None, {}
+    for p in paths:
+        s = json.loads(p.with_suffix(".json").read_text())
+        s = {k: s[k] for k in SETTINGS}
+        if settings is not None and s != settings:
+            raise SystemExit(f"{p} was played with different settings: {s} against {settings}")
+        settings = s
+        games.update(read_games(p))
+    if not games:
+        raise SystemExit("no games yet")
+    scores = np.array([int(g["score"]) for g in games.values()], dtype=np.int64)
+    stats = nt.summarize({"scores": scores, "max_tiles": np.array([int(g["max_tile"]) for g in games.values()]),
+                          "moves": np.array([int(g["moves"]) for g in games.values()])})
+    stats["ci95"] = float(1.96 * scores.std(ddof=1) / np.sqrt(len(scores))) if len(scores) > 1 else float("nan")
+    stats["game_hours"] = sum(float(g["seconds"]) for g in games.values()) / 3600
+    stats["settings"] = settings
+    return stats
+
+
+def show(stats: dict) -> None:
+    print(f"{stats['games']} games | mean {stats['mean_score']:.0f} +- {stats['ci95']:.0f} (95%) | "
+          f"median {stats['median_score']:.0f} | max {stats['max_score']} | {stats['mean_length']:.0f} moves | "
+          f"8192 {nt.percent(stats['rate_8192'], 1)}, 16384 {nt.percent(stats['rate_16384'], 1)}, "
+          f"32768 {nt.percent(stats['rate_32768'], 1)}, 65536 {nt.percent(stats['rate_65536'], 1)} | "
+          f"{stats['game_hours']:.1f} thread-hours", flush=True)
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--summary", nargs="+", default=None, help="CSV files to merge and report; plays nothing")
+    p.add_argument("--weights", default=None, help="defaults to checkpoints/ntuple/weights.bin or latest.bin")
+    p.add_argument("--out", default=None, help="CSV of finished games; its settings go to the .json beside it")
+    p.add_argument("--games", type=int, default=1000, help="size of the whole evaluation: games 0 .. n-1 of the seed")
+    p.add_argument("--shard", default="0/1", help="i/n: play the games whose number is i modulo n")
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--seed", type=int, default=2024)
+    p.add_argument("--threads", type=int, default=os.cpu_count() or 4, help="games played at once")
+    p.add_argument("--cutoff", type=float, default=0.0)
+    p.add_argument("--downgrade", type=int, default=0, help="tile (e.g. 32768) from which the search uses the downgraded board")
+    p.add_argument("--tt-bits", type=int, default=0, help="transposition table of 2**n entries per game in play; 0 = default")
+    p.add_argument("--depth-caps", default="", help="deepest search by number of empty cells, e.g. 5,5,5,5,4,4,4,4,3")
+    args = p.parse_args(argv)
+
+    if args.summary:
+        show(summarize([Path(x) for x in args.summary]))
+        return
+    if not args.out:
+        p.error("--out is required")
+    out, path = Path(args.out), nt.resolve_weights(args.weights)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    caps = [int(x) for x in args.depth_caps.split(",") if x.strip()]
+    settings = {"weights_md5": weights_md5(path), "depth": args.depth, "seed": args.seed, "cutoff": args.cutoff,
+                "downgrade": args.downgrade, "depth_caps": caps, "weights": str(path), "games": args.games}
+    meta = out.with_suffix(".json")
+    if meta.exists():
+        old = json.loads(meta.read_text())
+        diff = {k: (old.get(k), settings[k]) for k in SETTINGS if old.get(k) != settings[k]}
+        if diff:
+            raise SystemExit(f"{out} holds games played with other settings {diff}; use another --out")
+    meta.write_text(json.dumps(settings, indent=1))
+
+    i, n = (int(x) for x in args.shard.split("/"))
+    done = read_games(out)
+    todo = [g for g in range(args.games) if g % n == i and g not in done]
+    print(f"{path}: depth {args.depth}, shard {i}/{n}: {len(done)} games done, {len(todo)} to play "
+          f"on {args.threads} threads", flush=True)
+    if not todo:
+        show(summarize([out]))
+        return
+
+    net = nt.NTupleNet.load(path, keep_tc=False)
+    net.downgrade = args.downgrade
+    net.depth_caps = caps
+    if args.tt_bits:
+        net.tt_bits = args.tt_bits
+    new = not out.exists()
+    f = open(out, "a", newline="")
+    w = csv.DictWriter(f, fieldnames=FIELDS)
+    if new:
+        w.writeheader()
+    lock, t0, count = threading.Lock(), time.time(), [0]
+
+    def play(g: int) -> None:
+        t = time.time()
+        s = net.play(1, depth=args.depth, cutoff=args.cutoff, threads=1, seed=args.seed, first=g)
+        with lock:                                     # one row per finished game, on disk at once
+            w.writerow({"game": g, "score": int(s["scores"][0]), "max_tile": int(s["max_tiles"][0]),
+                        "moves": int(s["moves"][0]), "seconds": round(time.time() - t, 1)})
+            f.flush()
+            os.fsync(f.fileno())
+            count[0] += 1
+            if count[0] % max(1, args.threads) == 0 or count[0] == len(todo):
+                print(f"{count[0]}/{len(todo)} games in {(time.time() - t0) / 60:.1f} min", flush=True)
+
+    try:
+        with ThreadPoolExecutor(args.threads) as pool:
+            list(pool.map(play, todo))
+    finally:
+        f.close()
+    show(summarize([out]))
+    net.close()
+
+
+if __name__ == "__main__":
+    main()

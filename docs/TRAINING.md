@@ -41,6 +41,8 @@ uv run python -m game2048.ntuple_train --hours 4 --threads 12 --patterns 8x6
   twice the capacity, 1.1 GB of weights, and the only one here that reaches 32768.
 - `--patterns 8x6-matsuzaki` is the eight-pattern set behind the strongest
   published n-tuple players (Matsuzaki 2016; Guei et al. 2022).
+- `--patterns 8x6-matsuzaki-redundant` adds seven small patterns to those eight
+  (straight lines of 4 and 3 cells, 2x2 squares; Jaśkowski 2017). Not yet measured here.
 - `--v-init 320000` starts a new network valuing every board at that number
   (optimistic initialisation): the greedy policy keeps trying boards it has not
   played until their values come down. Meant for plain TD at a fixed rate,
@@ -50,10 +52,13 @@ uv run python -m game2048.ntuple_train --hours 4 --threads 12 --patterns 8x6
   coherence keeps two extra numbers per weight and gives every weight its own
   learning rate, which falls as that weight's updates start to cancel out.
   It costs three times the memory while training.
-- `--stages 16384,24576,32768` gives boards whose tile mass (the sum of all
-  tiles) has crossed each boundary their own weight tables. This is the
-  multi-stage idea from the literature. `--resume single-stage.bin --stages ...`
-  seeds stage 0 from an existing run. It did not help here; see the README.
+- `--stages 16384,24576` gives boards that hold certain tiles their own weight
+  tables. A boundary is compared with the sum of the distinct tile values on the
+  board: 16384 means "holds a 16384 or larger", 24576 "holds a 16384 and an 8192,
+  or larger". This is the multi-stage idea from the literature, trained in one run
+  with later stages reading through to earlier ones. `--resume single-stage.bin
+  --stages ...` seeds stage 0 from an existing run. It did not help here; see the
+  README. Training one stage at a time (below) is the other way to do it.
 - `--tc-stages 1 --alpha-plain 0.025` keeps the temporal coherence state on
   stage 0 only and trains the later stages with plain TD, which saves about
   1.1 GB per stage.
@@ -64,6 +69,29 @@ uv run python -m game2048.ntuple_train --hours 4 --threads 12 --patterns 8x6
 `kill <pid>` or Ctrl-C stops a run once the chunk in progress is done, and
 saves first. Run with `--help` for the rest. Weight files written by earlier versions of
 the engine are converted when loaded.
+
+### A later stage as a network of its own
+
+The strongest published players (Guei et al. 2022) train a second network for
+boards that hold a 16384, with the first one left as it is. Collect the boards
+where the first network hands over, then train the second from them:
+
+```bash
+uv run python examples/collect_starts.py --weights checkpoints/ntuple/weights.bin --tile 16384 --boards 200000 --out checkpoints/starts_16384.npy
+```
+
+```bash
+uv run python -m game2048.ntuple_train --patterns 8x6-matsuzaki --v-init 320000 --no-tc --alpha-plain 0.1 --starts checkpoints/starts_16384.npy --base checkpoints/ntuple/weights.bin --stage-tile 16384 --out checkpoints/ntuple_stage2
+```
+
+Every training game begins from one of the saved boards, so the scores in the
+log count from there. `--base` is only for the evaluations, which play whole
+games with the first network below the tile and the new one from it on. Join
+the two into one file for play:
+
+```bash
+uv run python examples/stack_stages.py --weights checkpoints/ntuple/weights.bin checkpoints/ntuple_stage2/weights.bin --tiles 16384 --out checkpoints/ntuple_2stage/weights.bin
+```
 
 ### Evaluate and build the report page
 
@@ -78,6 +106,26 @@ uv run python -m game2048.report --ntuple
 `--downgrade 32768` on the evaluation makes the search pick its move on the
 downgraded board (every tile above the largest missing one halved) once a 32768
 is on the board, where the tables have seen far more training.
+
+Deeper searches have two more knobs. `--depth-caps 5,5,5,5,4,4,4,4,3` limits the
+depth by how many cells are empty (here: up to 5 with 0 to 3 empty, 4 with 4 to 7,
+3 from 8 on), which is where the time of a deep search goes for nothing.
+`--tt-bits 24` gives each search thread a transposition table of 2^24 entries
+(512 MB) instead of 2^20. The table changes the speed only: with no `--cutoff`,
+a game is fixed by the seed and its number, whatever the table size or the
+number of threads.
+
+For an evaluation too long to run in one go, `examples/evaluate_games.py` writes
+each game to a CSV as it finishes, plays only the missing games when run again,
+and takes `--shard i/n` so several machines can share the games of one seed:
+
+```bash
+uv run python examples/evaluate_games.py --depth 3 --games 1000 --shard 0/2 --out checkpoints/eval/d3-a.csv
+```
+
+```bash
+uv run python examples/evaluate_games.py --summary checkpoints/eval/d3-a.csv checkpoints/eval/d3-b.csv
+```
 
 That writes `checkpoints/ntuple/report.html`, a self-contained page with the
 learning curve and the evaluation at each depth. `depth` counts the layers of

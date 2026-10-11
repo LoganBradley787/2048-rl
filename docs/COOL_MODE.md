@@ -4,8 +4,8 @@ In cool mode nothing is random. After every move the player picks an empty
 cell and puts a 2 or a 4 there. That turns 2048 from a game of chance into a
 puzzle with one question: how high can the score go?
 
-This page is the full account of how the `snake` agent got to 3,931,768
-points, 396 short of the ceiling. The short version is in the README.
+This page is the full account of how the `snake` agent got to 3,932,100
+points, 64 short of the ceiling. The short version is in the README.
 
 ## Where the ceiling is
 
@@ -27,11 +27,11 @@ A second 131072 would need 17.
 
 So no final board beats one of each tile from 131072 down to 4, and built
 from 2s that board is worth **3,932,164** points. That is the ceiling used
-on this page. It is an upper bound and not quite reachable: the cascade above
-only starts if its last tile is placed as a 4, and the last cell of the game
-is filled by a placed tile too, so at least 8 of those points are out of
-reach. Past reaching that board, the only thing left to optimise is how few
-4s get placed.
+on this page. It is an upper bound and not reachable: the cascade above only
+starts if its last tile is placed as a 4, and the last cell of the game is
+filled by a placed tile too. Past reaching that board, the only thing left to
+optimise is how few 4s get placed, and [the last section](#the-last-262000-points)
+counts 16 that look unavoidable: 64 points.
 
 ## Search instead of learning
 
@@ -97,7 +97,8 @@ Settings: 128 lines, 16 steps ahead, 4 steps played per plan, snake weight 2.
 | snake only, decay 0.9 | 128 x 16 | 3,670,068 | **131072** | 65,544 | 4.2 min |
 | decay 0.9, 2s only (`tiles=1`) | 128 x 16 | 1,835,012 | 65536 | | |
 | decay 0.9, 4s charged (`tiles=7`) | 128 x 16 | 1,742,508 | 65536 | 42,402 | 2.8 min |
-| decay 0.9, 2s first (`tiles=12`) | 128 x 16 | **3,931,768** | **131072** | 130,969 | 4.1 min |
+| decay 0.9, 2s first (`tiles=12`) | 128 x 16 | 3,931,768 | **131072** | 130,969 | 4.1 min |
+| decay 0.9, 2s first, fewest 4s (`tiles=28`) | 128 x 16 | **3,932,100** | **131072** | 131,052 | |
 
 The decay was the first fix. At 0.5 only the head of the chain carries
 weight, and the tail drifts out of order. At 0.75 or 0.9 every tile on the
@@ -109,7 +110,7 @@ The first games to reach 131072 scored about 3,670,000. They placed almost
 nothing but 4s, and by the formula above that costs 4 points per tile, about
 262,000 in total.
 
-Three attempts to get those points back:
+Four attempts to get those points back:
 
 1. **2s only** (`tiles=1`). The beam builds a flawless chain from 65536 down
    to 2 and then stops. The next level needs 17 tiles on 16 cells unless one
@@ -124,11 +125,30 @@ Three attempts to get those points back:
 The third one works. The game places 98 fours, in bursts of seven or eight
 at the cascades where a full chain collapses, and ends with one of each tile
 from 131072 down to 8 plus a 2 in the last cell. The fours cost 392 points
-and the last cell another 4: 396 short of the ceiling, 99.99% of it. It takes
-twice as many moves as the all-4s game, since every tile arrives as a 2, and
-the same wall time, since a 2s-only beam has half the candidates.
+and the last cell another 4: 396 short of the ceiling. It takes twice as many
+moves as the all-4s game, since every tile arrives as a 2, and the same wall
+time, since a 2s-only beam has half the candidates.
 
-What is left is the number of 4s per cascade, a few hundred points at most.
+4. **As few 4s as possible** (`tiles=28`). Seven or eight 4s per cascade is
+   the fallback being careless, not the game asking for them: a plan with 4s
+   allowed takes one at every step it is consulted. So the fallback now looks
+   for a line that survives the horizon with a single 4, then with two, and
+   so on, and only then allows any number. And the tile that fills the last
+   cell, which ends the game whatever it is, goes down as a 4.
+
+That game places 15 fours on the way and a sixteenth in the last cell, and
+ends with one of each tile from 131072 down to 4: **3,932,100** points, 64
+short of the ceiling.
+
+Fifteen looks like the fewest there can be. Building a tile 2^j from 2s
+takes j cells: the chain 2^(j-1), ..., 4, 2 and one more 2 to set it off. A
+placed 4 at the bottom saves one cell. The first 131072 needs a 65536 and
+its whole chain down to 4 on the board, fifteen tiles, so the sixteenth has
+to arrive as a 4. After that, with 131072 down to 2^(j+1) in place, j - 1
+cells are free, one short of what 2^j needs: one more 4 for each tile from
+65536 down to 8, fourteen of them. The last cell takes the sixteenth, and at
+4 points each that is the 64. This is a count, not a proof that no cleverer
+order exists; the search finds none.
 
 ## With random tiles
 
@@ -147,9 +167,10 @@ from game2048 import ntuple as nt
 
 net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)   # empty tables: value 0 everywhere
 net.snake_decay = 0.9
-stats = net.play_beam(games=1, width=128, depth=16, stride=4, snake=2.0, tiles=12)
+stats = net.play_beam(games=1, width=128, depth=16, stride=4, snake=2.0, tiles=28)
 print(stats["scores"], stats["max_tiles"], stats["moves"])
 ```
 
 `tiles` is a bit mask: 1 allows 2s, 2 allows 4s, 4 charges each placed 4 its
-4 points in the ranking, and 8 turns on 2s first.
+4 points in the ranking, 8 turns on 2s first, and 16 makes the fallback use as
+few 4s as it can.

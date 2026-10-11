@@ -176,6 +176,9 @@ no search. The `snake` figures in the table above are from 24 games.
 *Part of the report page that `python -m game2048.report --ntuple` builds
 from a training log, here for the 8-pattern run.*
 
+[docs/TRAINING_LOG.md](docs/TRAINING_LOG.md) lists every training run behind
+this repository, with its hardware, its length and what came of it.
+
 This is a strong player and not the state of the art. The best published
 n-tuple players average about 600,000 and reach 32768 in most games
 (Jaśkowski, 2017). The 4-pattern tables here top out near 385,000, roughly

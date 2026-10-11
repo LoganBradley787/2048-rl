@@ -31,7 +31,7 @@ on this page. It is an upper bound and not reachable: the cascade above only
 starts if its last tile is placed as a 4, and the last cell of the game is
 filled by a placed tile too. Past reaching that board, the only thing left to
 optimise is how few 4s get placed, and [the last section](#the-last-262000-points)
-counts 16 that look unavoidable: 64 points.
+shows why 16 of them are unavoidable: 64 points.
 
 ## Search instead of learning
 
@@ -140,15 +140,38 @@ That game places 15 fours on the way and a sixteenth in the last cell, and
 ends with one of each tile from 131072 down to 4: **3,932,100** points, 64
 short of the ceiling.
 
-Fifteen looks like the fewest there can be. Building a tile 2^j from 2s
-takes j cells: the chain 2^(j-1), ..., 4, 2 and one more 2 to set it off. A
-placed 4 at the bottom saves one cell. The first 131072 needs a 65536 and
-its whole chain down to 4 on the board, fifteen tiles, so the sixteenth has
-to arrive as a 4. After that, with 131072 down to 2^(j+1) in place, j - 1
-cells are free, one short of what 2^j needs: one more 4 for each tile from
-65536 down to 8, fourteen of them. The last cell takes the sixteenth, and at
-4 points each that is the 64. This is a count, not a proof that no cleverer
-order exists; the search finds none.
+Sixteen is the fewest there can be, whatever order the tiles are built in.
+Call the sum of the tiles on the board its mass. A given mass needs a certain
+number of tiles at least: the count you are left with when everything that
+can merge has merged, which is the number of 1s in the mass written in
+binary. A mass of 28 takes three tiles, 16, 8 and 4, and no fewer. After a
+move the board always has an empty cell for the new tile, so while the game
+goes on its mass has to fit in 15 tiles. Some masses need 16, so the game can
+end on one of them but never pass through it: 131,070 is the first (65536
+down to 2, one of each), then 196,606 (131072 and 32768 down to 2), and so
+on. Sixteen of them lie below the mass of the final board. A placed 2 raises
+the mass by 2 and a placed 4 by 4, so the only way past one of these is to
+step over it with a 4, and one 4 steps over one of them. That is sixteen 4s,
+64 points, and it makes 3,932,100 the most this final board can score.
+
+Other final boards do no better. The same count over every possible final
+mass (most points a board of that mass can be worth, minus 4 for each mass it
+had to step over) gives 3,932,100 at most.
+
+[`proof/Max2048.lean`](../proof/Max2048.lean) is this argument in Lean 4,
+using nothing beyond Lean's core library. It models the game without the
+grid: a board is a bag of at most 16 tiles, two equal tiles may merge at any
+time, and a 2 or a 4 may be added whenever a cell is free. The theorem
+`max_score` says no position reachable under those rules has a score above
+3,932,100. A real game is a special case, since a slide is some merges and
+always leaves a free cell for the new tile, so the bound covers it too. The
+grid is the one thing Lean is not told about: that a real game fits those
+rules is argued in this paragraph, not checked. With Lean installed,
+`lake build` in `proof/` checks the rest in a few seconds.
+
+So 3,932,100 is the maximum score of 2048. The agent reaches it from the
+starting board in the README's recording; from another one it placed a
+seventeenth 4 and scored 3,932,096.
 
 ## With random tiles
 

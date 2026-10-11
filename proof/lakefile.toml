@@ -1,0 +1,5 @@
+name = "max2048"
+defaultTargets = ["Max2048"]
+
+[[lean_lib]]
+name = "Max2048"

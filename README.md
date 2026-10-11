@@ -14,8 +14,8 @@ Two results:
   trained for 4 hours on a laptop.
 - **Cool mode**, a variant where you also choose where each new tile goes. A
   search with one hand-written rule and no training builds the **131072**
-  tile, the largest a 4x4 board can hold, and scores **3,932,100**. The upper
-  bound is 3,932,164.
+  tile, the largest a 4x4 board can hold, and scores **3,932,100**, the most
+  any game of 2048 can score. That bound is [checked in Lean](proof/Max2048.lean).
 
 For scale: a person who reaches the 2048 tile once has about 20,000 points.
 
@@ -141,9 +141,14 @@ each merge sets up the next. It places 2s unless only a 4 keeps the game
 alive, and then as few as will do: 15 times in 131,000 moves. The tile that
 fills the last cell is a 4 as well.
 
+Those 64 points are out of reach for any player: at least 16 tiles have to
+arrive as 4s, and the game has exactly 16. The proof is short, and
+[`proof/Max2048.lean`](proof/Max2048.lean) has it in a form the Lean proof
+assistant checks.
+
 The learned tables are not involved. Tables trained on cool mode did worse
 than no tables at all. [docs/COOL_MODE.md](docs/COOL_MODE.md) has the whole
-story, including where the 64 points went.
+story, including that argument.
 
 <img src="docs/images/final-board.png" alt="The last board of the snake agent's cool-mode game: 131072 down to 4 in snake order, with 3,932,100 points" width="380">
 
@@ -233,6 +238,7 @@ uv run python -m game2048.train --minutes 30
 | `game2048/agents.py` | The player registry. Add your own with an `act(game)` method. |
 | `game2048/report.py` | Builds an HTML report from a training log. |
 | `examples/` | Evaluation and rollout scripts. |
+| `proof/` | A Lean 4 proof that no game scores more than 3,932,100. `lake build` in that folder checks it. |
 | `tests/` | The test suite. |
 
 [docs/USAGE.md](docs/USAGE.md) has the Python API, the HTTP API, the tile

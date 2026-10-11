@@ -18,3 +18,15 @@ jobs:
       # (rules, server, C engine, n-tuple training and search) need only numpy and cc.
       - run: uv sync --extra dev
       - run: uv run pytest -q
+
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain version comes from proof/lean-toolchain.
+      - run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: lake build
+        working-directory: proof

@@ -11,3 +11,4 @@ checkpoints/
 .claude/settings*.json
 .DS_Store
 notes/
+proof/.lake/

@@ -8,10 +8,13 @@ where you can watch them or play yourself.
 
 Two results:
 
-- **The normal game.** A network of lookup tables trained by self-play
-  averages **351,671 points** and reaches the 16384 tile in 98% of games. It
-  started from nothing, with no human games and no built-in strategy, and
-  trained for 4 hours on a laptop.
+- **The normal game.** Two networks of lookup tables trained by self-play
+  average **589,335 points** over 1,000 games and reach the 32768 tile in 62%
+  of them. That is level with the best published player that learns the game
+  (Guei, Chen and Wu, 2022) at the same search depth. They started from
+  nothing, with no human games and no built-in strategy, and trained for 107
+  hours on a laptop and a rented CPU machine. The
+  [weights are a download](#download-the-trained-player).
 - **Cool mode**, a variant where you also choose where each new tile goes. A
   search with one hand-written rule and no training builds the **131072**
   tile, the largest a 4x4 board can hold, and scores **3,932,100**, the most
@@ -49,7 +52,8 @@ Open http://localhost:8048. Then:
 The `snake`, `greedy` and `random` players work on a fresh clone. `ntuple`,
 `ntuple-cool` and `nn` need trained weights, which are not in the repository
 (the tables are 0.5 GB and up). [Train your own](#train-your-own) takes one
-command.
+command, and the strongest player is a
+[download](#download-the-trained-player).
 
 Without uv, `pip install -e .` and
 `python -m uvicorn game2048.server:app --port 8048` do the same thing.
@@ -62,7 +66,8 @@ Without uv, `pip install -e .` and
 | `greedy` | takes the biggest merge on offer | 3,180 | 512 at best |
 | `nn` | small convolutional network, 46 minutes of training in PyTorch | 29,869 | 2048 in 74% of games |
 | `snake` | search with one hand-written rule, no training | 66,199 | 2048 in every game, 8192 in 12% |
-| `ntuple` | lookup tables trained by self-play in C, plus a 3-level search | **351,671** | 16384 in 98% of games, 32768 in 1% |
+| `ntuple` | lookup tables trained by self-play in C for 4 hours, plus a 3-level search | 351,671 | 16384 in 98% of games, 32768 in 1% |
+| the two-stage player (v2) | two such networks, 107 hours of training, plus the same search | **589,335** | 16384 in 97% of games, 32768 in 62% |
 
 In cool mode:
 
@@ -124,6 +129,27 @@ the leaves. It averages over the tiles instead of assuming the worst. That
 takes the 8-pattern network from 276,699 points with no search to 351,671, at
 about 8 ms per move.
 
+### The two-stage player
+
+The strongest player here follows the recipe of Guei, Chen and Wu (2022),
+with three changes to the plain method above.
+
+- **An optimistic start.** Every board begins with a value far above any real
+  score, so the player keeps trying whatever it has not yet been disappointed
+  by. Starting from zero, it settles early on lines that never reach 32768.
+- **Two networks.** One plays until the first 16384 appears and the other
+  plays from there. The second trains only on games that begin from a million
+  boards saved at that moment, so every one of its games is practice at the
+  hard part.
+- **Two phases.** Each network learns at a fixed rate for nine tenths of its
+  games, then with temporal coherence for the last tenth, which takes the
+  noise out of the tables.
+
+When it plays, the search also uses *tile downgrading* once the board holds a
+32768: it finds the largest tile value missing from the board, halves every
+tile above it, and chooses its move on that smaller, more familiar board. The
+two boards allow exactly the same merges.
+
 ### Cool mode
 
 When you place the tiles yourself there is no luck left, and the game becomes
@@ -179,11 +205,63 @@ from a training log, here for the 8-pattern run.*
 [docs/TRAINING_LOG.md](docs/TRAINING_LOG.md) lists every training run behind
 this repository, with its hardware, its length and what came of it.
 
-This is a strong player and not the state of the art. The best published
-n-tuple players average about 600,000 and reach 32768 in most games
-(Jaśkowski, 2017). The 4-pattern tables here top out near 385,000, roughly
-where a game ends if it holds a 16384 and an 8192 and never merges two
-16384s. The 8-pattern tables manage that merge once in a hundred games.
+### The two-stage player (v2)
+
+The same 1,000 games at each setting (seed 2024), with the 95% interval on
+the mean.
+
+| Search | Mean score | Median | Best game | Reach 16384 | Reach 32768 |
+| --- | --- | --- | --- | --- | --- |
+| Depth 0 | 396,821 ± 10,449 | 378,574 | 732,360 | 84.7% | 28.8% |
+| Depth 2 | 539,130 ± 10,435 | 620,610 | 742,192 | 96.3% | 58.6% |
+| Depth 2, tile downgrading | 565,703 ± 12,209 | 620,928 | 840,052 | 96.3% | 58.6% |
+| **Depth 3, tile downgrading** | **589,335 ± 12,170** | **629,086** | **840,244** | 97.6% | 62.5% |
+
+The best published player that learns the game is Guei, Chen and Wu's
+(2022). Their search counts one level more than the depth here, and with tile
+downgrading they report 563,316 over 10,000 games where this table has
+565,703, and 586,720 over 1,000 games where it has 589,335, with 32768 in
+57.9% and 62.0% of games. So this player is level with theirs at equal
+search, inside the error bars on both lines. Their best figure, 625,377 over
+100 games, is at a search three levels deeper than any run here.
+
+No game here has made a 65536. The best ones end near 840,000 points, which
+is a board holding every tile from 32768 down. Programs built on search and
+exact endgame tables instead of learning do get there:
+[macroxue/2048-ai](https://github.com/macroxue/2048-ai) averages 711,769 at
+its deepest search and reports a single game of 1,704,908.
+
+The two networks took four training runs and 107 hours:
+[docs/TRAINING_LOG.md](docs/TRAINING_LOG.md), runs 14 and 20 to 22.
+
+### Download the trained player
+
+The weights are attached to the
+[v2.0 release](https://github.com/LoganBradley787/2048-rl/releases/tag/v2.0),
+335 MB for each network and 1.09 GB once unpacked.
+
+```bash
+mkdir -p checkpoints/v2 && cd checkpoints/v2
+for f in 2048-ntuple-v2-stage1.bin.xz 2048-ntuple-v2-stage2.bin.xz SHA256SUMS; do
+  curl -LO https://github.com/LoganBradley787/2048-rl/releases/download/v2.0/$f
+done
+xz -d *.xz && sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing
+cd ../..
+uv run python examples/stack_stages.py \
+  --weights checkpoints/v2/2048-ntuple-v2-stage1.bin checkpoints/v2/2048-ntuple-v2-stage2.bin \
+  --tiles 16384 --out checkpoints/v2/two_stage.bin
+```
+
+Then any line of the table can be played again. Games are numbered and
+seeded, so the same command gives the same games on any machine:
+
+```bash
+uv run python examples/evaluate_games.py --weights checkpoints/v2/two_stage.bin \
+  --games 1000 --seed 2024 --depth 2 --downgrade 32768 --out checkpoints/v2/d2-dg.csv
+```
+
+That one takes about a quarter of an hour on 16 threads, and depth 3 about
+three hours.
 
 ## What did not work
 
@@ -192,7 +270,8 @@ where a game ends if it holds a 16384 and an 8192 and never merges two
 - **Multi-stage tables.** Giving late-game boards their own tables is the
   idea behind the best published results. A 3-stage run seeded from the
   4-pattern tables scored 313,338 at depth 2, below the single-stage tables,
-  and was dropped.
+  and was dropped. Splitting the game once, at the first 16384, and training
+  the second network from saved boards is what worked later.
 - **Learning cool mode.** Tables trained for 4 hours on the choose game
   reached 65536. The search with no tables reached 131072.
 - **Charging 4s their cost in the search ranking.** That game died at 65536.
@@ -203,8 +282,8 @@ where a game ends if it holds a 16384 and an 8192 and never merges two
 ## Train your own
 
 The trained weights are not in the repository: one set of n-tuple tables is
-0.5 to 3 GB, far past what git is for. The players that need them are a
-command away instead.
+0.5 to 3 GB, far past what git is for. The two-stage player is a
+[download](#download-the-trained-player), and the others are a command away.
 
 ```bash
 uv run python -m game2048.ntuple_train --hours 0.2 --threads 8
@@ -271,6 +350,10 @@ tests. The CNN tests are skipped unless PyTorch is installed
 - W. Jaśkowski, "Mastering 2048 with Delayed Temporal Coherence Learning,
   Multi-Stage Weight Promotion, Redundant Encoding and Carousel Shaping",
   2017. Temporal coherence learning and weight promotion.
+- H. Guei, L.-P. Chen and I-C. Wu, "Optimistic Temporal Difference Learning
+  for 2048", IEEE Transactions on Games, 2022. The optimistic start, the
+  two-phase schedule and tile downgrading, and the results the two-stage
+  player is measured against.
 
 ## License
 

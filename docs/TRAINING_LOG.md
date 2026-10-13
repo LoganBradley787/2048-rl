@@ -4,17 +4,17 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-11, 01:10. Runs 14 and 20 are still going.
+Last updated 2026-10-13, 08:30. Nothing is training.
 
 ## Totals so far
 
 | Machine | Wall-clock | CPU | Self-play moves |
 | --- | --- | --- | --- |
 | MacBook (M3 Pro, 12 cores) | 16.2 h | 168 thread-hours, plus 71 min on its GPU | 116 billion |
-| ThinkPad (i5-1240P, 16 threads) | 21.6 h | 342 thread-hours | 359 billion |
-| Google Colab, CPU runtimes | 7.4 h | 58 vCPU-hours | 86 billion |
+| ThinkPad (i5-1240P, 16 threads) | 72.3 h | 1,153 thread-hours | 1,130 billion |
+| Google Colab, CPU runtimes | 43.1 h | 343 vCPU-hours | 526 billion |
 | Google Colab, GPU runtimes | 1.2 h | 1.2 GPU-hours | 10 billion |
-| **All** | **46 h** | **570 CPU thread-hours** | **about 570 billion** |
+| **All** | **134 h** | **1,665 CPU thread-hours** | **about 1,780 billion** |
 
 A thread-hour is one hardware thread busy for an hour. The threads are not
 equal: the ThinkPad's are held to about 20 W by its firmware and a Colab vCPU
@@ -163,18 +163,21 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
 - **Result:** the firmware's 20 W limit, not the thread count, sets the speed.
   The changes took eight patterns from 2.6M to 5.1M moves a second.
 
-### 14. Optimistic TD, stage 1 (10 October onward, ThinkPad, running)
+### 14. Optimistic TD, stage 1 (10 to 12 October, ThinkPad)
 
 - **What:** run 12 again, for the full budget: about 0.9e12 moves of plain TD,
   to be followed by a tenth as much with temporal coherence.
 - **On:** 16 threads, 1.1 GB. Stopped and resumed twice in its first three
   hours to pick up faster builds of the engine.
-- **Time so far:** 21.1 hours. 40.05M games, 354.8B moves, about 40% of the
-  budget.
-- **So far:** training games average about 263,000, with 16384 in 64% and 32768
-  in 4%. The 32768 rate stayed under half a percent for the first 17 hours,
-  passed 1% at 33.1M games and has risen since. At depth 2, 48 games average about 359,000 with
-  32768 in 8 of them. Copies of the weights are kept every two and a half hours.
+- **Time:** 52.5 hours, ending 08:14 on 12 October. 95.0M games, 925.6B moves,
+  at about 5.1M moves a second throughout.
+- **Outcome:** training games average about 276,000 over the last five million,
+  with 16384 in 67% and 32768 in 6.0%. The 32768 rate stayed under half a
+  percent for the first 17 hours, passed 1% at 33.1M games and was still rising
+  slowly at the end (5.0% at 50M games, 5.6% at 70M). Alone at depth 2, the
+  hourly 48-game checks of the last day average about 395,000, with 32768 in
+  about a third of games. Copies of the weights were kept every two and a half
+  hours. The temporal coherence phase has not been run yet.
 
 ### 15. Speed checks on Colab's CPU runtimes (10 October)
 
@@ -233,7 +236,7 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   this player is someone else's network, so it is a test of the pipeline and
   nothing more.
 
-### 20. Stage 2, started early (11 October onward, Colab, running)
+### 20. Stage 2, started early (11 to 12 October, Colab)
 
 - **What:** the second network, for boards that hold a 16384. It reads stage 1
   only through the boards where stage 1 hands over, and those are nearly empty
@@ -245,7 +248,47 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
 - **On:** the high-RAM CPU runtime, 8 vCPUs, 2.2 GB, restarted by the watcher
   on the ThinkPad whenever a session ends.
 - **Budget:** 440B moves, about 100 million games from these boards, which is
-  the published length for a stage. Started 01:06.
+  the published length for a stage. Started 01:06 on 11 October.
+- **Time:** 35.7 hours, ending 12:45 on 12 October: 78.65M games, 440.2B moves,
+  at 3.4M to 4.0M moves a second. The games came out longer than estimated, so
+  the move budget bought fewer of them. Colab ended the first session after 24
+  hours; the watcher started a new machine and resumed from the last copy it
+  held, losing about 50 minutes.
+- **Outcome:** training games, which start with a 16384 on the board, reach a
+  32768 in 15%. Run 14's finished network hands over somewhat different boards
+  from the ones collected at 40.05M games (the 16384 in a corner on 84% of them
+  against 89%), so the last phase of this network will train on boards from the
+  finished stage 1.
+
+### 21. Stage 1, temporal coherence phase (12 October, ThinkPad)
+
+- **What:** the last tenth of stage 1's training: run 14's weights, continued
+  with temporal coherence learning at a step of 1.0 for 9.5M games.
+- **On:** 16 threads, 3.3 GB (the phase keeps two more tables beside each
+  weight table). About 2.9M moves a second.
+- **Time:** 12.7 hours, 08:44 to 21:30. 130.4B moves.
+- **Outcome:** the gain came at once and then stopped. Training games averaged
+  323,767 over the first 50,000 against about 276,000 at the end of run 14,
+  about 370,000 from the third million on, with 16384 in 85% and 32768 in 24%.
+  Alone at depth 2 over the same 300 games, the weights at 1.8M, 4.7M and 6.4M
+  games of the phase score 475,415, 477,034 and 467,637 (each within about
+  14,000), with 32768 in a little over half the games; before the phase the
+  hourly checks averaged about 395,000.
+
+### 22. Stage 2, temporal coherence phase (12 to 13 October, ThinkPad)
+
+- **What:** the last tenth of stage 2's training: run 20's weights, continued
+  with temporal coherence learning for 7.9M games, from a million hand-over
+  boards collected afresh from the finished stage 1 (the 16384 in a corner on
+  87% of them).
+- **On:** 16 threads, 4.4 GB. About 3.0M moves a second.
+- **Time:** 6.6 hours, 21:53 to 04:27. 69.6B moves.
+- **Outcome:** training games, counted from the hand-over, average about
+  241,000 against about 156,000 at the end of run 20, and reach a 32768 in 36%
+  against 15%. Most of that came in the first hour. This is the last training
+  run of the two-stage player. The two networks joined average 565,703 over
+  1,000 games at depth 2 with tile downgrading and 589,335 at depth 3; the
+  README has the full table and the weights are attached to the v2.0 release.
 
 ## Not training
 

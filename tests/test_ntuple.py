@@ -172,6 +172,28 @@ def _ref_expectimax(net, bits, depth):
     return maxnode(bits, depth)
 
 
+def test_search_value_is_exactly_the_reference_on_trained_and_stacked_networks():
+    """The search batches its leaves and keeps them in a table of their own. It must still add
+    the same numbers in the same order as the plain definition: equal, not approximately equal,
+    for one network and for stacked stages, at any table size."""
+    pats = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]]
+    a, b = nt.NTupleNet(patterns=pats, tc=False), nt.NTupleNet(patterns=pats, tc=False)
+    a.train(400, threads=1, seed=1, alpha_plain=0.1)
+    b.train(400, threads=1, seed=2, alpha_plain=0.1)
+    both = nt.NTupleNet.stack([a, b], [64])
+    rng = np.random.default_rng(21)
+    boards = [nt.to_bits(rand_exps(rng, density=0.8, max_exp=8)) for _ in range(8)]
+    for n in (a, both):
+        for bits_ in (10, 20):
+            n.tt_bits = bits_
+            for bd in boards:
+                assert n.search_value(bd, depth=1) == _ref_expectimax(n, bd, 1)
+            for bd in boards[:2]:
+                assert n.search_value(bd, depth=2) == _ref_expectimax(n, bd, 2)
+    for n in (a, b, both):
+        n.close()
+
+
 def test_search_value_matches_python_reference(net):
     rng = np.random.default_rng(8)
     for _ in range(15):
@@ -208,6 +230,27 @@ def test_save_load_round_trip(tmp_path):
         bits = nt.to_bits(rand_exps(rng))
         assert b.value(bits) == a.value(bits)
     assert b.patterns == a.patterns and b.tc == a.tc
+    a.close(); b.close()
+
+
+def test_temporal_coherence_state_survives_save_and_load(tmp_path):
+    """Values depend on the weights alone, so the round trip above would not notice the two
+    error sums being lost or swapped. Training on from the file does: the per-entry rates
+    come from those sums, so a copy with the wrong ones ends up with different weights."""
+    a = nt.NTupleNet()
+    a.train(games=60, threads=1, seed=2)
+    path = tmp_path / "w.bin"
+    a.save(path)
+    b = nt.NTupleNet.load(path)
+    a.train(games=60, threads=1, seed=5)
+    b.train(games=60, threads=1, seed=5)
+    rng = np.random.default_rng(11)
+    for _ in range(40):
+        bits = nt.to_bits(rand_exps(rng))
+        assert b.value(bits) == a.value(bits)
+    b.save(tmp_path / "w2.bin")
+    a.save(tmp_path / "w1.bin")
+    assert (tmp_path / "w1.bin").read_bytes() == (tmp_path / "w2.bin").read_bytes()
     a.close(); b.close()
 
 

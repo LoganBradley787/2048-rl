@@ -46,8 +46,8 @@ static inline uint64_t hash128(board_t b) {
 
 /* ---------------------------------------------------------------- engine --- */
 
-static row_t *row_left, *row_right;
-static int32_t *row_reward_l, *row_reward_r;
+typedef struct { row_t left, right; int32_t reward_l, reward_r; } rowent_t;   /* one line of cache per row */
+static rowent_t *rowtab;
 static int tables_ready = 0;
 static pthread_mutex_t tables_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -58,10 +58,7 @@ static inline row_t reverse_row(row_t r) {
 static void init_tables(void) {
     pthread_mutex_lock(&tables_lock);
     if (!tables_ready) {
-        row_left = (row_t *)malloc(sizeof(row_t) * ROW_N);
-        row_right = (row_t *)malloc(sizeof(row_t) * ROW_N);
-        row_reward_l = (int32_t *)malloc(sizeof(int32_t) * ROW_N);
-        row_reward_r = (int32_t *)malloc(sizeof(int32_t) * ROW_N);
+        rowtab = (rowent_t *)malloc(sizeof(rowent_t) * ROW_N);
         for (uint32_t idx = 0; idx < ROW_N; idx++) {
             int cells[4] = {(int)(idx & CMASK), (int)((idx >> 5) & CMASK), (int)((idx >> 10) & CMASK), (int)((idx >> 15) & CMASK)};
             int tiles[4], nt = 0;
@@ -77,10 +74,10 @@ static void init_tables(void) {
                 }
             }
             row_t res = (row_t)(out[0] | (out[1] << 5) | (out[2] << 10) | (out[3] << 15));
-            row_left[idx] = res;
-            row_reward_l[idx] = reward;
-            row_right[reverse_row(idx)] = reverse_row(res);
-            row_reward_r[reverse_row(idx)] = reward;
+            rowtab[idx].left = res;
+            rowtab[idx].reward_l = reward;
+            rowtab[reverse_row(idx)].right = reverse_row(res);
+            rowtab[reverse_row(idx)].reward_r = reward;
         }
         tables_ready = 1;
     }
@@ -103,8 +100,8 @@ static inline board_t slide_left(board_t b, int *reward) {
     int s = 0;
     for (int i = 0; i < 4; i++) {
         row_t row = (row_t)((b >> (ROW_BITS * i)) & ROW_MASK);
-        r |= (board_t)row_left[row] << (ROW_BITS * i);
-        s += row_reward_l[row];
+        r |= (board_t)rowtab[row].left << (ROW_BITS * i);
+        s += rowtab[row].reward_l;
     }
     *reward = s;
     return r;
@@ -115,8 +112,8 @@ static inline board_t slide_right(board_t b, int *reward) {
     int s = 0;
     for (int i = 0; i < 4; i++) {
         row_t row = (row_t)((b >> (ROW_BITS * i)) & ROW_MASK);
-        r |= (board_t)row_right[row] << (ROW_BITS * i);
-        s += row_reward_r[row];
+        r |= (board_t)rowtab[row].right << (ROW_BITS * i);
+        s += rowtab[row].reward_r;
     }
     *reward = s;
     return r;
@@ -215,7 +212,10 @@ typedef struct net {
     uint8_t shuf[MAX_PATTERNS][MAX_LEN][16];   /* shuf[k][j][s] = cells[k][s][j]: byte shuffles for the vector path */
     uint8_t pair[MAX_PATTERNS][48];            /* 6-cell patterns: cells (0,1), (2,3), (4,5) of each symmetry, side by side */
     size_t size[MAX_PATTERNS];
-    float *w[MAX_STAGES][MAX_PATTERNS], *e[MAX_STAGES][MAX_PATTERNS], *a[MAX_STAGES][MAX_PATTERNS];
+    /* One table per stage and pattern. A plain stage's table is its weights. A temporal coherence stage's
+     * table holds a record of four floats per entry: weight, sum of errors, sum of absolute errors, unused;
+     * an update then touches one line of cache, not three. See stage_shift, ENTRY_W, ENTRY_E, ENTRY_A. */
+    float *w[MAX_STAGES][MAX_PATTERNS];
     uint8_t *bits[MAX_STAGES][MAX_PATTERNS];
     uint64_t version;        /* bumped whenever weights change; search contexts flush on mismatch */
     search_ctx_t *main_ctx;  /* for single-threaded best_move calls */
@@ -230,6 +230,11 @@ typedef struct net {
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
+#define LEAF_BITS 12             /* leaves get a small table of their own, after the main one in the same block:
+                                  * 4,096 entries stay in the core's cache and catch as many repeats as a million do */
+static inline tt_entry_t *leaf_slot(const search_ctx_t *c, board_t b) {
+    return c->tt + ((size_t)1 << c->bits) + (size_t)(hash128(b) >> (64 - LEAF_BITS));
+}
 
 /* Which tiles are on the board: the sum of the distinct tile values present. A
  * boundary is compared with it, so 16384 means "holds a 16384 or larger" and
@@ -306,6 +311,11 @@ double nt_snake_score(uint64_t lo, uint64_t hi, double decay) {
 }
 
 static inline int stage_is_tc(const net_t *net, int st) { return st < net->tc_stages; }
+/* Entry i of a stage's table starts at float i << stage_shift: records of 4 floats with temporal coherence. */
+static inline int stage_shift(const net_t *net, int st) { return stage_is_tc(net, st) ? 2 : 0; }
+#define ENTRY_W(net, st, k, i) ((net)->w[st][k][(size_t)(i) << stage_shift(net, st)])
+#define ENTRY_E(net, st, k, i) ((net)->w[st][k][((size_t)(i) << 2) + 1])      /* temporal coherence stages only */
+#define ENTRY_A(net, st, k, i) ((net)->w[st][k][((size_t)(i) << 2) + 2])
 static inline int stage_has_bits(const net_t *net, int st) { return net->flags && st > 0 && !stage_is_tc(net, st); }
 static inline size_t bits_bytes(size_t entries) { return (entries + 7) / 8; }
 
@@ -356,11 +366,7 @@ static net_t *net_alloc(const int *cells_flat, const int *lens, int K, int tc_st
         net->size[k] = 1;
         for (int j = 0; j < n; j++) net->size[k] *= RADIX;
         for (int st = 0; st < net->n_stages; st++) {
-            int ok = (net->w[st][k] = (float *)table_calloc(net->size[k], sizeof(float))) != NULL;
-            if (stage_is_tc(net, st)) {
-                ok &= (net->e[st][k] = (float *)table_calloc(net->size[k], sizeof(float))) != NULL;
-                ok &= (net->a[st][k] = (float *)table_calloc(net->size[k], sizeof(float))) != NULL;
-            }
+            int ok = (net->w[st][k] = (float *)table_calloc(net->size[k] << stage_shift(net, st), sizeof(float))) != NULL;
             if (stage_has_bits(net, st))
                 ok &= (net->bits[st][k] = (uint8_t *)table_calloc(bits_bytes(net->size[k]), 1)) != NULL;
             if (!ok) { nt_free(net); return NULL; }           /* out of memory: the tables are large */
@@ -393,7 +399,7 @@ void *nt_stack(void **nets, int n, const int64_t *bounds) {
     if (!net) return NULL;
     for (int s = 0; s < n; s++)
         for (int k = 0; k < net->K; k++)
-            memcpy(net->w[s][k], ((net_t *)nets[s])->w[0][k], net->size[k] * sizeof(float));
+            for (size_t i = 0; i < net->size[k]; i++) ENTRY_W(net, s, k, i) = ENTRY_W((net_t *)nets[s], 0, k, i);
     return net;
 }
 
@@ -404,7 +410,7 @@ void nt_fill(void *p, float v) {
     net_t *net = (net_t *)p;
     for (int st = 0; st < net->n_stages; st++)
         for (int k = 0; k < net->K; k++)
-            for (size_t i = 0; i < net->size[k]; i++) net->w[st][k][i] = v;
+            for (size_t i = 0; i < net->size[k]; i++) ENTRY_W(net, st, k, i) = v;
     net->version++;
 }
 
@@ -413,7 +419,7 @@ void nt_free(void *p) {
     if (!net) return;
     for (int st = 0; st < net->n_stages; st++)
         for (int k = 0; k < net->K; k++) {
-            free(net->w[st][k]); free(net->e[st][k]); free(net->a[st][k]); free(net->bits[st][k]);
+            free(net->w[st][k]); free(net->bits[st][k]);
         }
     if (net->main_ctx) { free(net->main_ctx->tt); free(net->main_ctx); }
     if (net->choose_ctx) { free(net->choose_ctx->tt); free(net->choose_ctx); }
@@ -426,10 +432,8 @@ int nt_lock_memory(void *p) {
     int rc = 0;
     for (int st = 0; st < net->n_stages; st++) {
         for (int k = 0; k < net->K; k++) {
-            size_t bytes = net->size[k] * sizeof(float);
+            size_t bytes = (net->size[k] << stage_shift(net, st)) * sizeof(float);
             if (net->w[st][k] && mlock(net->w[st][k], bytes) != 0) rc = -1;
-            if (net->e[st][k] && mlock(net->e[st][k], bytes) != 0) rc = -1;
-            if (net->a[st][k] && mlock(net->a[st][k], bytes) != 0) rc = -1;
             if (net->bits[st][k] && mlock(net->bits[st][k], bits_bytes(net->size[k])) != 0) rc = -1;
         }
     }
@@ -458,7 +462,7 @@ static inline uint32_t tuple_index(board_t b, const int *cells, int n) {
 
 static inline int touched(const net_t *net, int st, int k, uint32_t i) {
     if (!net->flags || st == 0) return 1;
-    if (stage_is_tc(net, st)) return net->a[st][k][i] != 0.0f;
+    if (stage_is_tc(net, st)) return ENTRY_A(net, st, k, i) != 0.0f;
     return (net->bits[st][k][i >> 3] >> (i & 7)) & 1;
 }
 
@@ -468,7 +472,7 @@ static inline int entry_source(const net_t *net, int st, int k, uint32_t i) {
 }
 
 static inline float entry_value(const net_t *net, int st, int k, uint32_t i) {
-    return net->w[entry_source(net, st, k, i)][k][i];
+    return ENTRY_W(net, entry_source(net, st, k, i), k, i);
 }
 
 static inline float net_value_stage(const net_t *net, board_t b, int st) {
@@ -492,6 +496,7 @@ static inline void unpack_cells(board_t b, uint8_t *c) {
 }
 
 static inline void cells_indices(const net_t *net, const uint8_t *c, int st, uint32_t *idx) {
+    const int sh = stage_shift(net, st);
 #ifdef NT_SIMD
     _Static_assert(RADIX == 18, "the shifts below multiply by 18");
     const __m128i bytes = _mm_loadu_si128((const __m128i *)c);
@@ -515,7 +520,8 @@ static inline void cells_indices(const net_t *net, const uint8_t *c, int st, uin
         }
         _mm256_storeu_si256((__m256i *)(idx + 8 * k), acc);
         const float *w = net->w[st][k];
-        for (int s = 0; s < 8; s++) __builtin_prefetch(&w[idx[8 * k + s]]);
+        if (sh) for (int s = 0; s < 8; s++) __builtin_prefetch(&w[(size_t)idx[8 * k + s] << 2]);
+        else for (int s = 0; s < 8; s++) __builtin_prefetch(&w[idx[8 * k + s]]);
     }
 #else
     int f = 0;
@@ -526,11 +532,29 @@ static inline void cells_indices(const net_t *net, const uint8_t *c, int st, uin
             const int *cells = net->cells[k][s];
             uint32_t i = 0;
             for (int j = 0; j < n; j++) i = i * RADIX + c[cells[j]];
-            __builtin_prefetch(&w[i]);
+            __builtin_prefetch(&w[(size_t)i << sh]);
             idx[f++] = i;
         }
     }
 #endif
+}
+
+/* The entries of one stage at these indices, added in order: pattern by pattern, symmetry by symmetry. */
+static inline float sum_entries(const net_t *net, int st, const uint32_t *idx) {
+    float v = 0.0f;
+    int f = 0;
+    if (stage_shift(net, st)) {
+        for (int k = 0; k < net->K; k++) {
+            const float *w = net->w[st][k];
+            for (int s = 0; s < 8; s++) v += w[(size_t)idx[f++] << 2];
+        }
+    } else {
+        for (int k = 0; k < net->K; k++) {
+            const float *w = net->w[st][k];
+            for (int s = 0; s < 8; s++) v += w[idx[f++]];
+        }
+    }
+    return v;
 }
 
 /* The value of a board. Without promotion every entry is read from the board's own
@@ -547,13 +571,7 @@ static inline float net_value(const net_t *net, board_t b) {
         while (st < net->n_bounds && (scale & ~(int64_t)1) >= net->bounds[st]) st++;
     }
     cells_indices(net, c, st, idx);
-    float v = 0.0f;
-    int f = 0;
-    for (int k = 0; k < net->K; k++) {
-        const float *w = net->w[st][k];
-        for (int s = 0; s < 8; s++) v += w[idx[f++]];
-    }
-    return v;
+    return sum_entries(net, st, idx);
 }
 
 static inline void net_update_stage(net_t *net, board_t b, float delta, float alpha, float alpha_plain, int st) {
@@ -564,20 +582,20 @@ static inline void net_update_stage(net_t *net, board_t b, float delta, float al
             uint32_t i = tuple_index(b, net->cells[k][s], net->len[k]);
             if (st > 0 && !touched(net, st, k, i)) {   /* promotion: start from the previous stage's entry */
                 int src = entry_source(net, st - 1, k, i);
-                net->w[st][k][i] = net->w[src][k][i];
+                ENTRY_W(net, st, k, i) = ENTRY_W(net, src, k, i);
                 if (tc && stage_is_tc(net, src)) {      /* and inherit its adaptive-rate state */
-                    net->e[st][k][i] = net->e[src][k][i];
-                    net->a[st][k][i] = net->a[src][k][i];
+                    ENTRY_E(net, st, k, i) = ENTRY_E(net, src, k, i);
+                    ENTRY_A(net, st, k, i) = ENTRY_A(net, src, k, i);
                 }
             }
             if (tc) {
-                float E = net->e[st][k][i], A = net->a[st][k][i];
+                float E = ENTRY_E(net, st, k, i), A = ENTRY_A(net, st, k, i);
                 float beta = (A == 0.0f) ? 1.0f : fabsf(E) / A;
-                net->w[st][k][i] += step * beta;
-                net->e[st][k][i] = E + delta;
-                net->a[st][k][i] = A + fabsf(delta);
+                ENTRY_W(net, st, k, i) += step * beta;
+                ENTRY_E(net, st, k, i) = E + delta;
+                ENTRY_A(net, st, k, i) = A + fabsf(delta);
             } else {
-                net->w[st][k][i] += step;
+                ENTRY_W(net, st, k, i) += step;
                 if (stage_has_bits(net, st)) net->bits[st][k][i >> 3] |= (uint8_t)(1 << (i & 7));
             }
         }
@@ -656,33 +674,28 @@ static inline void feat_indices(const net_t *net, board_t b, uint32_t *idx) {
     cells_indices(net, c, 0, idx);
 }
 
-static inline float feat_value(const net_t *net, const uint32_t *idx) {
-    float v = 0.0f;
-    int f = 0;
-    for (int k = 0; k < net->K; k++) {
-        const float *w = net->w[0][k];
-        for (int s = 0; s < 8; s++) v += w[idx[f++]];
-    }
-    return v;
-}
+static inline float feat_value(const net_t *net, const uint32_t *idx) { return sum_entries(net, 0, idx); }
 
 static inline void feat_update(net_t *net, const uint32_t *idx, float delta, float alpha, float alpha_plain) {
     int tc = stage_is_tc(net, 0);
     float step = (tc ? alpha : alpha_plain) * delta / (float)(net->K * 8);
     int f = 0;
-    for (int k = 0; k < net->K; k++) {
-        float *w = net->w[0][k], *e = net->e[0][k], *a = net->a[0][k];
-        for (int s = 0; s < 8; s++) {
-            uint32_t i = idx[f++];
-            if (tc) {
-                float E = e[i], A = a[i];
+    if (tc) {
+        for (int k = 0; k < net->K; k++) {
+            float *w = net->w[0][k];
+            for (int s = 0; s < 8; s++) {
+                float *t = &w[(size_t)idx[f++] << 2];          /* weight, error sum, absolute error sum */
+                float E = t[1], A = t[2];
                 float beta = (A == 0.0f) ? 1.0f : fabsf(E) / A;
-                w[i] += step * beta;
-                e[i] = E + delta;
-                a[i] = A + fabsf(delta);
-            } else {
-                w[i] += step;
+                t[0] += step * beta;
+                t[1] = E + delta;
+                t[2] = A + fabsf(delta);
             }
+        }
+    } else {
+        for (int k = 0; k < net->K; k++) {
+            float *w = net->w[0][k];
+            for (int s = 0; s < 8; s++) w[idx[f++]] += step;
         }
     }
 }
@@ -695,6 +708,9 @@ static inline void feat_update(net_t *net, const uint32_t *idx, float delta, flo
 static float expected_target(const net_t *net, board_t after) {
     int empty = 0;
     double sum = 0.0;
+    board_t seen_key[256];                               /* values already read in this call; no board is 0 after a move */
+    float seen_val[256];
+    memset(seen_key, 0, sizeof seen_key);
     for (int i = 0; i < 16; i++) {
         if (cell(after, i)) continue;
         empty++;
@@ -702,6 +718,29 @@ static float expected_target(const net_t *net, board_t after) {
             board_t s = after | put(v, i);
             float best = 0.0f;
             int any = 0;
+            if (!net->flags && !net->n_bounds) {     /* one stage: index the four afterstates, then read them */
+                board_t a[4];
+                int r[4];
+                uint32_t idx[4][MAX_PATTERNS * 8];
+                int slot[4], hit[4];
+                float hv[4];
+                for (int d = 0; d < 4; d++) {
+                    a[d] = do_move(s, d, &r[d]);
+                    if (a[d] == s) continue;
+                    slot[d] = (int)(hash128(a[d]) >> 56);            /* spawns in one line often slide to the same board */
+                    hit[d] = seen_key[slot[d]] == a[d];
+                    if (hit[d]) hv[d] = seen_val[slot[d]];           /* read now: a later miss may take the slot */
+                    else feat_indices(net, a[d], idx[d]);
+                }
+                for (int d = 0; d < 4; d++) {
+                    if (a[d] == s) continue;
+                    float va;
+                    if (hit[d]) va = hv[d];
+                    else { va = feat_value(net, idx[d]); seen_key[slot[d]] = a[d]; seen_val[slot[d]] = va; }
+                    float q = (float)r[d] + va;
+                    if (!any || q > best) { best = q; any = 1; }
+                }
+            } else
             for (int d = 0; d < 4; d++) {
                 int r;
                 board_t a = do_move(s, d, &r);
@@ -860,7 +899,7 @@ void nt_train(void *p, long games, int threads, float alpha, float alpha_plain, 
 static search_ctx_t *ctx_create_tt(net_t *net, double cutoff, int use_tt) {
     search_ctx_t *c = (search_ctx_t *)calloc(1, sizeof(search_ctx_t));
     c->bits = net->tt_bits;
-    c->tt = use_tt ? (tt_entry_t *)table_calloc((size_t)1 << c->bits, sizeof(tt_entry_t)) : NULL;
+    c->tt = use_tt ? (tt_entry_t *)table_calloc(((size_t)1 << c->bits) + ((size_t)1 << LEAF_BITS), sizeof(tt_entry_t)) : NULL;
     c->cutoff = cutoff;
     c->net = net;
     c->version = net->version;
@@ -873,7 +912,7 @@ static search_ctx_t *ctx_create(net_t *net, double cutoff) {
 
 static void ctx_sync(search_ctx_t *c, double cutoff) {
     if (c->version != c->net->version || c->cutoff != cutoff) {
-        if (c->tt) memset(c->tt, 0, ((size_t)1 << c->bits) * sizeof(tt_entry_t));
+        if (c->tt) memset(c->tt, 0, (((size_t)1 << c->bits) + ((size_t)1 << LEAF_BITS)) * sizeof(tt_entry_t));
         c->version = c->net->version;
         c->cutoff = cutoff;
     }
@@ -923,9 +962,53 @@ double nt_leaf_snake(void *p) { return ((net_t *)p)->leaf_snake; }
  * size or thread count.
  * Leaves are kept too (as depth 0, stored +1 so an empty slot matches nothing):
  * one probe is far cheaper than a board's table lookups. */
+/* A max node whose children are all leaves: the four afterstates are probed, indexed
+ * and prefetched together, then summed, each in net_value's order. The same numbers. */
+static double max_leaf(search_ctx_t *c, board_t b) {
+    const net_t *net = c->net;
+    if (net->flags || net->leaf_snake > 0.0) return max_node(c, b, 0, 1.0);
+    board_t a[4];
+    int r[4], st[4], hit[4];
+    double val[4];
+    tt_entry_t *e[4];
+    uint32_t idx[4][MAX_PATTERNS * 8];
+    for (int d = 0; d < 4; d++) {
+        a[d] = do_move(b, d, &r[d]);
+        e[d] = (a[d] != b && c->tt) ? leaf_slot(c, a[d]) : NULL;
+        if (e[d]) __builtin_prefetch(e[d]);
+    }
+    for (int d = 0; d < 4; d++) {
+        hit[d] = 0;
+        if (a[d] == b) continue;
+        if (e[d] && e[d]->key == a[d] && e[d]->depth == 1) { hit[d] = 1; val[d] = e[d]->val; continue; }
+        uint8_t cc[16];
+        unpack_cells(a[d], cc);
+        int s0 = 0;
+        if (net->n_bounds) {
+            int64_t scale = 0;
+            for (int i = 0; i < 16; i++) scale |= (int64_t)1 << cc[i];
+            while (s0 < net->n_bounds && (scale & ~(int64_t)1) >= net->bounds[s0]) s0++;
+        }
+        st[d] = s0;
+        cells_indices(net, cc, s0, idx[d]);
+    }
+    double best = 0.0;
+    int any = 0;
+    for (int d = 0; d < 4; d++) {
+        if (a[d] == b) continue;
+        if (!hit[d]) {
+            val[d] = (double)sum_entries(net, st[d], idx[d]);
+            if (e[d]) { e[d]->key = a[d]; e[d]->depth = 1; e[d]->val = val[d]; }
+        }
+        double v = (double)r[d] + val[d];
+        if (!any || v > best) { best = v; any = 1; }
+    }
+    return best;
+}
+
 static double chance_node(search_ctx_t *c, board_t after, int depth, double prob) {
     if (prob < c->cutoff) depth = 0;
-    tt_entry_t *e = c->tt ? &c->tt[tt_hash(c, after)] : NULL;
+    tt_entry_t *e = !c->tt ? NULL : depth == 0 ? leaf_slot(c, after) : &c->tt[tt_hash(c, after)];
     if (e && e->key == after && e->depth == depth + 1) return e->val;
     if (depth == 0) {
         double v = leaf_value(c->net, after);
@@ -936,6 +1019,11 @@ static double chance_node(search_ctx_t *c, board_t after, int depth, double prob
     double p2 = prob * 0.9 / empty, p4 = prob * 0.1 / empty, sum = 0.0;
     for (int i = 0; i < 16; i++) {
         if (cell(after, i) != 0) continue;
+        if (depth == 1) {
+            sum += 0.9 * max_leaf(c, after | (put(1, i)));
+            sum += 0.1 * max_leaf(c, after | (put(2, i)));
+            continue;
+        }
         sum += 0.9 * max_node(c, after | (put(1, i)), depth - 1, p2);
         sum += 0.1 * max_node(c, after | (put(2, i)), depth - 1, p4);
     }
@@ -991,7 +1079,7 @@ void nt_set_downgrade(void *p, int exp) { ((net_t *)p)->downgrade = exp < 0 ? 0 
 int nt_get_downgrade(void *p) { return ((net_t *)p)->downgrade; }
 
 /* Not for use while games are being played on other threads. bits: 2^bits entries
- * of 32 bytes per search thread. caps: 17 depths indexed by the root's empty cells
+ * of 32 bytes per search thread (plus the 2^LEAF_BITS entries kept for leaves). caps: 17 depths indexed by the root's empty cells
  * (0 = no cap), or NULL to clear: crowded boards get the deep search, open ones,
  * where a spawn rarely decides anything, a shallow one. */
 static void drop_ctx(search_ctx_t **c) {
@@ -1718,6 +1806,13 @@ static const char MAGIC_V4[8] = "NTUPLE04";
 static const char MAGIC_V5[8] = "NTUPLE05";
 static const char MAGIC_V6[8] = "NTUPLE06";   /* radix-18 tables (five-bit cells) */
 
+/* One quantity of a table as the plain array the file format holds: float `off` of every record. */
+static void write_column(FILE *f, const float *t, int sh, int off, size_t n, float *buf) {
+    if (sh == 0) { fwrite(t, sizeof(float), n, f); return; }
+    for (size_t i = 0; i < n; i++) buf[i] = t[(i << sh) + off];
+    fwrite(buf, sizeof(float), n, f);
+}
+
 /* Format 06: header (K, tc_stages, flags, n_bounds, bounds, len, orig), then per
  * stage and pattern: w; e and a for TC stages; touched bits for plain stages >= 1.
  * weights_only drops the learning state and writes every stage's table with
@@ -1738,7 +1833,7 @@ int nt_save_ex(void *p, const char *path, int weights_only) {
     fwrite(net->len, sizeof(int), MAX_PATTERNS, f);
     fwrite(net->orig, sizeof(int), MAX_PATTERNS * MAX_LEN, f);
     float *buf = NULL;
-    if (weights_only && net->flags) {                /* scratch for baking promotion in */
+    if ((weights_only && net->flags) || net->tc_stages > 0) {   /* scratch: baking promotion in, or one column of a record table */
         size_t largest = 0;
         for (int k = 0; k < net->K; k++) if (net->size[k] > largest) largest = net->size[k];
         buf = (float *)malloc(largest * sizeof(float));
@@ -1750,11 +1845,11 @@ int nt_save_ex(void *p, const char *path, int weights_only) {
                 for (uint32_t i = 0; i < net->size[k]; i++) buf[i] = entry_value(net, st, k, i);
                 fwrite(buf, sizeof(float), net->size[k], f);
             } else {
-                fwrite(net->w[st][k], sizeof(float), net->size[k], f);
+                write_column(f, net->w[st][k], stage_shift(net, st), 0, net->size[k], buf);
             }
             if (!weights_only && stage_is_tc(net, st)) {
-                fwrite(net->e[st][k], sizeof(float), net->size[k], f);
-                fwrite(net->a[st][k], sizeof(float), net->size[k], f);
+                write_column(f, net->w[st][k], 2, 1, net->size[k], buf);
+                write_column(f, net->w[st][k], 2, 2, net->size[k], buf);
             }
             if (!weights_only && stage_has_bits(net, st)) fwrite(net->bits[st][k], 1, bits_bytes(net->size[k]), f);
         }
@@ -1774,12 +1869,13 @@ static inline uint32_t remap_old_index(uint32_t old, int n) {
     return idx;
 }
 
-/* Read a table of `fn` floats into dst (NULL = skip); re-index when the file is old. */
-static int read_table(FILE *f, float *dst, size_t fn, int old, int n, float *tmp) {
+/* Read a table of `fn` floats (NULL = skip) into float `off` of each record of dst, records of 1 << sh
+ * floats; re-index when the file is old. */
+static int read_table(FILE *f, float *dst, int sh, int off, size_t fn, int old, int n, float *tmp) {
     if (!dst) return skip_bytes(f, fn * sizeof(float));
-    if (!old) return fread(dst, sizeof(float), fn, f) == fn ? 0 : -1;
+    if (!old && sh == 0) return fread(dst, sizeof(float), fn, f) == fn ? 0 : -1;
     if (fread(tmp, sizeof(float), fn, f) != fn) return -1;
-    for (uint32_t i = 0; i < fn; i++) dst[remap_old_index(i, n)] = tmp[i];
+    for (uint32_t i = 0; i < fn; i++) dst[((size_t)(old ? remap_old_index(i, n) : i) << sh) + off] = tmp[i];
     return 0;
 }
 
@@ -1862,10 +1958,10 @@ void *nt_load_ex(const char *path, const int64_t *req_bounds, int n_req, int tc_
             int f_has_e = v >= 5 ? st < f_tc_stages : f_e_all;
             int f_has_a = v >= 5 ? st < f_tc_stages : f_a_all;
             int f_has_bits = v >= 5 ? (f_flags && st > 0 && st >= f_tc_stages) : (f_bits_v4 && st > 0);
-            if (read_table(f, net->w[st][k], fn, old, len[k], tmp)) goto fail;
-            if (f_has_e && read_table(f, stage_is_tc(net, st) ? net->e[st][k] : NULL, fn, old, len[k], tmp)) goto fail;
+            if (read_table(f, net->w[st][k], stage_shift(net, st), 0, fn, old, len[k], tmp)) goto fail;
+            if (f_has_e && read_table(f, stage_is_tc(net, st) ? net->w[st][k] : NULL, 2, 1, fn, old, len[k], tmp)) goto fail;
             if (f_has_a) {
-                if (stage_is_tc(net, st)) { if (read_table(f, net->a[st][k], fn, old, len[k], tmp)) goto fail; }
+                if (stage_is_tc(net, st)) { if (read_table(f, net->w[st][k], 2, 2, fn, old, len[k], tmp)) goto fail; }
                 else if (stage_has_bits(net, st)) {   /* keep the touched flags as bits */
                     if (fread(tmp, sizeof(float), fn, f) != fn) goto fail;
                     for (uint32_t i = 0; i < fn; i++)

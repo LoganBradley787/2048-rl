@@ -77,7 +77,7 @@ def main(argv=None) -> None:
     p.add_argument("--tc-stages", type=int, default=None,
                    help="leading stages that keep temporal-coherence state (default: all, or 0 with --no-tc)")
     p.add_argument("--no-tc", action="store_true",
-                   help="plain TD instead of temporal coherence (with --resume: drop the TC state, a third of the memory)")
+                   help="plain TD instead of temporal coherence (with --resume: drop the TC state, a quarter of the memory)")
     p.add_argument("--expect-target", action="store_true",
                    help="learn from the average over every tile that could appear instead of the one that did "
                         "(single-stage, random-spawn runs; 10 to 15 times the cost per move); pass it again on resume")

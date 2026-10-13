@@ -395,7 +395,7 @@ class NTupleNet:
     later stage has never updated read through to the previous stage.
 
     `tc_stages` is how many leading stages learn with temporal coherence (per-entry
-    adaptive rates, 8 extra bytes per weight); the rest use plain TD with their own
+    adaptive rates, 12 extra bytes per weight in memory); the rest use plain TD with their own
     step size (`alpha_plain`). Default: all stages when `tc`, else none.
 
     `v_init` is the value a fresh network gives every board (optimistic
@@ -438,7 +438,7 @@ class NTupleNet:
         network (later stages start by reading through to it). A file that already
         has stages must be loaded with no boundaries or the same ones. keep_tc=False
         drops the temporal-coherence state everywhere; `tc_stages=n` keeps it on the
-        first n stages only (plain TD elsewhere, at a third of the memory per stage)."""
+        first n stages only (plain TD elsewhere, at a quarter of the memory per stage)."""
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -607,7 +607,8 @@ class NTupleNet:
     @property
     def tt_bits(self) -> int:
         """Size of the search's transposition table: 2**tt_bits entries of 32 bytes
-        for each search thread (20 by default, 32 MB). Deep searches want more.
+        for each search thread (20 by default, 32 MB), beside a small fixed table for
+        the search's leaves. Deep searches want more.
         It changes the speed only, never the move chosen. Set it between searches."""
         return int(self._lib.nt_get_tt_bits(self._h))
 

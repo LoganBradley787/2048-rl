@@ -254,6 +254,28 @@ def test_temporal_coherence_state_survives_save_and_load(tmp_path):
     a.close(); b.close()
 
 
+def test_play_trace_is_the_same_game_as_play_with_its_history():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(300, threads=1, seed=1, alpha_plain=0.1)
+    for depth in (0, 1):
+        for g in (0, 3):
+            plain = n.play(1, depth=depth, threads=1, seed=7, first=g)
+            tr = n.play_trace(g, depth=depth, seed=7)
+            assert (tr["score"], tr["max_tile"], tr["moves"]) == (plain["scores"][0], plain["max_tiles"][0], plain["moves"][0])
+            boards, dirs = tr["boards"], tr["dirs"]
+            assert len(boards) == tr["moves"] + 1 and dirs[-1] == -1 and (dirs[:-1] >= 0).all()
+            assert 1 << int(boards[-1].max()) == tr["max_tile"]
+            score = 0
+            for t in range(tr["moves"]):                   # each board follows from the one before by its move and one new tile
+                after, r = nt.move(nt.to_bits(boards[t]), int(dirs[t]))
+                score += r
+                diff = boards[t + 1].astype(int) - nt.from_bits(after).astype(int)
+                assert np.count_nonzero(diff) == 1 and diff.max() in (1, 2) and nt.from_bits(after)[diff != 0][0] == 0
+            assert score == tr["score"]
+            assert all(nt.move(nt.to_bits(boards[-1]), d)[0] == nt.to_bits(boards[-1]) for d in range(4))
+    n.close()
+
+
 def test_agent_plays_legal_moves(tmp_path):
     n = nt.NTupleNet()
     n.train(games=100, threads=2, seed=4)

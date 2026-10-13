@@ -1178,6 +1178,39 @@ static void *play_worker(void *arg) {
 /* Games first .. first + games - 1 of the seed. A game depends on its number and
  * the seed alone, so an evaluation can be cut into pieces, run anywhere in any
  * order, and add up to the same games. */
+/* One game of the seed, played exactly as nt_play_from plays it, with its history kept: the board before
+ * each move (as two 64-bit halves) and the move made, then the final board. At most `cap` boards are kept
+ * (the game is played to its end regardless); *n_boards is how many were. Returns the score. */
+int64_t nt_play_trace(void *p, long game, int depth, double cutoff, uint64_t seed, long cap,
+                      uint64_t *boards_lohi, int8_t *dirs, long *n_boards, int32_t *maxtile, int32_t *moves) {
+    net_t *net = (net_t *)p;
+    search_ctx_t *c = ctx_create(net, cutoff);
+    uint64_t rng = game_seed(seed, game);
+    board_t b = spawn(spawn(0, &rng), &rng);
+    int64_t sc = 0;
+    int32_t mv = 0;
+    long kept = 0;
+    for (;;) {
+        int d = best_move(c, b, depth);
+        if (kept < cap) {
+            boards_lohi[2 * kept] = lo64(b);
+            boards_lohi[2 * kept + 1] = hi64(b);
+            dirs[kept] = (int8_t)d;                      /* -1 on the final board */
+            kept++;
+        }
+        if (d < 0) break;
+        int r;
+        b = spawn(do_move(b, d, &r), &rng);
+        sc += r;
+        mv++;
+    }
+    ctx_free(c);
+    *n_boards = kept;
+    *maxtile = max_exp(b) ? (1 << max_exp(b)) : 0;
+    *moves = mv;
+    return sc;
+}
+
 void nt_play_from(void *p, long games, long first, int depth, double cutoff, int threads, uint64_t seed,
                   int64_t *scores, int32_t *maxtiles, int32_t *moves) {
     long next = 0;

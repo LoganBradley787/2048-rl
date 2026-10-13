@@ -91,6 +91,9 @@ def main(argv=None) -> None:
     p.add_argument("--downgrade", type=int, default=0, help="tile (e.g. 32768) from which the search uses the downgraded board")
     p.add_argument("--tt-bits", type=int, default=0, help="transposition table of 2**n entries per game in play; 0 = default")
     p.add_argument("--depth-caps", default="", help="deepest search by number of empty cells, e.g. 5,5,5,5,4,4,4,4,3")
+    p.add_argument("--trace-dir", default=None,
+                   help="keep every game's history here, one game_<n>.npz each: `boards` (the board before each "
+                        "move, then the final one, as exponents) and `dirs` (0 up, 1 right, 2 down, 3 left, -1 at the end)")
     args = p.parse_args(argv)
 
     if args.summary:
@@ -125,6 +128,9 @@ def main(argv=None) -> None:
     net.depth_caps = caps
     if args.tt_bits:
         net.tt_bits = args.tt_bits
+    trace_dir = Path(args.trace_dir) if args.trace_dir else None
+    if trace_dir:
+        trace_dir.mkdir(parents=True, exist_ok=True)
     new = not out.exists()
     f = open(out, "a", newline="")
     w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -134,10 +140,15 @@ def main(argv=None) -> None:
 
     def play(g: int) -> None:
         t = time.time()
-        s = net.play(1, depth=args.depth, cutoff=args.cutoff, threads=1, seed=args.seed, first=g)
+        if trace_dir:                                  # the same game, with its history kept
+            s = net.play_trace(g, depth=args.depth, cutoff=args.cutoff, seed=args.seed)
+            np.savez_compressed(trace_dir / f"game_{g}.npz", boards=s["boards"], dirs=s["dirs"], score=s["score"])
+            row = {"score": s["score"], "max_tile": s["max_tile"], "moves": s["moves"]}
+        else:
+            s = net.play(1, depth=args.depth, cutoff=args.cutoff, threads=1, seed=args.seed, first=g)
+            row = {"score": int(s["scores"][0]), "max_tile": int(s["max_tiles"][0]), "moves": int(s["moves"][0])}
         with lock:                                     # one row per finished game, on disk at once
-            w.writerow({"game": g, "score": int(s["scores"][0]), "max_tile": int(s["max_tiles"][0]),
-                        "moves": int(s["moves"][0]), "seconds": round(time.time() - t, 1)})
+            w.writerow({"game": g, **row, "seconds": round(time.time() - t, 1)})
             f.flush()
             os.fsync(f.fileno())
             count[0] += 1

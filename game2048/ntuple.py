@@ -207,6 +207,9 @@ def lib() -> ctypes.CDLL:
     L.nt_search_value.argtypes, L.nt_search_value.restype = [vp, u64, u64, i32, f64], f64
     L.nt_play.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, P(i64), P(i32), P(i32)]
     L.nt_play_from.argtypes = [vp, ctypes.c_long, ctypes.c_long, i32, f64, i32, u64, P(i64), P(i32), P(i32)]
+    L.nt_play_trace.argtypes = [vp, ctypes.c_long, i32, f64, u64, ctypes.c_long, P(u64), P(ctypes.c_int8),
+                                P(ctypes.c_long), P(i32), P(i32)]
+    L.nt_play_trace.restype = i64
     L.nt_best_choose.argtypes, L.nt_best_choose.restype = [vp, u64, u64, i32, i32, P(i32), P(i32)], i32
     L.nt_choose_value.argtypes, L.nt_choose_value.restype = [vp, u64, u64, i32, i32], f64
     L.nt_play_choose.argtypes = [vp, ctypes.c_long, i32, i32, i32, u64, ctypes.c_long, ctypes.c_long,
@@ -739,6 +742,30 @@ class NTupleNet:
         self._lib.nt_play_from(self._h, games, int(first), int(depth), float(cutoff), threads,
                                seed & 0xFFFFFFFFFFFFFFFF, scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
+
+    def play_trace(self, game: int, depth: int = 1, cutoff: float = 0.0, seed: int = 0,
+                   max_boards: int = 200_000) -> dict:
+        """Game number `game` of `seed`, exactly as `play` plays it, with its history:
+        `boards[t]` is the board before move t (an (n, 4, 4) array of exponents) and
+        `dirs[t]` the move made there (0 up, 1 right, 2 down, 3 left); the last board
+        is the final one, with dir -1. Also `score`, `max_tile`, `moves`."""
+        buf = (ctypes.c_uint64 * (2 * max_boards))()
+        dirs = (ctypes.c_int8 * max_boards)()
+        n, tile, moves = ctypes.c_long(0), ctypes.c_int(0), ctypes.c_int(0)
+        score = self._lib.nt_play_trace(self._h, int(game), int(depth), float(cutoff), seed & 0xFFFFFFFFFFFFFFFF,
+                                        max_boards, buf, dirs, ctypes.byref(n), ctypes.byref(tile), ctypes.byref(moves))
+        raw = np.ctypeslib.as_array(buf)[: 2 * n.value].reshape(-1, 2)
+        cells = np.empty((n.value, 16), dtype=np.uint8)
+        for i in range(16):                          # 5 bits a cell, 12 cells in the low half and 4 across/above
+            lo_bits, shift = CELL_BITS * i, CELL_BITS * i - 64
+            if lo_bits + CELL_BITS <= 64:
+                cells[:, i] = (raw[:, 0] >> np.uint64(lo_bits)) & np.uint64(CELL_MASK)
+            elif shift >= 0:
+                cells[:, i] = (raw[:, 1] >> np.uint64(shift)) & np.uint64(CELL_MASK)
+            else:                                    # the cell that straddles the two halves
+                cells[:, i] = ((raw[:, 0] >> np.uint64(lo_bits)) | (raw[:, 1] << np.uint64(-shift))) & np.uint64(CELL_MASK)
+        return {"score": int(score), "max_tile": tile.value, "moves": moves.value,
+                "boards": cells.reshape(-1, 4, 4), "dirs": np.ctypeslib.as_array(dirs)[: n.value].copy()}
 
 
 def percent(rate: float, digits: int = 0) -> str:

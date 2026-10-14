@@ -4,7 +4,8 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-13, 08:30. Nothing is training.
+Last updated 2026-10-14, 01:30. Two runs are training on Colab (24 and 25);
+the totals below do not include them yet.
 
 ## Totals so far
 
@@ -289,6 +290,40 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   run of the two-stage player. The two networks joined average 565,703 over
   1,000 games at depth 2 with tile downgrading and 589,335 at depth 3; the
   README has the full table and the weights are attached to the v2.0 release.
+
+### 23. Engine speed work and a one-hour pilot (13 October, ThinkPad and Colab)
+
+- **What:** short training runs used only to time the engine (up to a few
+  minutes each, on the finished networks, thrown away afterwards), and one
+  hour of stage 2's finished network trained further with the expected-value
+  target, to see whether it changed anything quickly.
+- **On:** the ThinkPad, 16 threads; one Colab CPU machine for about an hour of
+  timing.
+- **Time:** the pilot ran 61 minutes: 510,000 games, 4.7B moves.
+- **Outcome:** the engine changes that came out of the timing (faster search,
+  faster temporal coherence training, results unchanged) are in the code. The
+  pilot changed nothing measurable over 1,000 games, and was not kept.
+
+### 24. Stage 2 with the expected-value target (from 13 October, Colab, running)
+
+- **What:** run 20's weights (stage 2 before its temporal coherence phase),
+  trained further toward the average over every tile that can appear instead
+  of the tile that did, at the same fixed learning rate, from the same million
+  hand-over boards. Budget 70B moves.
+- **On:** one Colab high-RAM CPU machine (8 vCPUs). About 1.2M moves a second:
+  this target costs about five times as much per move.
+- **Started:** 19:20 on 13 October.
+
+### 25. Stage 3, for boards holding a 32768 and a 16384 (from 13 October, Colab, running)
+
+- **What:** a third network, new, trained only from boards that already hold
+  a 32768 and a 16384: 300,000 such boards collected from games of the v2
+  player without search. Optimistic start at 190,000 (below the 320,000 of
+  the first two stages, since less is left to win from these boards), fixed
+  learning rate. Budget 190B moves.
+- **On:** one Colab high-RAM CPU machine. About 3.9M moves a second.
+- **Started:** 19:16 on 13 October (collecting the boards took the first two
+  hours).
 
 ## Not training
 

@@ -4,8 +4,8 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-14, 12:05. Run 26 is training on Colab; the totals
-below do not include runs 24 to 26 yet.
+Last updated 2026-10-14, 15:10. The totals below do not include runs 24
+to 26 yet.
 
 ## Totals so far
 
@@ -338,14 +338,21 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   it was not kept. A network trained this way would need far more training to
   catch up with the 78M games stage 2 already had.
 
-### 26. Temporal coherence phase for run 24 (from 14 October, Colab, running)
+### 26. Temporal coherence phase for run 24 (14 October, Colab)
 
 - **What:** run 24's weights, continued with temporal coherence learning and
   the expected-value target for 7B moves (a tenth of run 24), from the same
   hand-over boards. Then joined to the finished stage 1 and played over 1,000
   games at depth 2 with tile downgrading, the same test that gave v2 565,703.
 - **On:** one Colab high-RAM CPU machine (8 vCPUs).
-- **Started:** 12:29 on 14 October (after uploading its 3.3 GB of inputs).
+- **Time:** 12:29 to 14:48 on 14 October, after uploading its 3.3 GB of
+  inputs; 105 minutes of training. 780,000 games, 7.1B moves.
+- **Outcome:** training games averaged about 244,000 and reached a 32768 in
+  37%, against 241,000 and 36% after run 22. Over the same 1,000 games at
+  depth 2 with tile downgrading the joined player averaged 569,924 against
+  v2's 565,703: 4,221 more a game, well inside the noise (plus or minus
+  14,555), with a 32768 in 60.0% of games against 58.6%. A 10,000-game
+  comparison is running.
 
 ## Not training
 

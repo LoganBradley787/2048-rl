@@ -94,7 +94,8 @@ def main(argv=None) -> None:
     p.add_argument("--endgame", type=int, default=0,
                    help="exact endgame tables choose the move once this many tiles (32768 down) lie on a snake; 0 = off")
     p.add_argument("--endgame-bits", type=int, default=29,
-                   help="memo size for the 5- to 7-tile tables, as a power of two (7 bytes a slot: 29 is 3.8 GB)")
+                   help="memo size for the 5-tile table as a power of two; 6 tiles get the same up to 31, 7 tiles two fewer up to 27. "
+                        "Under 31: 7 bytes a slot (29 is 3.8 GB); 31 and over: 4 bytes (33 is 32 GB)")
     p.add_argument("--trace-dir", default=None,
                    help="keep every game's history here, one game_<n>.npz each: `boards` (the board before each "
                         "move, then the final one, as exponents) and `dirs` (0 up, 1 right, 2 down, 3 left, -1 at the end)")

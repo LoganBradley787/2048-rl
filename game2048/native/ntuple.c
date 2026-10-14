@@ -1130,6 +1130,10 @@ static const int EG_SNAKE[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 1
 static pthread_mutex_t eg_lock = PTHREAD_MUTEX_INITIALIZER;
 static float *eg_dense[16];
 static uint32_t *eg_klo[16]; static uint8_t *eg_khi[16]; static uint16_t *eg_val[16];
+/* Maps of 2^31 slots or more use 4 bytes a slot instead: an index is first mixed by a 40-bit bijection h; the
+ * slot it starts from holds the low bits of h, so the word only needs the high bits of h (q), how far the entry
+ * sits from its starting slot (off) and the value. 0 = empty. Entries that would sit too far are not stored. */
+static uint32_t *eg_w32[16]; static int eg_wbits[16];
 static uint64_t eg_cap[16], eg_used[16];
 static int eg_bits = 29, eg_full = 0;
 
@@ -1169,7 +1173,7 @@ static uint64_t eg_index(const uint8_t *b, int k) {
 static uint64_t eg_pow(uint64_t b, int e) { uint64_t r = 1; while (e--) r *= b; return r; }
 
 static int eg_alloc(int k) {                                  /* under eg_lock */
-    if (eg_dense[k] || eg_klo[k]) return 0;
+    if (eg_dense[k] || eg_klo[k] || eg_w32[k]) return 0;
     if (k >= 8) {
         uint64_t size = eg_pow((uint64_t)(17 - k), 16 - k);
         float *t = (float *)malloc(size * sizeof(float));
@@ -1178,7 +1182,15 @@ static int eg_alloc(int k) {                                  /* under eg_lock *
         eg_dense[k] = t;
         return 0;
     }
-    uint64_t cap = (uint64_t)1 << (k == 7 ? eg_bits - 2 : eg_bits);
+    /* 5 locked: 2^eg_bits slots; 6: at most 2^31; 7: two bits fewer, at most 2^27 (it never needed more) */
+    int bits = k == 5 ? eg_bits : k == 6 ? (eg_bits < 31 ? eg_bits : 31) : (eg_bits - 2 < 27 ? eg_bits - 2 : 27);
+    uint64_t cap = (uint64_t)1 << bits;
+    if (bits >= 31) {
+        uint32_t *w = (uint32_t *)calloc(cap, 4);
+        if (!w) { eg_full = 1; return -1; }
+        eg_cap[k] = cap; eg_wbits[k] = bits; eg_w32[k] = w;
+        return 0;
+    }
     uint32_t *klo = (uint32_t *)malloc(cap * 4);
     uint8_t *khi = (uint8_t *)malloc(cap);
     uint16_t *val = (uint16_t *)malloc(cap * 2);
@@ -1194,6 +1206,37 @@ static inline uint64_t eg_slot(int k, uint64_t key) {
     uint32_t lo = (uint32_t)key; uint8_t hi = (uint8_t)(key >> 32);
     while (eg_khi[k][i] != 0xFF && !(eg_klo[k][i] == lo && eg_khi[k][i] == hi)) i = (i + 1) & m;
     return i;
+}
+
+static inline uint64_t eg_mix40(uint64_t x) {             /* a bijection on 40 bits */
+    const uint64_t M = ((uint64_t)1 << 40) - 1;
+    x = (x * 0x9E3779B97F4A7C15ULL) & M; x ^= x >> 20;
+    x = (x * 0xC2B2AE3D27D4EB4FULL) & M; x ^= x >> 20;
+    return x;
+}
+
+/* 4-byte map: word = 1 | off (bits-25 bits, at most 8) | q (40-bits bits) | value (16 bits), from the top.
+ * Returns the slot holding key, or the empty slot where it goes, or UINT64_MAX if it would sit too far. */
+static inline uint64_t eg_w32_slot(int k, uint64_t key, int *found) {
+    int bits = eg_wbits[k], qbits = 40 - bits, obits = 31 - 16 - qbits;
+    if (obits > 8) obits = 8;
+    uint64_t h = eg_mix40(key), m = eg_cap[k] - 1, home = h & m, q = h >> bits;
+    for (uint64_t off = 0; off < ((uint64_t)1 << obits); off++) {
+        uint64_t i = (home + off) & m;
+        uint32_t w = eg_w32[k][i];
+        if (!w) { *found = 0; return i; }
+        if (((w >> 16) & (((uint32_t)1 << qbits) - 1)) == q && ((w >> (16 + qbits)) & (((uint32_t)1 << obits) - 1)) == off) {
+            *found = 1; return i;
+        }
+    }
+    *found = 0;
+    return UINT64_MAX;
+}
+
+static inline uint32_t eg_w32_word(int k, uint64_t key, uint64_t slot, uint16_t v) {
+    int bits = eg_wbits[k], qbits = 40 - bits;
+    uint64_t h = eg_mix40(key), m = eg_cap[k] - 1, off = (slot - (h & m)) & m, q = h >> bits;
+    return (uint32_t)1 << 31 | (uint32_t)(off << (16 + qbits)) | (uint32_t)(q << 16) | v;
 }
 
 static float eg_value(const uint8_t *b, int k);
@@ -1229,7 +1272,10 @@ static float eg_value(const uint8_t *b, int k) {
     uint64_t idx = eg_index(b, k), slot = 0;
     if (eg_alloc(k) != 0) return 0.0f;
     if (eg_dense[k]) { if (eg_dense[k][idx] >= 0.0f) return eg_dense[k][idx]; }
-    else {
+    else if (eg_w32[k]) {
+        int found; uint64_t i = eg_w32_slot(k, idx, &found);
+        if (found) return (float)(eg_w32[k][i] & 0xFFFF) * (1.0f / 65535.0f);
+    } else {
         slot = eg_slot(k, idx);
         if (eg_khi[k][slot] != 0xFF) return (float)eg_val[k][slot] * (1.0f / 65535.0f);
     }
@@ -1248,7 +1294,16 @@ static float eg_value(const uint8_t *b, int k) {
         if (fits) { float w = eg_value(b, k + 1); if (w > best) best = w; }
     }
     if (eg_dense[k]) eg_dense[k][idx] = best;
-    else if (eg_used[k] * 10 < eg_cap[k] * 8) {
+    else if (eg_w32[k]) {
+        int found; uint64_t i = eg_w32_slot(k, idx, &found);    /* again: the map may have changed in the recursion */
+        uint16_t q16 = (uint16_t)(best * 65535.0f + 0.5f);
+        if (i != UINT64_MAX && !found && eg_used[k] * 10 < eg_cap[k] * 8) {
+            eg_w32[k][i] = eg_w32_word(k, idx, i, q16);
+            eg_used[k]++;
+            best = (float)q16 * (1.0f / 65535.0f);
+        } else if (found) best = (float)(eg_w32[k][i] & 0xFFFF) * (1.0f / 65535.0f);
+        else eg_full = 1;
+    } else if (eg_used[k] * 10 < eg_cap[k] * 8) {
         slot = eg_slot(k, idx);                                 /* the map may have changed during the recursion */
         eg_klo[k][slot] = (uint32_t)idx; eg_khi[k][slot] = (uint8_t)(idx >> 32);
         eg_val[k][slot] = (uint16_t)(best * 65535.0f + 0.5f);

@@ -1460,6 +1460,55 @@ void nt_reach(void *p, const uint64_t *starts_lohi, long n, int k, int depth, in
     free(starts);
 }
 
+/* From each start board, play to the end with the network's settings (search depth, downgrading, endgame tables):
+ * the largest tile reached, the points scored from the start and the moves. For measuring the end of the game
+ * many times from late boards instead of whole games. Game i draws its tiles from game_seed(seed, i). */
+typedef struct {
+    net_t *net;
+    int depth;
+    long *next, n;
+    uint64_t seed;
+    const board_t *starts;
+    int32_t *maxtile, *moves;
+    int64_t *score;
+} from_job_t;
+
+static void *from_worker(void *arg) {
+    from_job_t *j = (from_job_t *)arg;
+    search_ctx_t *c = ctx_create(j->net, 0.0);
+    for (;;) {
+        long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
+        if (g >= j->n) break;
+        uint64_t rng = game_seed(j->seed, g);
+        board_t b = j->starts[g];
+        int64_t sc = 0;
+        int32_t mv = 0;
+        for (;;) {
+            int d = best_move(c, b, j->depth);
+            if (d < 0) break;
+            int r;
+            b = spawn(do_move(b, d, &r), &rng);
+            sc += r;
+            mv++;
+        }
+        j->maxtile[g] = max_exp(b) ? 1 << max_exp(b) : 0;
+        j->score[g] = sc;
+        j->moves[g] = mv;
+    }
+    ctx_free(c);
+    return NULL;
+}
+
+void nt_play_boards(void *p, const uint64_t *starts_lohi, long n, int depth, int threads, uint64_t seed,
+                    int32_t *maxtile, int64_t *score, int32_t *moves) {
+    net_t *net = (net_t *)p;
+    long nn = n, next = 0;
+    board_t *starts = unpack_boards(starts_lohi, &nn);
+    from_job_t job = {net, depth, &next, nn, seed, starts, maxtile, moves, score};
+    run_workers(from_worker, &job, threads);
+    free(starts);
+}
+
 /* Use tables built in advance (notes/tb/build2.c, layout 2): <dir>/k<k>.u16 for k = kmin .. 15, 2-byte values,
  * with the tile on the j-th free snake cell capped at 2^(n - drops[j]) (the last drop repeats; never below 4, never
  * above n) in tables with at most kcap locked tiles; larger k uncapped. Maps the files read-only. Returns 0, or -1

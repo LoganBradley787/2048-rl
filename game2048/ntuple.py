@@ -232,6 +232,7 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_load.argtypes, L.nt_endgame_load.restype = [ctypes.c_char_p, i32, P(i32), i32, i32], i32
     L.nt_endgame_loaded.restype = i32
     L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, i32, u64, P(i32), P(i32)]
+    L.nt_play_boards.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, u64, P(i32), P(ctypes.c_int64), P(i32)]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
     L.nt_expected_target.argtypes, L.nt_expected_target.restype = [vp, u64, u64], f32
     L.nt_set_expect.argtypes = [vp, i32]
@@ -797,6 +798,16 @@ class NTupleNet:
         reached, moves = (ctypes.c_int32 * max(1, n))(), (ctypes.c_int32 * max(1, n))()
         self._lib.nt_reach(self._h, packed, n, int(k), int(depth), threads, seed & 0xFFFFFFFFFFFFFFFF, reached, moves)
         return {"reached": np.ctypeslib.as_array(reached)[:n].copy(), "moves": np.ctypeslib.as_array(moves)[:n].copy()}
+
+    def play_boards(self, starts, depth: int = 0, threads: int = 1, seed: int = 0) -> dict:
+        """From each start board (bitboards or an (n, 4, 4) grid array), play to the end with
+        this network's settings (search depth, downgrading, endgame tables). Returns per game
+        `max_tile`, `score` (points from the start board on) and `moves`."""
+        packed, n = starts if isinstance(starts, tuple) else pack_starts(starts)
+        tile, moves = (ctypes.c_int32 * max(1, n))(), (ctypes.c_int32 * max(1, n))()
+        score = (ctypes.c_int64 * max(1, n))()
+        self._lib.nt_play_boards(self._h, packed, n, int(depth), threads, seed & 0xFFFFFFFFFFFFFFFF, tile, score, moves)
+        return {k: np.ctypeslib.as_array(v)[:n].copy() for k, v in (("max_tile", tile), ("score", score), ("moves", moves))}
 
     def play_trace(self, game: int, depth: int = 1, cutoff: float = 0.0, seed: int = 0,
                    max_boards: int = 200_000) -> dict:

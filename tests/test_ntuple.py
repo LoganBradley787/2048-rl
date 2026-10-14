@@ -1561,3 +1561,19 @@ def test_endgame_tables_built_in_advance_match_the_solver(tmp_path):
     assert (out / "caps.txt").read_text().split() == ["12", "0,1,2,3,3,4,4,5,5,5,5", "6", "2"]
     r = subprocess.run([sys.executable, "-c", _PREBUILT_CHECK, str(out)], capture_output=True, text=True, cwd=root)
     assert r.stdout.strip() == "ok", r.stdout + r.stderr
+
+
+def test_play_boards_from_start_boards():
+    """play_boards plays each start board to the end: the same games whatever the thread count,
+    nothing from a board with no move, and a fresh board plays a whole game."""
+    net = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)
+    dead = np.array([[1, 2, 1, 2], [2, 1, 2, 1], [1, 2, 1, 2], [2, 1, 2, 1]], dtype=np.uint8)
+    start = np.zeros((4, 4), dtype=np.uint8); start[0, 0] = 1; start[3, 3] = 2
+    boards = np.stack([dead, start, start, start])
+    a = net.play_boards(boards, depth=0, threads=1, seed=5)
+    b = net.play_boards(boards, depth=0, threads=3, seed=5)
+    for k in ("max_tile", "score", "moves"):
+        assert (a[k] == b[k]).all()
+    assert a["moves"][0] == 0 and a["score"][0] == 0 and a["max_tile"][0] == 4
+    assert (a["moves"][1:] > 20).all() and (a["max_tile"][1:] >= 16).all()
+    assert len(set(a["score"][1:].tolist())) > 1                 # each game draws its own tiles

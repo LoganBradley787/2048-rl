@@ -4,8 +4,8 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-14, 10:55. Run 24 is training on Colab; the totals
-below do not include runs 24 and 25 yet.
+Last updated 2026-10-14, 12:05. Run 26 is training on Colab; the totals
+below do not include runs 24 to 26 yet.
 
 ## Totals so far
 
@@ -304,7 +304,7 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   faster temporal coherence training, results unchanged) are in the code. The
   pilot changed nothing measurable over 1,000 games, and was not kept.
 
-### 24. Stage 2 with the expected-value target (from 13 October, Colab, running)
+### 24. Stage 2 with the expected-value target (13 to 14 October, Colab)
 
 - **What:** run 20's weights (stage 2 before its temporal coherence phase),
   trained further toward the average over every tile that can appear instead
@@ -312,7 +312,14 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   hand-over boards. Budget 70B moves.
 - **On:** one Colab high-RAM CPU machine (8 vCPUs). About 1.2M moves a second:
   this target costs about five times as much per move.
-- **Started:** 19:20 on 13 October.
+- **Time:** 19:20 on 13 October to 11:53 on 14 October, 15.9 hours.
+  8.56M games, 70.1B moves.
+- **Outcome:** training games, counted from the hand-over, averaged about
+  222,000 at the end and reached a 32768 in 31%, against about 156,000 and
+  15% at the end of run 20 (the same weights trained on with the usual
+  target) and 241,000 and 36% after run 22's temporal coherence phase. It gets
+  its own temporal coherence phase next (run 26) before it is played against
+  the v2 player.
 
 ### 25. Stage 3, for boards holding a 32768 and a 16384 (13 to 14 October, Colab)
 
@@ -339,3 +346,12 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
 - Evaluations (playing games with finished weights, with or without search)
   are not counted here, nor is collecting boards for a later stage.
 - The test suite trains small throwaway tables for seconds at a time.
+
+### 26. Temporal coherence phase for run 24 (from 14 October, Colab, running)
+
+- **What:** run 24's weights, continued with temporal coherence learning and
+  the expected-value target for 7B moves (a tenth of run 24), from the same
+  hand-over boards. Then joined to the finished stage 1 and played over 1,000
+  games at depth 2 with tile downgrading, the same test that gave v2 565,703.
+- **On:** one Colab high-RAM CPU machine (8 vCPUs).
+- **Started:** 12:00 on 14 October.

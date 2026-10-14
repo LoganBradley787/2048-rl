@@ -1382,6 +1382,19 @@ def test_endgame_move_is_found_in_every_orientation():
     n.close()
 
 
+def test_endgame_tables_also_serve_the_game_after_a_65536():
+    """A 65536 in the corner with 16384, 8192, ... after it is played as if the corner held a 32768."""
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    n.endgame = 15
+    g = _snake_board(15, {12: 1})
+    g[0] = 16
+    bits = nt.to_bits(g.reshape(4, 4))
+    d = n.best_move(bits, depth=1)
+    after, reward = nt.move(bits, d)
+    assert reward == 4 and nt.from_bits(after)[0, 0] == 16
+    n.close()
+
+
 def test_endgame_play_is_unchanged_where_no_board_qualifies():
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
     n.train(200, threads=1, seed=1, alpha_plain=0.1)

@@ -1314,7 +1314,10 @@ static float eg_value(const uint8_t *b, int k) {
 }
 
 /* The table's move for this board, or -1 when no orientation of it is a table position with kmin or more locked
- * tiles and a chance above zero. Works on the board as it is (before any downgrading). */
+ * tiles and a chance above zero. Works on the board as it is (before any downgrading).
+ * The corner tile only has to be the largest: a 65536 there with 16384, 8192, ... after it plays exactly like a
+ * 32768 there (locked tiles never move or merge in the table), so the same tables serve the game after the first
+ * 65536, where winning means making the 32768 beside it. */
 static int eg_choose(board_t board, int kmin) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
@@ -1322,6 +1325,9 @@ static int eg_choose(board_t board, int kmin) {
     for (int s = 0; s < 8; s++) {
         uint8_t o[16];                                          /* the board turned or mirrored */
         for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
+        const int corner = o[EG_SNAKE[0]];
+        if (corner < 15) continue;
+        o[EG_SNAKE[0]] = 15;                                    /* see above: only its being the largest matters */
         int k = 0;
         while (k < 15 && o[EG_SNAKE[k]] == 15 - k) k++;
         if (k < kmin || k < EG_MIN) continue;
@@ -1335,6 +1341,8 @@ static int eg_choose(board_t board, int kmin) {
             uint8_t a[16], t[16];
             for (int i = 0; i < 16; i++) a[i] = (uint8_t)cell(after, i);
             for (int i = 0; i < 16; i++) t[i] = a[sym_cell(i, s)];
+            if (t[EG_SNAKE[0]] != corner) continue;             /* the corner moved: not an allowed move */
+            t[EG_SNAKE[0]] = 15;
             int ok2 = 1;                                        /* the same tests as eg_try, on the turned afterstate */
             for (int i = 0; i < k - 1 && ok2; i++) if (t[EG_SNAKE[i]] != 15 - i) ok2 = 0;
             if (!ok2) continue;

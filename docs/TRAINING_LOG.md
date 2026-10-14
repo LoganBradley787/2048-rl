@@ -345,7 +345,7 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   hand-over boards. Then joined to the finished stage 1 and played over 1,000
   games at depth 2 with tile downgrading, the same test that gave v2 565,703.
 - **On:** one Colab high-RAM CPU machine (8 vCPUs).
-- **Started:** 12:00 on 14 October.
+- **Started:** 12:29 on 14 October (after uploading its 3.3 GB of inputs).
 
 ## Not training
 

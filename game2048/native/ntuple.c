@@ -1313,6 +1313,29 @@ static float eg_value(const uint8_t *b, int k) {
     return best;
 }
 
+/* Whether a board, turned by symmetry s, is a table position: returns k (locked tiles, at least kmin) or 0, and
+ * fills o with the turned board, its corner set to 32768 (see eg_choose) and *corner with the real corner. */
+static int eg_orient(const uint8_t *c, int s, int kmin, uint8_t *o, int *corner) {
+    for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
+    *corner = o[EG_SNAKE[0]];
+    if (*corner < 15) return 0;
+    o[EG_SNAKE[0]] = 15;
+    int k = 0;
+    while (k < 15 && o[EG_SNAKE[k]] == 15 - k) k++;
+    if (k < kmin || k < EG_MIN) return 0;
+    for (int i = k; i < 16; i++) if (o[EG_SNAKE[i]] > 16 - k) return 0;
+    return k;
+}
+
+/* The largest k (at least kmin) for which some orientation of the board is a table position, or 0. */
+static int eg_position(board_t board, int kmin) {
+    uint8_t c[16], o[16];
+    int corner, best = 0;
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
+    for (int s = 0; s < 8; s++) { int k = eg_orient(c, s, kmin, o, &corner); if (k > best) best = k; }
+    return best;
+}
+
 /* The table's move for this board, or -1 when no orientation of it is a table position with kmin or more locked
  * tiles and a chance above zero. Works on the board as it is (before any downgrading).
  * The corner tile only has to be the largest: a 65536 there with 16384, 8192, ... after it plays exactly like a
@@ -1324,16 +1347,8 @@ static int eg_choose(board_t board, int kmin) {
     int best_dir = -1; float best_v = 0.0f;
     for (int s = 0; s < 8; s++) {
         uint8_t o[16];                                          /* the board turned or mirrored */
-        for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
-        const int corner = o[EG_SNAKE[0]];
-        if (corner < 15) continue;
-        o[EG_SNAKE[0]] = 15;                                    /* see above: only its being the largest matters */
-        int k = 0;
-        while (k < 15 && o[EG_SNAKE[k]] == 15 - k) k++;
-        if (k < kmin || k < EG_MIN) continue;
-        int ok = 1;
-        for (int i = k; i < 16; i++) if (o[EG_SNAKE[i]] > 16 - k) ok = 0;
-        if (!ok) continue;
+        int corner, k = eg_orient(c, s, kmin, o, &corner);
+        if (!k) continue;
         for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
             int r;
             board_t after = do_move(board, d, &r);
@@ -1360,6 +1375,58 @@ static int eg_choose(board_t board, int kmin) {
         }
     }
     return best_dir;
+}
+
+/* From each start board, play until the board is a table position with k or more locked tiles (reached = 1) or
+ * the game is lost (0), with the network's settings (search depth, downgrading; tables are not used). For
+ * measuring how often a player gets to the tables. Game i draws its tiles from game_seed(seed, i). */
+static int best_move(search_ctx_t *c, board_t b, int depth);
+
+typedef struct {
+    net_t *net;
+    int depth, k;
+    long *next, n;
+    uint64_t seed;
+    const board_t *starts;
+    int32_t *reached, *moves;
+} reach_job_t;
+
+static void *reach_worker(void *arg) {
+    reach_job_t *j = (reach_job_t *)arg;
+    search_ctx_t *c = ctx_create(j->net, 0.0);
+    for (;;) {
+        long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
+        if (g >= j->n) break;
+        uint64_t rng = game_seed(j->seed, g);
+        board_t b = j->starts[g];
+        int32_t mv = 0, got = 0;
+        for (;;) {
+            if (eg_position(b, j->k)) { got = 1; break; }
+            int d = best_move(c, b, j->depth);
+            if (d < 0) break;
+            int r;
+            b = spawn(do_move(b, d, &r), &rng);
+            mv++;
+        }
+        j->reached[g] = got;
+        j->moves[g] = mv;
+    }
+    ctx_free(c);
+    return NULL;
+}
+
+void nt_reach(void *p, const uint64_t *starts_lohi, long n, int k, int depth, int threads, uint64_t seed,
+              int32_t *reached, int32_t *moves) {
+    net_t *net = (net_t *)p;
+    long nn = n;
+    board_t *starts = unpack_boards(starts_lohi, &nn);
+    int keep = net->endgame;
+    net->endgame = 0;                                       /* the point is to see how the network gets there */
+    long next = 0;
+    reach_job_t job = {net, depth, k, &next, nn, seed, starts, reached, moves};
+    run_workers(reach_worker, &job, threads);
+    net->endgame = keep;
+    free(starts);
 }
 
 /* Size of the maps for tables with 5 to 7 locked tiles, as a power of two (call before the first use). */
@@ -1394,7 +1461,9 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         /* Only when the downgraded board belongs to the same stage: a stage made for boards with a 32768
          * and a 16384 must see them as they are, or it would never be asked. */
         board_t lower = downgrade(b);
-        if (stage_of(lower, c->net->bounds, c->net->n_bounds) == stage_of(b, c->net->bounds, c->net->n_bounds)) b = lower;
+        /* A tile above 32768 is beyond what any stage trained on: downgrade it whatever stage that gives. */
+        if (max_exp(b) > 15 || stage_of(lower, c->net->bounds, c->net->n_bounds) == stage_of(b, c->net->bounds, c->net->n_bounds))
+            b = lower;
     }
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;

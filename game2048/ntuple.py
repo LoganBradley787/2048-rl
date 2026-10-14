@@ -229,6 +229,7 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_full.restype = i32
     L.nt_endgame_used.argtypes, L.nt_endgame_used.restype = [i32], u64
     L.nt_endgame_value.argtypes, L.nt_endgame_value.restype = [u64, u64, i32], f32
+    L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, i32, u64, P(i32), P(i32)]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
     L.nt_expected_target.argtypes, L.nt_expected_target.restype = [vp, u64, u64], f32
     L.nt_set_expect.argtypes = [vp, i32]
@@ -767,6 +768,15 @@ class NTupleNet:
         self._lib.nt_play_from(self._h, games, int(first), int(depth), float(cutoff), threads,
                                seed & 0xFFFFFFFFFFFFFFFF, scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
+
+    def reach(self, starts, k: int = 6, depth: int = 0, threads: int = 1, seed: int = 0) -> dict:
+        """From each start board (bitboards or an (n, 4, 4) grid array), play until the board
+        is an endgame-table position with k or more locked tiles or the game is lost, with
+        this network's search settings (tables off). Returns `reached` (0/1) and `moves`."""
+        packed, n = starts if isinstance(starts, tuple) else pack_starts(starts)
+        reached, moves = (ctypes.c_int32 * max(1, n))(), (ctypes.c_int32 * max(1, n))()
+        self._lib.nt_reach(self._h, packed, n, int(k), int(depth), threads, seed & 0xFFFFFFFFFFFFFFFF, reached, moves)
+        return {"reached": np.ctypeslib.as_array(reached)[:n].copy(), "moves": np.ctypeslib.as_array(moves)[:n].copy()}
 
     def play_trace(self, game: int, depth: int = 1, cutoff: float = 0.0, seed: int = 0,
                    max_boards: int = 200_000) -> dict:

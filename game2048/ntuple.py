@@ -201,7 +201,7 @@ def lib() -> ctypes.CDLL:
     L.nt_update.argtypes = [vp, u64, u64, f32, f32, f32]
     L.nt_train.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(i64), P(i32), P(i32)]
     L.nt_train_from.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(u64), ctypes.c_long, P(i64), P(i32), P(i32)]
-    L.nt_collect.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, i32, P(ctypes.c_uint8), P(i64)]
+    L.nt_collect.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, i64, P(ctypes.c_uint8), P(i64)]
     L.nt_stack.argtypes, L.nt_stack.restype = [P(vp), i32, P(i64)], vp
     L.nt_best_move.argtypes, L.nt_best_move.restype = [vp, u64, u64, i32, f64], i32
     L.nt_search_value.argtypes, L.nt_search_value.restype = [vp, u64, u64, i32, f64], f64
@@ -223,6 +223,12 @@ def lib() -> ctypes.CDLL:
     L.nt_set_leaf_snake.argtypes = [vp, f64]
     L.nt_downgrade.argtypes = [u64, u64, P(u64), P(u64)]
     L.nt_set_downgrade.argtypes = [vp, i32]
+    L.nt_set_endgame.argtypes = [vp, i32]
+    L.nt_get_endgame.argtypes, L.nt_get_endgame.restype = [vp], i32
+    L.nt_endgame_bits.argtypes = [i32]
+    L.nt_endgame_full.restype = i32
+    L.nt_endgame_used.argtypes, L.nt_endgame_used.restype = [i32], u64
+    L.nt_endgame_value.argtypes, L.nt_endgame_value.restype = [u64, u64, i32], f32
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
     L.nt_expected_target.argtypes, L.nt_expected_target.restype = [vp, u64, u64], f32
     L.nt_set_expect.argtypes = [vp, i32]
@@ -287,6 +293,12 @@ def spawn(bits: int, seed: int) -> int:
     lo, hi = ctypes.c_uint64(0), ctypes.c_uint64(0)
     lib().nt_spawn(*_lohi(bits), ctypes.byref(state), ctypes.byref(lo), ctypes.byref(hi))
     return lo.value | (hi.value << 64)
+
+
+def endgame_value(bits: int, k: int) -> float:
+    """The endgame table's chance of winning for a board with k tiles locked on the
+    snake as it stands (not turned), or -1 if it is not such a position."""
+    return float(lib().nt_endgame_value(*_lohi(bits), int(k)))
 
 
 def downgrade(bits: int) -> int:
@@ -546,13 +558,14 @@ class NTupleNet:
     def collect_starts(self, games: int, tile: int = 16384, depth: int = 0, cutoff: float = 0.0,
                        threads: int = 1, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
         """Play `games` games and keep from each the first board that holds `tile`
-        or larger. Returns (grids, scores): (n, 4, 4) uint8 exponent grids for
-        `save_starts`, and the points each game had at that board. Games that end
-        before reaching the tile are left out."""
+        or larger. `tile` is read as a stage boundary is (see `stage_of`): 16384 is
+        a 16384 or larger, 49152 a 32768 and a 16384, or larger. Returns (grids,
+        scores): (n, 4, 4) uint8 exponent grids for `save_starts`, and the points
+        each game had at that board. Games that end before it are left out."""
         cells = np.zeros((games, 16), dtype=np.uint8)
         scores = (ctypes.c_int64 * games)()
         self._lib.nt_collect(self._h, games, int(depth), float(cutoff), threads, seed & 0xFFFFFFFFFFFFFFFF,
-                             int(tile).bit_length() - 1, cells.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), scores)
+                             int(tile), cells.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), scores)
         reached = cells.any(axis=1)
         return cells[reached].reshape(-1, 4, 4), np.ctypeslib.as_array(scores).copy()[reached]
 
@@ -589,6 +602,18 @@ class NTupleNet:
     @downgrade.setter
     def downgrade(self, tile: int) -> None:
         self._lib.nt_set_downgrade(self._h, int(tile).bit_length() - 1 if tile else 0)
+
+    @property
+    def endgame(self) -> int:
+        """Exact endgame tables choose the move once this many tiles, 32768 down, lie
+        locked along a snake (in any orientation); 0 = off. The tables are exact for
+        that formation and shared by every network in the process; they fill as
+        positions are reached and take gigabytes for 5 or 6 locked tiles."""
+        return int(self._lib.nt_get_endgame(self._h))
+
+    @endgame.setter
+    def endgame(self, k: int) -> None:
+        self._lib.nt_set_endgame(self._h, int(k))
 
     @property
     def expect_target(self) -> bool:

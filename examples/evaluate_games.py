@@ -29,7 +29,7 @@ import numpy as np
 from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
-SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps"]
+SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame"]
 
 
 def weights_md5(path: Path) -> str:
@@ -53,7 +53,7 @@ def summarize(paths: list[Path]) -> dict:
     settings, games = None, {}
     for p in paths:
         s = json.loads(p.with_suffix(".json").read_text())
-        s = {k: s[k] for k in SETTINGS}
+        s = {k: s.get(k) for k in SETTINGS}
         if settings is not None and s != settings:
             raise SystemExit(f"{p} was played with different settings: {s} against {settings}")
         settings = s
@@ -91,6 +91,10 @@ def main(argv=None) -> None:
     p.add_argument("--downgrade", type=int, default=0, help="tile (e.g. 32768) from which the search uses the downgraded board")
     p.add_argument("--tt-bits", type=int, default=0, help="transposition table of 2**n entries per game in play; 0 = default")
     p.add_argument("--depth-caps", default="", help="deepest search by number of empty cells, e.g. 5,5,5,5,4,4,4,4,3")
+    p.add_argument("--endgame", type=int, default=0,
+                   help="exact endgame tables choose the move once this many tiles (32768 down) lie on a snake; 0 = off")
+    p.add_argument("--endgame-bits", type=int, default=29,
+                   help="memo size for the 5- to 7-tile tables, as a power of two (7 bytes a slot: 29 is 3.8 GB)")
     p.add_argument("--trace-dir", default=None,
                    help="keep every game's history here, one game_<n>.npz each: `boards` (the board before each "
                         "move, then the final one, as exponents) and `dirs` (0 up, 1 right, 2 down, 3 left, -1 at the end)")
@@ -105,7 +109,7 @@ def main(argv=None) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     caps = [int(x) for x in args.depth_caps.split(",") if x.strip()]
     settings = {"weights_md5": weights_md5(path), "depth": args.depth, "seed": args.seed, "cutoff": args.cutoff,
-                "downgrade": args.downgrade, "depth_caps": caps, "weights": str(path), "games": args.games}
+                "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None, "weights": str(path), "games": args.games}
     meta = out.with_suffix(".json")
     if meta.exists():
         old = json.loads(meta.read_text())
@@ -125,6 +129,9 @@ def main(argv=None) -> None:
 
     net = nt.NTupleNet.load(path, keep_tc=False)
     net.downgrade = args.downgrade
+    if args.endgame:
+        nt.lib().nt_endgame_bits(args.endgame_bits)
+        net.endgame = args.endgame
     net.depth_caps = caps
     if args.tt_bits:
         net.tt_bits = args.tt_bits

@@ -20,7 +20,9 @@ from game2048 import ntuple as nt
 def main(argv=None) -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default=None, help="defaults to checkpoints/ntuple/weights.bin or latest.bin")
-    p.add_argument("--tile", type=int, default=16384)
+    p.add_argument("--tile", type=int, default=16384,
+                   help="what the board must hold, as a stage boundary: 16384, or 49152 for a 32768 and a 16384")
+    p.add_argument("--downgrade", type=int, default=0, help="play with tile downgrading from this tile (e.g. 32768)")
     p.add_argument("--boards", type=int, default=200_000, help="stop once this many are collected")
     p.add_argument("--depth", type=int, default=0, help="search depth of the games played (0 = no search, as in training)")
     p.add_argument("--chunk", type=int, default=20_000, help="games per native call")
@@ -30,6 +32,7 @@ def main(argv=None) -> None:
     args = p.parse_args(argv)
 
     net = nt.NTupleNet.load(nt.resolve_weights(args.weights), keep_tc=False)
+    net.downgrade = args.downgrade
     kept, points, games, t0 = [], [], 0, time.time()
     while sum(len(k) for k in kept) < args.boards:
         grids, scores = net.collect_starts(args.chunk, tile=args.tile, depth=args.depth, threads=args.threads,

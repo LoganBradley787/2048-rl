@@ -1059,6 +1059,17 @@ def test_train_choose_can_start_games_from_saved_boards():
     a.close(); b.close(); c.close()
 
 
+def test_collect_starts_reads_the_tile_as_a_stage_boundary():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(300, threads=1, seed=1, alpha_plain=0.1)
+    one, _ = n.collect_starts(40, tile=64, depth=0, threads=2, seed=5)
+    both, _ = n.collect_starts(40, tile=96, depth=0, threads=2, seed=5)       # a 64 and a 32
+    assert len(one) and all(g.max() == 6 for g in one)
+    assert len(both) and all(g.max() == 6 and (g == 5).any() for g in both)
+    assert not all((g == 5).any() for g in one)        # the first board with a 64 need not hold a 32
+    n.close()
+
+
 def test_harvest_starts_collects_boards_past_a_mass_threshold(tmp_path):
     n = nt.NTupleNet()
     n.train_choose(games=100, threads=2, seed=6, max_moves=100_000)
@@ -1264,6 +1275,106 @@ def test_downgrade_keeps_every_merge_possible_and_no_other():
             moved, down_moved = nt.move(b, direction)[0], nt.move(d, direction)[0]
             assert (moved == b) == (down_moved == d)
             assert (nt.from_bits(moved) == 0).tolist() == (nt.from_bits(down_moved) == 0).tolist()
+
+
+def test_downgrading_never_takes_a_board_out_of_its_stage():
+    """A stage that starts at a 32768 and a 16384 is asked about those boards as they are;
+    below that boundary the downgraded board is searched as before."""
+    pats = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]]
+    nets = [nt.NTupleNet(patterns=pats, tc=False) for _ in range(3)]
+    for i, n in enumerate(nets):
+        n.train(200, threads=1, seed=i, alpha_plain=0.1)
+    three = nt.NTupleNet.stack(nets, [16384, 49152])
+    rng = np.random.default_rng(13)
+    def board(tiles):
+        g = rand_exps(rng, density=0.6, max_exp=9).ravel()
+        g[: len(tiles)] = tiles
+        return nt.to_bits(g.reshape(4, 4))
+    alone = [board([15]) for _ in range(30)]           # 32768 and no 16384: downgrading stays in the middle stage
+    pair = [board([15, 14]) for _ in range(30)]        # 32768 and 16384, no 8192: downgrading would leave the last stage
+    plain = [three.best_move(b, depth=1) for b in alone + pair]
+    three.downgrade = 32768
+    assert [three.best_move(b, depth=1) for b in pair] == plain[30:]
+    with_dg = [three.best_move(b, depth=1) for b in alone]
+    three.downgrade = 0
+    assert with_dg == [three.best_move(nt.downgrade(b), depth=1) for b in alone]
+    for n in nets + [three]:
+        n.close()
+
+
+SNAKE = [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12]
+
+
+def _snake_board(k, play):
+    """k tiles from 32768 down on the snake, `play` a dict cell -> exponent for the rest."""
+    g = np.zeros(16, dtype=np.uint8)
+    for i in range(k):
+        g[SNAKE[i]] = 15 - i
+    for c, v in play.items():
+        g[c] = v
+    return g
+
+
+def _ref_endgame(g, k, memo):
+    """Plain Python version of the engine's endgame rule, for the few-cell tables."""
+    n = 16 - k
+    key = (bytes(g), k)
+    if key in memo:
+        return memo[key]
+    best = 0.0
+    for d in range(4):
+        moved, _ = nt.move(nt.to_bits(g.reshape(4, 4)), d)
+        a = nt.from_bits(moved).ravel().copy()
+        if (a == g).all() or any(a[SNAKE[i]] != 15 - i for i in range(k - 1)):
+            continue
+        if a[SNAKE[k - 1]] == n + 1:
+            best = 1.0
+            break
+        if a[SNAKE[k - 1]] != n or any(a[SNAKE[i]] > n for i in range(k, 16)):
+            continue
+        empty = [c for c in range(16) if a[c] == 0]
+        total = 0.0
+        for c in empty:
+            for v, p in ((1, 0.9), (2, 0.1)):
+                if v > n:
+                    continue
+                a[c] = v
+                total += p * _ref_endgame(a.copy(), k, memo)
+                a[c] = 0
+        best = max(best, total / len(empty) if empty else 0.0)
+    if k < 15 and g[SNAKE[k]] == n - 1 and all(g[SNAKE[i]] <= n - 1 for i in range(k + 1, 16)):
+        best = max(best, _ref_endgame(g, k + 1, memo))
+    memo[key] = best
+    return best
+
+
+def test_endgame_tables_match_a_plain_python_solution():
+    # one cell in play: a 2 next to the last locked 2 merges into it and wins
+    assert nt.endgame_value(nt.to_bits(_snake_board(15, {12: 1}).reshape(4, 4)), 15) == 1.0
+    assert nt.endgame_value(nt.to_bits(_snake_board(15, {12: 2}).reshape(4, 4)), 15) == -1.0   # a 4 is not in play
+    assert nt.endgame_value(nt.to_bits(_snake_board(14, {}).reshape(4, 4)), 15) == -1.0        # not 15 locked
+    rng = np.random.default_rng(14)
+    memo = {}
+    for k in (13, 12):
+        cells = SNAKE[k:]
+        for _ in range(12):
+            g = _snake_board(k, {c: int(rng.integers(0, 16 - k + 1)) for c in cells})
+            if not (g == 0).any():
+                continue
+            want = _ref_endgame(g, k, memo)
+            got = nt.endgame_value(nt.to_bits(g.reshape(4, 4)), k)
+            assert got == pytest.approx(want, abs=1e-6)
+
+
+def test_endgame_play_is_unchanged_where_no_board_qualifies():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(200, threads=1, seed=1, alpha_plain=0.1)
+    plain = n.play(4, depth=1, threads=2, seed=5)
+    n.endgame = 6
+    assert n.endgame == 6
+    with_tables = n.play(4, depth=1, threads=2, seed=5)
+    assert (plain["scores"] == with_tables["scores"]).all()       # these games never come near a 32768
+    n.close()
 
 
 def test_search_plays_the_downgraded_board_once_the_threshold_tile_is_there():

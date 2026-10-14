@@ -224,6 +224,7 @@ typedef struct net {
     double snake_decay;      /* weight ratio between consecutive cells on the snake path */
     double snake_w[16];      /* snake_decay^k */
     int downgrade;           /* exponent of the tile that switches tile downgrading on at the search root (0 = off) */
+    int endgame;             /* exact endgame tables choose the move from this many locked tiles on (0 = off) */
     int expect;              /* training target: 0 = the tile that appeared, 1 = the average over every tile that could */
     int tt_bits;             /* transposition table size for searches on this network */
     int depth_cap[17];       /* random-spawn search: deepest search for a root with this many empty cells (0 = no cap) */
@@ -1107,8 +1108,228 @@ void nt_get_depth_caps(void *p, int *out) {
     for (int i = 0; i < 17; i++) out[i] = ((net_t *)p)->depth_cap[i];
 }
 
+/* ------------------------------------------------------------- endgame --- */
+
+/* Exact tables for the end of the game, used to choose the move once a board qualifies.
+ *
+ * A board qualifies with k locked tiles when, in one of its eight orientations, 32768, 16384, ... down to
+ * 32768 >> (k-1) sit one each on the first k cells of the snake (0 1 2 3, 7 6 5 4, 8 9 10 11, 15 14 13 12) and
+ * every other tile is at most the last of them. The n = 16 - k other cells are in play. A move is allowed if
+ * it leaves the locked cells as they are and makes no tile in play larger than the last locked one; merging a
+ * tile into the last locked one wins (the ladder then merges upward, counted as certain); a tile of half the
+ * last locked one on the next snake cell may be taken as locked too (the better of the two is used).
+ * Value = chance of winning with the best allowed move each turn, solved by recursion with a memo (every move
+ * adds a tile, so there are no cycles). Restricting the moves makes it a floor on perfect play.
+ *
+ * The memo is shared by every network and thread, filled on demand under one lock. Tables with 8 or more
+ * locked tiles are arrays of every position; larger ones keep only the positions reached, 7 bytes each (the
+ * index in 40 bits, the value in 16: steps of 1/65535), in maps of 2^EG_BITS slots (2^(EG_BITS-2) for 7 locked).
+ * Values are what the memo returns, so play is the same whatever order positions were first reached in. */
+#define EG_MIN 5
+static const int EG_SNAKE[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12};
+static pthread_mutex_t eg_lock = PTHREAD_MUTEX_INITIALIZER;
+static float *eg_dense[16];
+static uint32_t *eg_klo[16]; static uint8_t *eg_khi[16]; static uint16_t *eg_val[16];
+static uint64_t eg_cap[16], eg_used[16];
+static int eg_bits = 29, eg_full = 0;
+
+static int eg_slide(uint8_t *l) {
+    uint8_t t[4]; int n = 0, changed = 0;
+    for (int i = 0; i < 4; i++) if (l[i]) t[n++] = l[i];
+    uint8_t o[4] = {0, 0, 0, 0}; int m = 0;
+    for (int i = 0; i < n;) {
+        if (i + 1 < n && t[i] == t[i + 1]) { o[m++] = (uint8_t)(t[i] + 1); i += 2; }
+        else o[m++] = t[i++];
+    }
+    for (int i = 0; i < 4; i++) { if (l[i] != o[i]) changed = 1; l[i] = o[i]; }
+    return changed;
+}
+
+/* dir: 0 up, 1 right, 2 down, 3 left, as do_move */
+static int eg_move(const uint8_t *b, int dir, uint8_t *out) {
+    int changed = 0;
+    memcpy(out, b, 16);
+    for (int i = 0; i < 4; i++) {
+        uint8_t l[4]; int c[4];
+        for (int j = 0; j < 4; j++)
+            c[j] = dir == 0 ? 4 * j + i : dir == 2 ? 4 * (3 - j) + i : dir == 3 ? 4 * i + j : 4 * i + (3 - j);
+        for (int j = 0; j < 4; j++) l[j] = b[c[j]];
+        changed |= eg_slide(l);
+        for (int j = 0; j < 4; j++) out[c[j]] = l[j];
+    }
+    return changed;
+}
+
+static uint64_t eg_index(const uint8_t *b, int k) {
+    int n = 16 - k; uint64_t idx = 0;
+    for (int i = 15; i >= k; i--) idx = idx * (uint64_t)(n + 1) + b[EG_SNAKE[i]];
+    return idx;
+}
+
+static uint64_t eg_pow(uint64_t b, int e) { uint64_t r = 1; while (e--) r *= b; return r; }
+
+static int eg_alloc(int k) {                                  /* under eg_lock */
+    if (eg_dense[k] || eg_klo[k]) return 0;
+    if (k >= 8) {
+        uint64_t size = eg_pow((uint64_t)(17 - k), 16 - k);
+        float *t = (float *)malloc(size * sizeof(float));
+        if (!t) return -1;
+        for (uint64_t i = 0; i < size; i++) t[i] = -1.0f;
+        eg_dense[k] = t;
+        return 0;
+    }
+    eg_cap[k] = (uint64_t)1 << (k == 7 ? eg_bits - 2 : eg_bits);
+    eg_klo[k] = (uint32_t *)malloc(eg_cap[k] * 4);
+    eg_khi[k] = (uint8_t *)malloc(eg_cap[k]);
+    eg_val[k] = (uint16_t *)malloc(eg_cap[k] * 2);
+    if (!eg_klo[k] || !eg_khi[k] || !eg_val[k]) return -1;
+    memset(eg_khi[k], 0xFF, eg_cap[k]);                       /* an index never has 0xFF in its top byte */
+    return 0;
+}
+
+static inline uint64_t eg_slot(int k, uint64_t key) {
+    uint64_t x = key; x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+    uint64_t m = eg_cap[k] - 1, i = x & m;
+    uint32_t lo = (uint32_t)key; uint8_t hi = (uint8_t)(key >> 32);
+    while (eg_khi[k][i] != 0xFF && !(eg_klo[k][i] == lo && eg_khi[k][i] == hi)) i = (i + 1) & m;
+    return i;
+}
+
+static float eg_value(const uint8_t *b, int k);
+
+/* the expected value of an afterstate in table k, over the tile that comes next */
+static float eg_after(uint8_t *a, int k) {
+    int n = 16 - k, empty = 0;
+    double sum = 0.0;
+    for (int c = 0; c < 16; c++) {
+        if (a[c]) continue;
+        empty++;
+        a[c] = 1; sum += 0.9 * eg_value(a, k);
+        a[c] = 2; sum += n >= 2 ? 0.1 * eg_value(a, k) : 0.0;      /* a 4 cannot be in play with one cell: lost */
+        a[c] = 0;
+    }
+    return empty ? (float)(sum / empty) : 0.0f;
+}
+
+/* -1: the move is not allowed; 2: it wins; else 0 and *a holds the afterstate */
+static int eg_try(const uint8_t *b, int k, int d, uint8_t *a) {
+    int n = 16 - k;
+    if (!eg_move(b, d, a)) return -1;
+    for (int i = 0; i < k - 1; i++) if (a[EG_SNAKE[i]] != 15 - i) return -1;
+    if (a[EG_SNAKE[k - 1]] == n + 1) return 2;                  /* merged into the last locked tile */
+    if (a[EG_SNAKE[k - 1]] != n) return -1;
+    for (int i = k; i < 16; i++) if (a[EG_SNAKE[i]] > n) return -1;
+    return 0;
+}
+
+static float eg_value(const uint8_t *b, int k) {
+    int n = 16 - k;
+    if (k >= 16) return 1.0f;
+    uint64_t idx = eg_index(b, k), slot = 0;
+    if (eg_alloc(k) != 0) return 0.0f;
+    if (eg_dense[k]) { if (eg_dense[k][idx] >= 0.0f) return eg_dense[k][idx]; }
+    else {
+        slot = eg_slot(k, idx);
+        if (eg_khi[k][slot] != 0xFF) return (float)eg_val[k][slot] * (1.0f / 65535.0f);
+    }
+    float best = 0.0f;
+    for (int d = 0; d < 4; d++) {
+        uint8_t a[16];
+        int r = eg_try(b, k, d, a);
+        if (r < 0) continue;
+        if (r == 2) { best = 1.0f; break; }
+        float v = eg_after(a, k);
+        if (v > best) best = v;
+    }
+    if (k < 15 && b[EG_SNAKE[k]] == n - 1) {                   /* the next tile of the ladder is in place: lock it */
+        int fits = 1;
+        for (int i = k + 1; i < 16; i++) if (b[EG_SNAKE[i]] > n - 1) fits = 0;
+        if (fits) { float w = eg_value(b, k + 1); if (w > best) best = w; }
+    }
+    if (eg_dense[k]) eg_dense[k][idx] = best;
+    else if (eg_used[k] * 10 < eg_cap[k] * 8) {
+        slot = eg_slot(k, idx);                                 /* the map may have changed during the recursion */
+        eg_klo[k][slot] = (uint32_t)idx; eg_khi[k][slot] = (uint8_t)(idx >> 32);
+        eg_val[k][slot] = (uint16_t)(best * 65535.0f + 0.5f);
+        eg_used[k]++;
+        best = (float)eg_val[k][slot] * (1.0f / 65535.0f);
+    } else eg_full = 1;
+    return best;
+}
+
+/* The table's move for this board, or -1 when no orientation of it is a table position with kmin or more locked
+ * tiles and a chance above zero. Works on the board as it is (before any downgrading). */
+static int eg_choose(board_t board, int kmin) {
+    uint8_t c[16];
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
+    int best_dir = -1; float best_v = 0.0f;
+    for (int s = 0; s < 8; s++) {
+        uint8_t o[16];                                          /* the board turned or mirrored */
+        for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
+        int k = 0;
+        while (k < 15 && o[EG_SNAKE[k]] == 15 - k) k++;
+        if (k < kmin || k < EG_MIN) continue;
+        int ok = 1;
+        for (int i = k; i < 16; i++) if (o[EG_SNAKE[i]] > 16 - k) ok = 0;
+        if (!ok) continue;
+        for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
+            int r;
+            board_t after = do_move(board, d, &r);
+            if (after == board) continue;
+            uint8_t a[16], t[16];
+            for (int i = 0; i < 16; i++) a[i] = (uint8_t)cell(after, i);
+            for (int i = 0; i < 16; i++) t[i] = a[sym_cell(i, s)];
+            int ok2 = 1;                                        /* the same tests as eg_try, on the turned afterstate */
+            for (int i = 0; i < k - 1 && ok2; i++) if (t[EG_SNAKE[i]] != 15 - i) ok2 = 0;
+            if (!ok2) continue;
+            float v;
+            if (t[EG_SNAKE[k - 1]] == 17 - k) v = 1.0f;
+            else {
+                if (t[EG_SNAKE[k - 1]] != 16 - k) continue;
+                for (int i = k; i < 16 && ok2; i++) if (t[EG_SNAKE[i]] > 16 - k) ok2 = 0;
+                if (!ok2) continue;
+                pthread_mutex_lock(&eg_lock);
+                v = eg_after(t, k);
+                pthread_mutex_unlock(&eg_lock);
+            }
+            if (v > best_v) { best_v = v; best_dir = d; }
+        }
+    }
+    return best_dir;
+}
+
+/* Size of the maps for tables with 5 to 7 locked tiles, as a power of two (call before the first use). */
+void nt_endgame_bits(int bits) { if (bits >= 16 && bits <= 34) eg_bits = bits; }
+void nt_set_endgame(void *p, int kmin) { ((net_t *)p)->endgame = kmin < 0 ? 0 : kmin; }
+int nt_get_endgame(void *p) { return ((net_t *)p)->endgame; }
+int nt_endgame_full(void) { return eg_full; }
+uint64_t nt_endgame_used(int k) { return k >= 0 && k < 16 ? eg_used[k] : 0; }
+/* The table's chance of winning for a board already turned onto the snake, or -1 if it is not a position of
+ * table k. For tests. */
+float nt_endgame_value(uint64_t lo, uint64_t hi, int k) {
+    board_t b = mk(lo, hi);
+    uint8_t c[16];
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
+    if (k < EG_MIN || k > 15) return -1.0f;
+    for (int i = 0; i < k; i++) if (c[EG_SNAKE[i]] != 15 - i) return -1.0f;
+    for (int i = k; i < 16; i++) if (c[EG_SNAKE[i]] > 16 - k) return -1.0f;
+    pthread_mutex_lock(&eg_lock);
+    float v = eg_value(c, k);
+    pthread_mutex_unlock(&eg_lock);
+    return v;
+}
+
 static int best_move(search_ctx_t *c, board_t b, int depth) {
-    if (c->net->downgrade && max_exp(b) >= c->net->downgrade) b = downgrade(b);
+    if (c->net->endgame) {                                     /* an exact table, when the board is one of its positions */
+        int d = eg_choose(b, c->net->endgame);
+        if (d >= 0) return d;
+    }
+    if (c->net->downgrade && max_exp(b) >= c->net->downgrade) {
+        /* Only when the downgraded board belongs to the same stage: a stage made for boards with a 32768
+         * and a 16384 must see them as they are, or it would never be asked. */
+        board_t lower = downgrade(b);
+        if (stage_of(lower, c->net->bounds, c->net->n_bounds) == stage_of(b, c->net->bounds, c->net->n_bounds)) b = lower;
+    }
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;
     int best = -1;
@@ -1229,7 +1450,8 @@ void nt_play(void *p, long games, int depth, double cutoff, int threads, uint64_
  * leaves its cells at zero. */
 typedef struct {
     net_t *net;
-    int depth, exp;
+    int depth;
+    int64_t scale;
     double cutoff;
     long *next, n;
     uint64_t seed;
@@ -1246,14 +1468,14 @@ static void *collect_worker(void *arg) {
         uint64_t rng = game_seed(j->seed, g);
         board_t b = spawn(spawn(0, &rng), &rng);
         int64_t sc = 0;
-        while (max_exp(b) < j->exp) {
+        while (board_scale(b) < j->scale) {
             int d = best_move(c, b, j->depth);
             if (d < 0) break;
             int r;
             b = spawn(do_move(b, d, &r), &rng);
             sc += r;
         }
-        if (max_exp(b) >= j->exp)
+        if (board_scale(b) >= j->scale)
             for (int i = 0; i < 16; i++) j->cells[16 * g + i] = (uint8_t)cell(b, i);
         j->scores[g] = sc;
     }
@@ -1261,11 +1483,13 @@ static void *collect_worker(void *arg) {
     return NULL;
 }
 
-void nt_collect(void *p, long games, int depth, double cutoff, int threads, uint64_t seed, int exp,
+/* `scale` is a threshold on the tiles a board holds, as for stage boundaries (see board_scale): 16384 keeps
+ * the first board with a 16384 or larger, 49152 the first with a 32768 and a 16384, or larger. */
+void nt_collect(void *p, long games, int depth, double cutoff, int threads, uint64_t seed, int64_t scale,
                 uint8_t *cells, int64_t *scores) {
     long next = 0;
     memset(cells, 0, (size_t)games * 16);
-    collect_job_t job = {(net_t *)p, depth, exp, cutoff, &next, games, seed, cells, scores};
+    collect_job_t job = {(net_t *)p, depth, scale, cutoff, &next, games, seed, cells, scores};
     run_workers(collect_worker, &job, threads);
 }
 

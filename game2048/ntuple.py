@@ -229,6 +229,8 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_full.restype = i32
     L.nt_endgame_used.argtypes, L.nt_endgame_used.restype = [i32], u64
     L.nt_endgame_value.argtypes, L.nt_endgame_value.restype = [u64, u64, i32], f32
+    L.nt_endgame_load.argtypes, L.nt_endgame_load.restype = [ctypes.c_char_p, i32, P(i32), i32, i32], i32
+    L.nt_endgame_loaded.restype = i32
     L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, i32, u64, P(i32), P(i32)]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
     L.nt_expected_target.argtypes, L.nt_expected_target.restype = [vp, u64, u64], f32
@@ -300,6 +302,24 @@ def endgame_value(bits: int, k: int) -> float:
     """The endgame table's chance of winning for a board with k tiles locked on the
     snake as it stands (not turned), or -1 if it is not such a position."""
     return float(lib().nt_endgame_value(*_lohi(bits), int(k)))
+
+
+def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = None, kcap: int | None = None) -> int:
+    """Use endgame tables built in advance: <directory>/k<k>.u16 for k = kmin .. 15. kmin,
+    the caps (drops) and the largest capped table (kcap) are read from <directory>/caps.txt
+    ("kmin d0,d1,... kcap 2") unless given. Once per process. Returns the lowest table loaded. Call before any play."""
+    from pathlib import Path
+    d = Path(directory)
+    words = (d / "caps.txt").read_text().split() if None in (kmin, drops, kcap) else []
+    if words and (len(words) < 4 or words[3] != "2"):
+        raise ValueError(f"{d / 'caps.txt'} should read 'kmin d0,d1,... kcap 2' (layout 2, notes/tb/build2.c)")
+    kmin = int(words[0]) if kmin is None else kmin
+    drops = [int(x) for x in words[1].split(",") if x] if drops is None else drops
+    kcap = (int(words[2]) if len(words) > 2 else 15) if kcap is None else kcap
+    arr = (ctypes.c_int32 * 16)(*drops)
+    if lib().nt_endgame_load(str(d).encode(), int(kmin), arr, len(drops), int(kcap)) != 0:
+        raise ValueError(f"no tables for {kmin} locked and up in {d} with caps {drops}")
+    return int(kmin)
 
 
 def downgrade(bits: int) -> int:

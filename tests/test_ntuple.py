@@ -1519,3 +1519,45 @@ def test_training_on_the_expected_target_learns_and_is_off_by_default():
     assert c["scores"][-100:].mean() > 1.4 * c["scores"][:20].mean() # and it learns
     for n in (plain, again, expect):
         n.close()
+
+
+_PREBUILT_CHECK = r"""
+import sys
+import numpy as np
+from game2048 import ntuple as nt
+SNAKE = [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12]
+rng = np.random.default_rng(0)
+boards = []
+for k in range(12, 16):
+    for _ in range(300):
+        g = np.zeros(16, dtype=np.uint8)
+        for i in range(k):
+            g[SNAKE[i]] = 15 - i
+        for i in range(k, 16):
+            g[SNAKE[i]] = 0 if rng.random() < 0.3 else rng.integers(1, 16 - k + 1)
+        boards.append((nt.to_bits(g.reshape(4, 4)), k))
+before = [nt.endgame_value(b, k) for b, k in boards]          # solved on demand
+assert nt.load_endgame(sys.argv[1]) == 12
+after = [nt.endgame_value(b, k) for b, k in boards]           # read from the files
+assert all((x < 0) == (y < 0) for x, y in zip(before, after))
+assert max(abs(x - y) for x, y in zip(before, after)) < 1e-4
+assert sum(x > 0 for x in after) > 100
+with __import__("pytest").raises(ValueError):
+    nt.load_endgame(sys.argv[1])                               # once per process
+print("ok")
+"""
+
+
+def test_endgame_tables_built_in_advance_match_the_solver(tmp_path):
+    """Tables from examples/build_endgame.py (12 to 15 locked: exact, no caps) give the
+    values the engine solves on demand. Run in a fresh process: loading is once per process."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    out = tmp_path / "tables"
+    subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--kmin", "12", "--threads", "2",
+                    "--out", str(out)], check=True, capture_output=True)
+    assert (out / "caps.txt").read_text().split() == ["12", "0,1,2,3,3,4,4,5,5,5,5", "6", "2"]
+    r = subprocess.run([sys.executable, "-c", _PREBUILT_CHECK, str(out)], capture_output=True, text=True, cwd=root)
+    assert r.stdout.strip() == "ok", r.stdout + r.stderr

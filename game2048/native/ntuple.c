@@ -1136,6 +1136,26 @@ static uint32_t *eg_klo[16]; static uint8_t *eg_khi[16]; static uint16_t *eg_val
 static uint32_t *eg_w32[16]; static int eg_wbits[16];
 static uint64_t eg_cap[16], eg_used[16];
 static int eg_bits = 29, eg_full = 0;
+/* Tables built whole in advance (nt_endgame_load): every position of a capped space, 2 bytes each, mapped read-only
+ * from files; no lock needed. The tile on the j-th free snake cell of table k is at most 2^eg_tcap[k][j] (n = 16 - k
+ * without caps); a board that does not fit is not a position of that table and a move that breaks a cap is not
+ * allowed. Index (layout 2 of notes/tb/build2.c): positions sorted by the sum of the tiles in play (in units of 2),
+then by rank within the sum, the first free cell most significant: offs[s] + the sum over cells of eg_rank[k][j]
+at (sum left, tile), the number of ways to fill the later cells with what is left when cell j holds less. */
+static uint16_t *eg_pre[16];
+static uint64_t *eg_offs[16], *eg_rank[16][16], eg_psize[16];
+static int eg_tcap[16][16];
+
+static inline int eg_units(int e) { return e ? 1 << (e - 1) : 0; }
+
+static inline int eg_fits(const uint8_t *b, int k) {
+    for (int j = 0; j < 16 - k; j++) if (b[EG_SNAKE[k + j]] > eg_tcap[k][j]) return 0;
+    return 1;
+}
+
+static void eg_caps_init(void) { for (int k = 0; k < 16; k++) for (int j = 0; j < 16; j++) eg_tcap[k][j] = 16 - k; }
+static pthread_once_t eg_caps_once = PTHREAD_ONCE_INIT;
+static void eg_caps_default(void) { pthread_once(&eg_caps_once, eg_caps_init); }   /* no caps: tiles in play up to n */
 
 static int eg_slide(uint8_t *l) {
     uint8_t t[4]; int n = 0, changed = 0;
@@ -1262,13 +1282,24 @@ static int eg_try(const uint8_t *b, int k, int d, uint8_t *a) {
     for (int i = 0; i < k - 1; i++) if (a[EG_SNAKE[i]] != 15 - i) return -1;
     if (a[EG_SNAKE[k - 1]] == n + 1) return 2;                  /* merged into the last locked tile */
     if (a[EG_SNAKE[k - 1]] != n) return -1;
-    for (int i = k; i < 16; i++) if (a[EG_SNAKE[i]] > n) return -1;
+    if (!eg_fits(a, k)) return -1;
     return 0;
 }
 
 static float eg_value(const uint8_t *b, int k) {
     int n = 16 - k;
     if (k >= 16) return 1.0f;
+    if (eg_pre[k]) {
+        int r = 0;
+        for (int j = 0; j < n; j++) r += eg_units(b[EG_SNAKE[k + j]]);
+        uint64_t q = eg_offs[k][r];
+        for (int j = 0; j < n; j++) {
+            int v = b[EG_SNAKE[k + j]];
+            q += eg_rank[k][j][(size_t)r * (eg_tcap[k][j] + 1) + v];
+            r -= eg_units(v);
+        }
+        return (float)eg_pre[k][q] * (1.0f / 65535.0f);
+    }
     uint64_t idx = eg_index(b, k), slot = 0;
     if (eg_alloc(k) != 0) return 0.0f;
     if (eg_dense[k]) { if (eg_dense[k][idx] >= 0.0f) return eg_dense[k][idx]; }
@@ -1289,9 +1320,7 @@ static float eg_value(const uint8_t *b, int k) {
         if (v > best) best = v;
     }
     if (k < 15 && b[EG_SNAKE[k]] == n - 1) {                   /* the next tile of the ladder is in place: lock it */
-        int fits = 1;
-        for (int i = k + 1; i < 16; i++) if (b[EG_SNAKE[i]] > n - 1) fits = 0;
-        if (fits) { float w = eg_value(b, k + 1); if (w > best) best = w; }
+        if (eg_fits(b, k + 1)) { float w = eg_value(b, k + 1); if (w > best) best = w; }
     }
     if (eg_dense[k]) eg_dense[k][idx] = best;
     else if (eg_w32[k]) {
@@ -1323,7 +1352,8 @@ static int eg_orient(const uint8_t *c, int s, int kmin, uint8_t *o, int *corner)
     int k = 0;
     while (k < 15 && o[EG_SNAKE[k]] == 15 - k) k++;
     if (k < kmin || k < EG_MIN) return 0;
-    for (int i = k; i < 16; i++) if (o[EG_SNAKE[i]] > 16 - k) return 0;
+    eg_caps_default();
+    if (!eg_fits(o, k)) return 0;
     return k;
 }
 
@@ -1364,12 +1394,13 @@ static int eg_choose(board_t board, int kmin) {
             float v;
             if (t[EG_SNAKE[k - 1]] == 17 - k) v = 1.0f;
             else {
-                if (t[EG_SNAKE[k - 1]] != 16 - k) continue;
-                for (int i = k; i < 16 && ok2; i++) if (t[EG_SNAKE[i]] > 16 - k) ok2 = 0;
-                if (!ok2) continue;
-                pthread_mutex_lock(&eg_lock);
-                v = eg_after(t, k);
-                pthread_mutex_unlock(&eg_lock);
+                if (t[EG_SNAKE[k - 1]] != 16 - k || !eg_fits(t, k)) continue;
+                if (eg_pre[k]) v = eg_after(t, k);              /* read-only: no lock */
+                else {
+                    pthread_mutex_lock(&eg_lock);
+                    v = eg_after(t, k);
+                    pthread_mutex_unlock(&eg_lock);
+                }
             }
             if (v > best_v) { best_v = v; best_dir = d; }
         }
@@ -1429,6 +1460,84 @@ void nt_reach(void *p, const uint64_t *starts_lohi, long n, int k, int depth, in
     free(starts);
 }
 
+/* Use tables built in advance (notes/tb/build2.c, layout 2): <dir>/k<k>.u16 for k = kmin .. 15, 2-byte values,
+ * with the tile on the j-th free snake cell capped at 2^(n - drops[j]) (the last drop repeats; never below 4, never
+ * above n) in tables with at most kcap locked tiles; larger k uncapped. Maps the files read-only. Returns 0, or -1
+ * (nothing changed) if a file is missing or the wrong size. Call once, before any play; tables below kmin stay on
+ * demand (and step into these ones). */
+int nt_endgame_loaded(void);
+int nt_endgame_load(const char *dir, int kmin, const int *drops, int ndrops, int kcap) {
+    if (kmin < EG_MIN || kmin > 15 || ndrops < 0 || ndrops > 16 || nt_endgame_loaded()) return -1;
+    eg_caps_default();
+    int caps[16][16];
+    uint64_t *offs[16] = {0}, *rank[16][16] = {{0}}, size[16];
+    uint16_t *maps[16] = {0};
+    int ok = 1;
+    for (int k = kmin; k <= 15 && ok; k++) {
+        int n = 16 - k, S = 0;
+        for (int j = 0; j < n; j++) {
+            int d = ndrops && k <= kcap ? drops[j < ndrops ? j : ndrops - 1] : 0, c = n - d;
+            if (c < 2) c = 2;
+            if (c > n) c = n;
+            caps[k][j] = c; S += eg_units(c);
+        }
+        uint64_t *cnt = (uint64_t *)calloc((size_t)(n + 1) * (S + 1), sizeof(uint64_t));   /* cells j.. with r units */
+        offs[k] = (uint64_t *)malloc((size_t)(S + 2) * sizeof(uint64_t));
+        if (!cnt || !offs[k]) { free(cnt); ok = 0; break; }
+        cnt[(size_t)n * (S + 1)] = 1;
+        for (int j = n - 1; j >= 0; j--)
+            for (int r = 0; r <= S; r++) {
+                uint64_t t = 0;
+                for (int e = 0; e <= caps[k][j] && eg_units(e) <= r; e++) t += cnt[(size_t)(j + 1) * (S + 1) + r - eg_units(e)];
+                cnt[(size_t)j * (S + 1) + r] = t;
+            }
+        offs[k][0] = 0;
+        for (int r = 0; r <= S; r++) offs[k][r + 1] = offs[k][r] + cnt[r];
+        size[k] = offs[k][S + 1];
+        for (int j = 0; j < n && ok; j++) {
+            int C = caps[k][j] + 1;
+            rank[k][j] = (uint64_t *)malloc((size_t)(S + 1) * C * sizeof(uint64_t));
+            if (!rank[k][j]) { ok = 0; break; }
+            for (int r = 0; r <= S; r++) {
+                uint64_t acc = 0;
+                for (int v = 0; v < C; v++) {
+                    rank[k][j][(size_t)r * C + v] = acc;
+                    if (eg_units(v) <= r) acc += cnt[(size_t)(j + 1) * (S + 1) + r - eg_units(v)];
+                }
+            }
+        }
+        free(cnt);
+        if (!ok) break;
+        char path[4096];
+        snprintf(path, sizeof path, "%s/k%d.u16", dir, k);
+        FILE *f = fopen(path, "rb");
+        void *m = MAP_FAILED;
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            if ((uint64_t)ftell(f) == size[k] * 2) m = mmap(NULL, size[k] * 2, PROT_READ, MAP_SHARED, fileno(f), 0);
+            fclose(f);
+        }
+        if (m == MAP_FAILED) { ok = 0; break; }
+        madvise(m, size[k] * 2, MADV_RANDOM);
+        maps[k] = (uint16_t *)m;
+    }
+    if (!ok) {
+        for (int k = kmin; k <= 15; k++) {
+            if (maps[k]) munmap(maps[k], size[k] * 2);
+            free(offs[k]);
+            for (int j = 0; j < 16; j++) free(rank[k][j]);
+        }
+        return -1;
+    }
+    for (int k = kmin; k <= 15; k++) {
+        eg_offs[k] = offs[k]; eg_psize[k] = size[k];
+        for (int j = 0; j < 16 - k; j++) { eg_tcap[k][j] = caps[k][j]; eg_rank[k][j] = rank[k][j]; }
+    }
+    for (int k = kmin; k <= 15; k++) eg_pre[k] = maps[k];      /* last: a table is used only once all is set */
+    return 0;
+}
+int nt_endgame_loaded(void) { for (int k = EG_MIN; k <= 15; k++) if (eg_pre[k]) return k; return 0; }
+
 /* Size of the maps for tables with 5 to 7 locked tiles, as a power of two (call before the first use). */
 void nt_endgame_bits(int bits) { if (bits >= 16 && bits <= 34) eg_bits = bits; }
 void nt_set_endgame(void *p, int kmin) { ((net_t *)p)->endgame = kmin < 0 ? 0 : kmin; }
@@ -1445,7 +1554,8 @@ float nt_endgame_value(uint64_t lo, uint64_t hi, int k) {
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
     if (k < EG_MIN || k > 15) return -1.0f;
     for (int i = 0; i < k; i++) if (c[EG_SNAKE[i]] != 15 - i) return -1.0f;
-    for (int i = k; i < 16; i++) if (c[EG_SNAKE[i]] > 16 - k) return -1.0f;
+    eg_caps_default();
+    if (!eg_fits(c, k)) return -1.0f;
     pthread_mutex_lock(&eg_lock);
     float v = eg_value(c, k);
     pthread_mutex_unlock(&eg_lock);

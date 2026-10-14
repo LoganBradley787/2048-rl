@@ -4,8 +4,8 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-14, 01:30. Two runs are training on Colab (24 and 25);
-the totals below do not include them yet.
+Last updated 2026-10-14, 10:55. Run 24 is training on Colab; the totals
+below do not include runs 24 and 25 yet.
 
 ## Totals so far
 
@@ -314,7 +314,7 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   this target costs about five times as much per move.
 - **Started:** 19:20 on 13 October.
 
-### 25. Stage 3, for boards holding a 32768 and a 16384 (from 13 October, Colab, running)
+### 25. Stage 3, for boards holding a 32768 and a 16384 (13 to 14 October, Colab)
 
 - **What:** a third network, new, trained only from boards that already hold
   a 32768 and a 16384: 300,000 such boards collected from games of the v2
@@ -322,8 +322,14 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   the first two stages, since less is left to win from these boards), fixed
   learning rate. Budget 190B moves.
 - **On:** one Colab high-RAM CPU machine. About 3.9M moves a second.
-- **Started:** 19:16 on 13 October (collecting the boards took the first two
-  hours).
+- **Time:** 19:16 on 13 October to 10:00 on 14 October, about 12.6 hours of
+  training after two hours collecting the boards. 63.5M games, 190B moves.
+- **Outcome:** training games from those boards averaged about 74,000 at the
+  end, up from 47,000, and flat for the last six hours. From real boards of
+  that kind it played worse than the two-stage player does with tile
+  downgrading (which plays such boards as their twins with half the tiles), and
+  it was not kept. A network trained this way would need far more training to
+  catch up with the 78M games stage 2 already had.
 
 ## Not training
 

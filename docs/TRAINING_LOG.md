@@ -338,15 +338,6 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   it was not kept. A network trained this way would need far more training to
   catch up with the 78M games stage 2 already had.
 
-## Not training
-
-- The `snake` agent has no trained weights: it is a search with one
-  hand-written rule. Its cool-mode games, and the Lean proof that 3,932,100 is
-  the most any game can score, involve no training.
-- Evaluations (playing games with finished weights, with or without search)
-  are not counted here, nor is collecting boards for a later stage.
-- The test suite trains small throwaway tables for seconds at a time.
-
 ### 26. Temporal coherence phase for run 24 (from 14 October, Colab, running)
 
 - **What:** run 24's weights, continued with temporal coherence learning and
@@ -355,3 +346,12 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   games at depth 2 with tile downgrading, the same test that gave v2 565,703.
 - **On:** one Colab high-RAM CPU machine (8 vCPUs).
 - **Started:** 12:00 on 14 October.
+
+## Not training
+
+- The `snake` agent has no trained weights: it is a search with one
+  hand-written rule. Its cool-mode games, and the Lean proof that 3,932,100 is
+  the most any game can score, involve no training.
+- Evaluations (playing games with finished weights, with or without search)
+  are not counted here, nor is collecting boards for a later stage.
+- The test suite trains small throwaway tables for seconds at a time.

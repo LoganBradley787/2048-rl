@@ -1366,6 +1366,22 @@ def test_endgame_tables_match_a_plain_python_solution():
             assert got == pytest.approx(want, abs=1e-6)
 
 
+def test_endgame_move_is_found_in_every_orientation():
+    """Fifteen tiles locked and a 2 beside the last one: the table's move is the merge that
+    wins, whichever way the board is turned or mirrored."""
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    n.endgame = 15
+    g = _snake_board(15, {12: 1}).reshape(4, 4)
+    for flip in (False, True):
+        for r in range(4):
+            h = np.rot90(g.T if flip else g, r)
+            bits = nt.to_bits(np.ascontiguousarray(h))
+            d = n.best_move(bits, depth=1)
+            after, reward = nt.move(bits, d)
+            assert reward == 4 and (nt.from_bits(after) == 2).sum() == 2   # the two 2s became a 4 beside the locked 4
+    n.close()
+
+
 def test_endgame_play_is_unchanged_where_no_board_qualifies():
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
     n.train(200, threads=1, seed=1, alpha_plain=0.1)

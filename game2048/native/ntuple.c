@@ -1173,17 +1173,18 @@ static int eg_alloc(int k) {                                  /* under eg_lock *
     if (k >= 8) {
         uint64_t size = eg_pow((uint64_t)(17 - k), 16 - k);
         float *t = (float *)malloc(size * sizeof(float));
-        if (!t) return -1;
+        if (!t) { eg_full = 1; return -1; }
         for (uint64_t i = 0; i < size; i++) t[i] = -1.0f;
         eg_dense[k] = t;
         return 0;
     }
-    eg_cap[k] = (uint64_t)1 << (k == 7 ? eg_bits - 2 : eg_bits);
-    eg_klo[k] = (uint32_t *)malloc(eg_cap[k] * 4);
-    eg_khi[k] = (uint8_t *)malloc(eg_cap[k]);
-    eg_val[k] = (uint16_t *)malloc(eg_cap[k] * 2);
-    if (!eg_klo[k] || !eg_khi[k] || !eg_val[k]) return -1;
-    memset(eg_khi[k], 0xFF, eg_cap[k]);                       /* an index never has 0xFF in its top byte */
+    uint64_t cap = (uint64_t)1 << (k == 7 ? eg_bits - 2 : eg_bits);
+    uint32_t *klo = (uint32_t *)malloc(cap * 4);
+    uint8_t *khi = (uint8_t *)malloc(cap);
+    uint16_t *val = (uint16_t *)malloc(cap * 2);
+    if (!klo || !khi || !val) { free(klo); free(khi); free(val); eg_full = 1; return -1; }   /* all or nothing */
+    memset(khi, 0xFF, cap);                                   /* an index never has 0xFF in its top byte */
+    eg_cap[k] = cap; eg_klo[k] = klo; eg_khi[k] = khi; eg_val[k] = val;
     return 0;
 }
 
@@ -1302,6 +1303,8 @@ static int eg_choose(board_t board, int kmin) {
 void nt_endgame_bits(int bits) { if (bits >= 16 && bits <= 34) eg_bits = bits; }
 void nt_set_endgame(void *p, int kmin) { ((net_t *)p)->endgame = kmin < 0 ? 0 : kmin; }
 int nt_get_endgame(void *p) { return ((net_t *)p)->endgame; }
+/* 1 once any table ran out of room (a map at 80% or an allocation that failed): values may then be floors and play
+ * may depend on timing. Evaluations should report it. */
 int nt_endgame_full(void) { return eg_full; }
 uint64_t nt_endgame_used(int k) { return k >= 0 && k < 16 ? eg_used[k] : 0; }
 /* The table's chance of winning for a board already turned onto the snake, or -1 if it is not a position of

@@ -109,7 +109,8 @@ def main(argv=None) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     caps = [int(x) for x in args.depth_caps.split(",") if x.strip()]
     settings = {"weights_md5": weights_md5(path), "depth": args.depth, "seed": args.seed, "cutoff": args.cutoff,
-                "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None, "weights": str(path), "games": args.games}
+                "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None,
+                "endgame_bits": args.endgame_bits if args.endgame else None, "weights": str(path), "games": args.games}
     meta = out.with_suffix(".json")
     if meta.exists():
         old = json.loads(meta.read_text())
@@ -168,6 +169,11 @@ def main(argv=None) -> None:
     finally:
         f.close()
     show(summarize([out]))
+    if args.endgame:                                   # a table that ran out of room makes play slow and timing-dependent
+        L = nt.lib()
+        print("endgame tables: positions kept " + ", ".join(f"{k} locked {L.nt_endgame_used(k):,}" for k in range(5, 8))
+              + (" | RAN OUT OF ROOM: values from then on may be floors; rerun with a larger --endgame-bits"
+                 if L.nt_endgame_full() else " | never full"), flush=True)
     net.close()
 
 

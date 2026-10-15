@@ -14,8 +14,10 @@
  * (stored just after it) and table k+1: the files are written in place through a shared mapping, and no table
  * needs to fit in memory. Values: uint16, v * 65535 rounded.
  *
- * Program:  endgame_build <kmin> <d0,d1,...> <outdir> [threads] [kcap]
- *           writes <outdir>/k<k>.u16 for k = kmin .. 15 and <outdir>/caps.txt ("kmin drops kcap 2").
+ * Program:  endgame_build <kmin> <d0,d1,...> <outdir> [threads] [kcap] [path]
+ *           writes <outdir>/k<k>.u16 for k = kmin .. 15 and <outdir>/caps.txt ("kmin drops kcap 2 [path]").
+ *           path: 16 cells, comma-separated, the order the big tiles lie in (default: the snake
+ *           0,1,2,3,7,6,5,4,8,9,10,11,15,14,13,12); consecutive locked cells must be neighbours.
  * Library:  tb2_build, tb2_load, tb2_value, tb2_size (for checks).
  */
 #include <fcntl.h>
@@ -30,7 +32,8 @@
 #include <time.h>
 #include <unistd.h>
 
-static const int SNAKE[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12};
+static int SNAKE[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12};   /* the formation's cell path */
+static int PATHSET = 0;
 static int DROP[16], NDROP, KCAP = 15;
 static int CAP[16][16], MAXS[16];
 static uint64_t *OFFS[16], *PR[16][16], SIZE[16];
@@ -227,7 +230,9 @@ int tb2_build(int kmin, const int *drops, int ndrops, int kcap, const char *dir,
     FILE *f = fopen(path, "w"); if (!f) return -1;
     fprintf(f, "%d ", kmin);
     for (int j = 0; j < NDROP; j++) fprintf(f, j ? ",%d" : "%d", DROP[j]);
-    fprintf(f, " %d 2\n", KCAP);
+    fprintf(f, " %d 2", KCAP);
+    if (PATHSET) for (int i = 0; i < 16; i++) fprintf(f, i ? ",%d" : " %d", SNAKE[i]);
+    fprintf(f, "\n");
     return fclose(f) == 0 ? 0 : -1;
 }
 
@@ -257,6 +262,12 @@ int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "build2 <kmin> <d0,d1,...> <outdir> [threads] [kcap]\n"); return 2; }
     int kmin = atoi(argv[1]), drops[16], nd = 0, threads = argc > 4 ? atoi(argv[4]) : 1;
     int kcap = argc > 5 ? atoi(argv[5]) : 15;
+    if (argc > 6) {
+        int n = 0; unsigned seen = 0;
+        for (char *p = argv[6]; *p && n < 16;) { SNAKE[n] = atoi(p); seen |= 1u << (SNAKE[n] & 15); n++; while (*p && *p != ',') p++; if (*p) p++; }
+        if (n != 16 || seen != 0xFFFF) { fprintf(stderr, "path must list the 16 cells once each\n"); return 2; }
+        PATHSET = 1;
+    }
     for (char *p = argv[2]; *p && nd < 16;) { drops[nd++] = atoi(p); while (*p && *p != ',') p++; if (*p) p++; }
     if (tb2_build(kmin, drops, nd, kcap, argv[3], threads)) { fprintf(stderr, "build failed (memory or files)\n"); return 1; }
     return 0;

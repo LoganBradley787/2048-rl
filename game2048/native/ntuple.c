@@ -1126,7 +1126,13 @@ void nt_get_depth_caps(void *p, int *out) {
  * index in 40 bits, the value in 16: steps of 1/65535), in maps of 2^EG_BITS slots (2^(EG_BITS-2) for 7 locked).
  * Values are what the memo returns, so play is the same whatever order positions were first reached in. */
 #define EG_MIN 5
-static const int EG_SNAKE[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12};
+/* Formations ("families"): each is an order of cells. The k largest tiles lie on its first k cells, the next rung
+ * goes on cell k and the other cells are in play. Family 0 is the snake: the only one solved on demand. Others
+ * come only from tables built in advance (nt_endgame_load with their path). */
+#define EG_FAM 4
+static int eg_path[EG_FAM][16] = {{0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12}};
+static int eg_nfam = 1;
+#define EG_SNAKE eg_path[0]
 static pthread_mutex_t eg_lock = PTHREAD_MUTEX_INITIALIZER;
 static float *eg_dense[16];
 static uint32_t *eg_klo[16]; static uint8_t *eg_khi[16]; static uint16_t *eg_val[16];
@@ -1142,18 +1148,21 @@ static int eg_bits = 29, eg_full = 0;
  * allowed. Index (layout 2 of notes/tb/build2.c): positions sorted by the sum of the tiles in play (in units of 2),
 then by rank within the sum, the first free cell most significant: offs[s] + the sum over cells of eg_rank[k][j]
 at (sum left, tile), the number of ways to fill the later cells with what is left when cell j holds less. */
-static uint16_t *eg_pre[16];
-static uint64_t *eg_offs[16], *eg_rank[16][16], eg_psize[16];
-static int eg_tcap[16][16];
+static uint16_t *eg_pre[EG_FAM][16];
+static uint64_t *eg_offs[EG_FAM][16], *eg_rank[EG_FAM][16][16], eg_psize[EG_FAM][16];
+static int eg_tcap[EG_FAM][16][16];
 
 static inline int eg_units(int e) { return e ? 1 << (e - 1) : 0; }
 
-static inline int eg_fits(const uint8_t *b, int k) {
-    for (int j = 0; j < 16 - k; j++) if (b[EG_SNAKE[k + j]] > eg_tcap[k][j]) return 0;
+static inline int eg_fits(int f, const uint8_t *b, int k) {
+    const int *P = eg_path[f];
+    for (int j = 0; j < 16 - k; j++) if (b[P[k + j]] > eg_tcap[f][k][j]) return 0;
     return 1;
 }
 
-static void eg_caps_init(void) { for (int k = 0; k < 16; k++) for (int j = 0; j < 16; j++) eg_tcap[k][j] = 16 - k; }
+static void eg_caps_init(void) {
+    for (int f = 0; f < EG_FAM; f++) for (int k = 0; k < 16; k++) for (int j = 0; j < 16; j++) eg_tcap[f][k][j] = 16 - k;
+}
 static pthread_once_t eg_caps_once = PTHREAD_ONCE_INIT;
 static void eg_caps_default(void) { pthread_once(&eg_caps_once, eg_caps_init); }   /* no caps: tiles in play up to n */
 
@@ -1259,47 +1268,50 @@ static inline uint32_t eg_w32_word(int k, uint64_t key, uint64_t slot, uint16_t 
     return (uint32_t)1 << 31 | (uint32_t)(off << (16 + qbits)) | (uint32_t)(q << 16) | v;
 }
 
-static float eg_value(const uint8_t *b, int k);
+static float eg_value(int f, const uint8_t *b, int k);
 
 /* the expected value of an afterstate in table k, over the tile that comes next */
-static float eg_after(uint8_t *a, int k) {
+static float eg_after(int f, uint8_t *a, int k) {
     int n = 16 - k, empty = 0;
     double sum = 0.0;
     for (int c = 0; c < 16; c++) {
         if (a[c]) continue;
         empty++;
-        a[c] = 1; sum += 0.9 * eg_value(a, k);
-        a[c] = 2; sum += n >= 2 ? 0.1 * eg_value(a, k) : 0.0;      /* a 4 cannot be in play with one cell: lost */
+        a[c] = 1; sum += 0.9 * eg_value(f, a, k);
+        a[c] = 2; sum += n >= 2 ? 0.1 * eg_value(f, a, k) : 0.0;   /* a 4 cannot be in play with one cell: lost */
         a[c] = 0;
     }
     return empty ? (float)(sum / empty) : 0.0f;
 }
 
 /* -1: the move is not allowed; 2: it wins; else 0 and *a holds the afterstate */
-static int eg_try(const uint8_t *b, int k, int d, uint8_t *a) {
+static int eg_try(int f, const uint8_t *b, int k, int d, uint8_t *a) {
     int n = 16 - k;
+    const int *P = eg_path[f];
     if (!eg_move(b, d, a)) return -1;
-    for (int i = 0; i < k - 1; i++) if (a[EG_SNAKE[i]] != 15 - i) return -1;
-    if (a[EG_SNAKE[k - 1]] == n + 1) return 2;                  /* merged into the last locked tile */
-    if (a[EG_SNAKE[k - 1]] != n) return -1;
-    if (!eg_fits(a, k)) return -1;
+    for (int i = 0; i < k - 1; i++) if (a[P[i]] != 15 - i) return -1;
+    if (a[P[k - 1]] == n + 1) return 2;                          /* merged into the last locked tile */
+    if (a[P[k - 1]] != n) return -1;
+    if (!eg_fits(f, a, k)) return -1;
     return 0;
 }
 
-static float eg_value(const uint8_t *b, int k) {
+static float eg_value(int f, const uint8_t *b, int k) {
     int n = 16 - k;
     if (k >= 16) return 1.0f;
-    if (eg_pre[k]) {
+    if (eg_pre[f][k]) {
+        const int *P = eg_path[f];
         int r = 0;
-        for (int j = 0; j < n; j++) r += eg_units(b[EG_SNAKE[k + j]]);
-        uint64_t q = eg_offs[k][r];
+        for (int j = 0; j < n; j++) r += eg_units(b[P[k + j]]);
+        uint64_t q = eg_offs[f][k][r];
         for (int j = 0; j < n; j++) {
-            int v = b[EG_SNAKE[k + j]];
-            q += eg_rank[k][j][(size_t)r * (eg_tcap[k][j] + 1) + v];
+            int v = b[P[k + j]];
+            q += eg_rank[f][k][j][(size_t)r * (eg_tcap[f][k][j] + 1) + v];
             r -= eg_units(v);
         }
-        return (float)eg_pre[k][q] * (1.0f / 65535.0f);
+        return (float)eg_pre[f][k][q] * (1.0f / 65535.0f);
     }
+    if (f) return 0.0f;                                          /* only the snake is solved on demand */
     uint64_t idx = eg_index(b, k), slot = 0;
     if (eg_alloc(k) != 0) return 0.0f;
     if (eg_dense[k]) { if (eg_dense[k][idx] >= 0.0f) return eg_dense[k][idx]; }
@@ -1313,14 +1325,14 @@ static float eg_value(const uint8_t *b, int k) {
     float best = 0.0f;
     for (int d = 0; d < 4; d++) {
         uint8_t a[16];
-        int r = eg_try(b, k, d, a);
+        int r = eg_try(0, b, k, d, a);
         if (r < 0) continue;
         if (r == 2) { best = 1.0f; break; }
-        float v = eg_after(a, k);
+        float v = eg_after(0, a, k);
         if (v > best) best = v;
     }
     if (k < 15 && b[EG_SNAKE[k]] == n - 1) {                   /* the next tile of the ladder is in place: lock it */
-        if (eg_fits(b, k + 1)) { float w = eg_value(b, k + 1); if (w > best) best = w; }
+        if (eg_fits(0, b, k + 1)) { float w = eg_value(0, b, k + 1); if (w > best) best = w; }
     }
     if (eg_dense[k]) eg_dense[k][idx] = best;
     else if (eg_w32[k]) {
@@ -1344,25 +1356,31 @@ static float eg_value(const uint8_t *b, int k) {
 
 /* Whether a board, turned by symmetry s, is a table position: returns k (locked tiles, at least kmin) or 0, and
  * fills o with the turned board, its corner set to 32768 (see eg_choose) and *corner with the real corner. */
-static int eg_orient(const uint8_t *c, int s, int kmin, uint8_t *o, int *corner) {
+static int eg_orient(int f, const uint8_t *c, int s, int kmin, uint8_t *o, int *corner) {
+    const int *P = eg_path[f];
     for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
-    *corner = o[EG_SNAKE[0]];
+    *corner = o[P[0]];
     if (*corner < 15) return 0;
-    o[EG_SNAKE[0]] = 15;
+    o[P[0]] = 15;
     int k = 0;
-    while (k < 15 && o[EG_SNAKE[k]] == 15 - k) k++;
+    while (k < 15 && o[P[k]] == 15 - k) k++;
     if (k < kmin || k < EG_MIN) return 0;
+    if (f && !eg_pre[f][k]) return 0;                            /* no table for this family and k */
     eg_caps_default();
-    if (!eg_fits(o, k)) return 0;
+    if (!eg_fits(f, o, k)) return 0;
     return k;
 }
 
-/* The largest k (at least kmin) for which some orientation of the board is a table position, or 0. */
-static int eg_position(board_t board, int kmin) {
+/* The largest k (at least kmin) for which some orientation of the board is a table position of a family in
+ * fmask (bit f = family f), or 0. */
+static int eg_position(board_t board, int kmin, unsigned fmask) {
     uint8_t c[16], o[16];
     int corner, best = 0;
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
-    for (int s = 0; s < 8; s++) { int k = eg_orient(c, s, kmin, o, &corner); if (k > best) best = k; }
+    for (int f = 0; f < eg_nfam; f++) {
+        if (!((fmask >> f) & 1)) continue;
+        for (int s = 0; s < 8; s++) { int k = eg_orient(f, c, s, kmin, o, &corner); if (k > best) best = k; }
+    }
     return best;
 }
 
@@ -1375,10 +1393,12 @@ static int eg_choose(board_t board, int kmin) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
     int best_dir = -1; float best_v = 0.0f;
+    for (int f = 0; f < eg_nfam; f++)                           /* every formation with tables: the best chance */
     for (int s = 0; s < 8; s++) {
         uint8_t o[16];                                          /* the board turned or mirrored */
-        int corner, k = eg_orient(c, s, kmin, o, &corner);
+        int corner, k = eg_orient(f, c, s, kmin, o, &corner);
         if (!k) continue;
+        const int *P = eg_path[f];
         for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
             int r;
             board_t after = do_move(board, d, &r);
@@ -1386,19 +1406,19 @@ static int eg_choose(board_t board, int kmin) {
             uint8_t a[16], t[16];
             for (int i = 0; i < 16; i++) a[i] = (uint8_t)cell(after, i);
             for (int i = 0; i < 16; i++) t[i] = a[sym_cell(i, s)];
-            if (t[EG_SNAKE[0]] != corner) continue;             /* the corner moved: not an allowed move */
-            t[EG_SNAKE[0]] = 15;
+            if (t[P[0]] != corner) continue;                    /* the corner moved: not an allowed move */
+            t[P[0]] = 15;
             int ok2 = 1;                                        /* the same tests as eg_try, on the turned afterstate */
-            for (int i = 0; i < k - 1 && ok2; i++) if (t[EG_SNAKE[i]] != 15 - i) ok2 = 0;
+            for (int i = 0; i < k - 1 && ok2; i++) if (t[P[i]] != 15 - i) ok2 = 0;
             if (!ok2) continue;
             float v;
-            if (t[EG_SNAKE[k - 1]] == 17 - k) v = 1.0f;
+            if (t[P[k - 1]] == 17 - k) v = 1.0f;
             else {
-                if (t[EG_SNAKE[k - 1]] != 16 - k || !eg_fits(t, k)) continue;
-                if (eg_pre[k]) v = eg_after(t, k);              /* read-only: no lock */
+                if (t[P[k - 1]] != 16 - k || !eg_fits(f, t, k)) continue;
+                if (eg_pre[f][k]) v = eg_after(f, t, k);        /* read-only: no lock */
                 else {
                     pthread_mutex_lock(&eg_lock);
-                    v = eg_after(t, k);
+                    v = eg_after(f, t, k);
                     pthread_mutex_unlock(&eg_lock);
                 }
             }
@@ -1416,6 +1436,7 @@ static int best_move(search_ctx_t *c, board_t b, int depth);
 typedef struct {
     net_t *net;
     int depth, k;
+    unsigned fmask;
     long *next, n;
     uint64_t seed;
     const board_t *starts;
@@ -1432,7 +1453,7 @@ static void *reach_worker(void *arg) {
         board_t b = j->starts[g];
         int32_t mv = 0, got = 0;
         for (;;) {
-            if (eg_position(b, j->k)) { got = 1; break; }
+            if (eg_position(b, j->k, j->fmask)) { got = 1; break; }
             int d = best_move(c, b, j->depth);
             if (d < 0) break;
             int r;
@@ -1446,15 +1467,16 @@ static void *reach_worker(void *arg) {
     return NULL;
 }
 
-void nt_reach(void *p, const uint64_t *starts_lohi, long n, int k, int depth, int threads, uint64_t seed,
-              int32_t *reached, int32_t *moves) {
+/* fmask: which formations count (bit f = family f; family 0 = the snake, also without tables) */
+void nt_reach(void *p, const uint64_t *starts_lohi, long n, int k, unsigned fmask, int depth, int threads,
+              uint64_t seed, int32_t *reached, int32_t *moves) {
     net_t *net = (net_t *)p;
     long nn = n;
     board_t *starts = unpack_boards(starts_lohi, &nn);
     int keep = net->endgame;
     net->endgame = 0;                                       /* the point is to see how the network gets there */
     long next = 0;
-    reach_job_t job = {net, depth, k, &next, nn, seed, starts, reached, moves};
+    reach_job_t job = {net, depth, k, fmask, &next, nn, seed, starts, reached, moves};
     run_workers(reach_worker, &job, threads);
     net->endgame = keep;
     free(starts);
@@ -1509,14 +1531,25 @@ void nt_play_boards(void *p, const uint64_t *starts_lohi, long n, int depth, int
     free(starts);
 }
 
-/* Use tables built in advance (notes/tb/build2.c, layout 2): <dir>/k<k>.u16 for k = kmin .. 15, 2-byte values,
- * with the tile on the j-th free snake cell capped at 2^(n - drops[j]) (the last drop repeats; never below 4, never
- * above n) in tables with at most kcap locked tiles; larger k uncapped. Maps the files read-only. Returns 0, or -1
- * (nothing changed) if a file is missing or the wrong size. Call once, before any play; tables below kmin stay on
- * demand (and step into these ones). */
-int nt_endgame_loaded(void);
-int nt_endgame_load(const char *dir, int kmin, const int *drops, int ndrops, int kcap) {
-    if (kmin < EG_MIN || kmin > 15 || ndrops < 0 || ndrops > 16 || nt_endgame_loaded()) return -1;
+/* Use tables built in advance (endgame_build.c): <dir>/k<k>.u16 for k = kmin .. 15, 2-byte values, along the
+ * formation `path` (16 cells; NULL = the snake), with the tile on the j-th free cell of the path capped at
+ * 2^(n - drops[j]) (the last drop repeats; never below 4, never above n) in tables with at most kcap locked tiles;
+ * larger k uncapped. Maps the files read-only. The snake's tables are family 0 (below kmin they stay on demand and
+ * step into these ones); another path becomes a new family, used only where its tables exist. Returns the family,
+ * or -1 (nothing changed) if a file is missing or the wrong size, the family is already loaded or there is no room.
+ * Call before any play. */
+static int eg_family_loaded(int f) { for (int k = EG_MIN; k <= 15; k++) if (eg_pre[f][k]) return 1; return 0; }
+int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path) {
+    if (kmin < EG_MIN || kmin > 15 || ndrops < 0 || ndrops > 16) return -1;
+    int fam = 0;
+    if (path && memcmp(path, eg_path[0], sizeof eg_path[0]) != 0) {
+        for (fam = 1; fam < eg_nfam; fam++) if (memcmp(path, eg_path[fam], sizeof eg_path[0]) == 0) break;
+        if (fam == EG_FAM) return -1;
+        unsigned seen = 0;                                       /* a path must hold every cell once */
+        for (int i = 0; i < 16; i++) { if (path[i] < 0 || path[i] > 15) return -1; seen |= 1u << path[i]; }
+        if (seen != 0xFFFF) return -1;
+    }
+    if (eg_family_loaded(fam)) return -1;
     eg_caps_default();
     int caps[16][16];
     uint64_t *offs[16] = {0}, *rank[16][16] = {{0}}, size[16];
@@ -1557,14 +1590,14 @@ int nt_endgame_load(const char *dir, int kmin, const int *drops, int ndrops, int
         }
         free(cnt);
         if (!ok) break;
-        char path[4096];
-        snprintf(path, sizeof path, "%s/k%d.u16", dir, k);
-        FILE *f = fopen(path, "rb");
+        char file[4096];
+        snprintf(file, sizeof file, "%s/k%d.u16", dir, k);
+        FILE *fp = fopen(file, "rb");
         void *m = MAP_FAILED;
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            if ((uint64_t)ftell(f) == size[k] * 2) m = mmap(NULL, size[k] * 2, PROT_READ, MAP_SHARED, fileno(f), 0);
-            fclose(f);
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            if ((uint64_t)ftell(fp) == size[k] * 2) m = mmap(NULL, size[k] * 2, PROT_READ, MAP_SHARED, fileno(fp), 0);
+            fclose(fp);
         }
         if (m == MAP_FAILED) { ok = 0; break; }
         madvise(m, size[k] * 2, MADV_RANDOM);
@@ -1578,14 +1611,25 @@ int nt_endgame_load(const char *dir, int kmin, const int *drops, int ndrops, int
         }
         return -1;
     }
+    if (fam && fam == eg_nfam) { memcpy(eg_path[fam], path, sizeof eg_path[0]); eg_nfam++; }
     for (int k = kmin; k <= 15; k++) {
-        eg_offs[k] = offs[k]; eg_psize[k] = size[k];
-        for (int j = 0; j < 16 - k; j++) { eg_tcap[k][j] = caps[k][j]; eg_rank[k][j] = rank[k][j]; }
+        eg_offs[fam][k] = offs[k]; eg_psize[fam][k] = size[k];
+        for (int j = 0; j < 16 - k; j++) { eg_tcap[fam][k][j] = caps[k][j]; eg_rank[fam][k][j] = rank[k][j]; }
     }
-    for (int k = kmin; k <= 15; k++) eg_pre[k] = maps[k];      /* last: a table is used only once all is set */
+    for (int k = kmin; k <= 15; k++) eg_pre[fam][k] = maps[k]; /* last: a table is used only once all is set */
+    return fam;
+}
+int nt_endgame_load(const char *dir, int kmin, const int *drops, int ndrops, int kcap) {
+    return nt_endgame_load_path(dir, kmin, drops, ndrops, kcap, NULL) < 0 ? -1 : 0;
+}
+/* The lowest k with a table built in advance for family f, or 0. */
+int nt_endgame_loaded_family(int f) {
+    if (f < 0 || f >= eg_nfam) return 0;
+    for (int k = EG_MIN; k <= 15; k++) if (eg_pre[f][k]) return k;
     return 0;
 }
-int nt_endgame_loaded(void) { for (int k = EG_MIN; k <= 15; k++) if (eg_pre[k]) return k; return 0; }
+int nt_endgame_loaded(void) { return nt_endgame_loaded_family(0); }
+int nt_endgame_families(void) { return eg_nfam; }
 
 /* Size of the maps for tables with 5 to 7 locked tiles, as a power of two (call before the first use). */
 void nt_endgame_bits(int bits) { if (bits >= 16 && bits <= 34) eg_bits = bits; }
@@ -1595,21 +1639,22 @@ int nt_get_endgame(void *p) { return ((net_t *)p)->endgame; }
  * may depend on timing. Evaluations should report it. */
 int nt_endgame_full(void) { return eg_full; }
 uint64_t nt_endgame_used(int k) { return k >= 0 && k < 16 ? eg_used[k] : 0; }
-/* The table's chance of winning for a board already turned onto the snake, or -1 if it is not a position of
+/* Family f's chance of winning for a board already turned onto its path, or -1 if it is not a position of its
  * table k. For tests. */
-float nt_endgame_value(uint64_t lo, uint64_t hi, int k) {
+float nt_endgame_value_family(uint64_t lo, uint64_t hi, int k, int f) {
     board_t b = mk(lo, hi);
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
-    if (k < EG_MIN || k > 15) return -1.0f;
-    for (int i = 0; i < k; i++) if (c[EG_SNAKE[i]] != 15 - i) return -1.0f;
+    if (k < EG_MIN || k > 15 || f < 0 || f >= eg_nfam || (f && !eg_pre[f][k])) return -1.0f;
+    for (int i = 0; i < k; i++) if (c[eg_path[f][i]] != 15 - i) return -1.0f;
     eg_caps_default();
-    if (!eg_fits(c, k)) return -1.0f;
+    if (!eg_fits(f, c, k)) return -1.0f;
     pthread_mutex_lock(&eg_lock);
-    float v = eg_value(c, k);
+    float v = eg_value(f, c, k);
     pthread_mutex_unlock(&eg_lock);
     return v;
 }
+float nt_endgame_value(uint64_t lo, uint64_t hi, int k) { return nt_endgame_value_family(lo, hi, k, 0); }
 
 /* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
  * tile and the stage rule allows. */

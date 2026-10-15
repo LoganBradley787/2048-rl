@@ -33,6 +33,8 @@ def main() -> None:
     p.add_argument("--kmin", type=int, default=6, help="smallest table: this many locked tiles (5 to 15)")
     p.add_argument("--drops", default="0,1,2,3,3,4,4,5,5,5,5", help="caps: free cell j holds at most 2^(n - d_j)")
     p.add_argument("--kcap", type=int, default=6, help="caps apply to tables with at most this many locked tiles")
+    p.add_argument("--path", default="snake",
+                   help="formation: snake, block (32768 16384 8192 on top, 4096 2048 1024 under them), or 16 cells")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 1)
     p.add_argument("--out", required=True)
     args = p.parse_args()
@@ -41,7 +43,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         exe = Path(tmp) / "endgame_build"
         compile_builder(exe)
-        subprocess.run([str(exe), str(args.kmin), args.drops, str(out), str(args.threads), str(args.kcap)], check=True)
+        path = {"snake": None, "block": "0,1,2,6,5,4,8,9,10,11,7,3,15,14,13,12"}.get(args.path, args.path)
+        cmd = [str(exe), str(args.kmin), args.drops, str(out), str(args.threads), str(args.kcap)] + ([path] if path else [])
+        subprocess.run(cmd, check=True)
     print(f"tables in {out}: " + ", ".join(f"{f.name} {f.stat().st_size / 1e9:.2f} GB" for f in sorted(out.glob("k*.u16"))
                                        if f.stat().st_size > 1e8))
 

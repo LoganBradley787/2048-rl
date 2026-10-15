@@ -232,7 +232,12 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_value.argtypes, L.nt_endgame_value.restype = [u64, u64, i32], f32
     L.nt_endgame_load.argtypes, L.nt_endgame_load.restype = [ctypes.c_char_p, i32, P(i32), i32, i32], i32
     L.nt_endgame_loaded.restype = i32
-    L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, i32, u64, P(i32), P(i32)]
+    L.nt_endgame_load_path.argtypes = [ctypes.c_char_p, i32, P(i32), i32, i32, P(i32)]
+    L.nt_endgame_load_path.restype = i32
+    L.nt_endgame_loaded_family.argtypes, L.nt_endgame_loaded_family.restype = [i32], i32
+    L.nt_endgame_families.restype = i32
+    L.nt_endgame_value_family.argtypes, L.nt_endgame_value_family.restype = [u64, u64, i32, i32], f32
+    L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, ctypes.c_uint, i32, i32, u64, P(i32), P(i32)]
     L.nt_play_boards.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, u64, P(i32), P(ctypes.c_int64), P(i32)]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
     L.nt_expected_target.argtypes, L.nt_expected_target.restype = [vp, u64, u64], f32
@@ -300,16 +305,24 @@ def spawn(bits: int, seed: int) -> int:
     return lo.value | (hi.value << 64)
 
 
-def endgame_value(bits: int, k: int) -> float:
+SNAKE_PATH = [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12]
+# 32768 16384 8192 on the top row, 4096 2048 1024 under them right to left (a 2x3 block in the corner)
+BLOCK_PATH = [0, 1, 2, 6, 5, 4, 8, 9, 10, 11, 7, 3, 15, 14, 13, 12]
+
+
+def endgame_value(bits: int, k: int, family: int = 0) -> float:
     """The endgame table's chance of winning for a board with k tiles locked on the
-    snake as it stands (not turned), or -1 if it is not such a position."""
-    return float(lib().nt_endgame_value(*_lohi(bits), int(k)))
+    family's path (0 = the snake) as it stands (not turned), or -1 if it is not such a position."""
+    return float(lib().nt_endgame_value_family(*_lohi(bits), int(k), int(family)))
 
 
-def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = None, kcap: int | None = None) -> int:
+def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = None, kcap: int | None = None,
+                 path: list[int] | None = None) -> int:
     """Use endgame tables built in advance: <directory>/k<k>.u16 for k = kmin .. 15. kmin,
-    the caps (drops) and the largest capped table (kcap) are read from <directory>/caps.txt
-    ("kmin d0,d1,... kcap 2") unless given. Once per process. Returns the lowest table loaded. Call before any play."""
+    the caps (drops), the largest capped table (kcap) and the formation's cell path are read
+    from <directory>/caps.txt ("kmin d0,d1,... kcap 2 [path]"; no path = the snake) unless given.
+    Each formation once per process; several formations can be loaded and play takes the best.
+    Returns the lowest table loaded. Call before any play."""
     from pathlib import Path
     d = Path(directory)
     words = (d / "caps.txt").read_text().split() if None in (kmin, drops, kcap) else []
@@ -318,9 +331,12 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
     kmin = int(words[0]) if kmin is None else kmin
     drops = [int(x) for x in words[1].split(",") if x] if drops is None else drops
     kcap = (int(words[2]) if len(words) > 2 else 15) if kcap is None else kcap
+    if path is None and len(words) > 4:
+        path = [int(x) for x in words[4].split(",")]
     arr = (ctypes.c_int32 * 16)(*drops)
-    if lib().nt_endgame_load(str(d).encode(), int(kmin), arr, len(drops), int(kcap)) != 0:
-        raise ValueError(f"no tables for {kmin} locked and up in {d} with caps {drops}")
+    p = (ctypes.c_int32 * 16)(*path) if path else None
+    if lib().nt_endgame_load_path(str(d).encode(), int(kmin), arr, len(drops), int(kcap), p) < 0:
+        raise ValueError(f"no tables for {kmin} locked and up in {d} with caps {drops} (or that formation is loaded)")
     return int(kmin)
 
 
@@ -797,13 +813,17 @@ class NTupleNet:
                                seed & 0xFFFFFFFFFFFFFFFF, scores, maxtiles, moves)
         return _stats(scores, maxtiles, moves)
 
-    def reach(self, starts, k: int = 6, depth: int = 0, threads: int = 1, seed: int = 0) -> dict:
+    def reach(self, starts, k: int = 6, depth: int = 0, threads: int = 1, seed: int = 0, families: int = 1) -> dict:
         """From each start board (bitboards or an (n, 4, 4) grid array), play until the board
         is an endgame-table position with k or more locked tiles or the game is lost, with
-        this network's search settings (tables off). Returns `reached` (0/1) and `moves`."""
+        this network's search settings (tables off). `families` is a bit mask of the formations
+        that count: 1 = the snake, 2 = the next formation loaded with `load_endgame`, and so on
+        (formations other than the snake count only where their tables are loaded).
+        Returns `reached` (0/1) and `moves`."""
         packed, n = starts if isinstance(starts, tuple) else pack_starts(starts)
         reached, moves = (ctypes.c_int32 * max(1, n))(), (ctypes.c_int32 * max(1, n))()
-        self._lib.nt_reach(self._h, packed, n, int(k), int(depth), threads, seed & 0xFFFFFFFFFFFFFFFF, reached, moves)
+        self._lib.nt_reach(self._h, packed, n, int(k), int(families), int(depth), threads, seed & 0xFFFFFFFFFFFFFFFF,
+                           reached, moves)
         return {"reached": np.ctypeslib.as_array(reached)[:n].copy(), "moves": np.ctypeslib.as_array(moves)[:n].copy()}
 
     def play_boards(self, starts, depth: int = 0, threads: int = 1, seed: int = 0) -> dict:

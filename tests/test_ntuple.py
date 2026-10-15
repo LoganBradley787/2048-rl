@@ -1315,8 +1315,9 @@ def _snake_board(k, play):
     return g
 
 
-def _ref_endgame(g, k, memo):
-    """Plain Python version of the engine's endgame rule, for the few-cell tables."""
+def _ref_endgame(g, k, memo, path=SNAKE):
+    """Plain Python version of the engine's endgame rule, for the few-cell tables, along a cell path."""
+    SNAKE = path
     n = 16 - k
     key = (bytes(g), k)
     if key in memo:
@@ -1339,11 +1340,11 @@ def _ref_endgame(g, k, memo):
                 if v > n:
                     continue
                 a[c] = v
-                total += p * _ref_endgame(a.copy(), k, memo)
+                total += p * _ref_endgame(a.copy(), k, memo, path)
                 a[c] = 0
         best = max(best, total / len(empty) if empty else 0.0)
     if k < 15 and g[SNAKE[k]] == n - 1 and all(g[SNAKE[i]] <= n - 1 for i in range(k + 1, 16)):
-        best = max(best, _ref_endgame(g, k + 1, memo))
+        best = max(best, _ref_endgame(g, k + 1, memo, path))
     memo[key] = best
     return best
 
@@ -1593,3 +1594,51 @@ def test_downgrade_repeats_after_a_65536():
     assert (nt.from_bits(net.root_board(nt.to_bits(g.reshape(4, 4)))).ravel() == want).all()
     net.downgrade = 0
     assert net.root_board(nt.to_bits(g.reshape(4, 4))) == nt.to_bits(g.reshape(4, 4))
+
+
+_FAMILY_CHECK = r"""
+import json, sys
+import numpy as np
+from game2048 import ntuple as nt
+snake_dir, block_dir, boards = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+assert nt.load_endgame(snake_dir) == 12 and nt.load_endgame(block_dir) == 12
+assert nt.lib().nt_endgame_families() == 2
+out = [nt.endgame_value(nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4)), k, 1) for g, k in boards]
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+r = net.reach(np.array([boards[0][0]], dtype=np.uint8).reshape(1, 4, 4), k=12, families=2)
+print(json.dumps({"values": out, "block_reached": int(r["reached"][0])}))
+"""
+
+
+def test_endgame_tables_of_a_second_formation(tmp_path):
+    """Tables built along the 2x3-block path load as a second formation beside the snake, give the
+    values of a plain Python solution along that path, and count for reach with their bit."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for name in ("snake", "block"):
+        subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--kmin", "12", "--threads", "2",
+                        "--path", name, "--out", str(tmp_path / name)], check=True, capture_output=True)
+    assert (tmp_path / "block" / "caps.txt").read_text().split()[4] == ",".join(map(str, nt.BLOCK_PATH))
+    rng = np.random.default_rng(21)
+    boards, want, memo = [], [], {}
+    while len(boards) < 16:
+        k = int(rng.integers(12, 14))
+        g = np.zeros(16, dtype=np.uint8)
+        for i in range(k):
+            g[nt.BLOCK_PATH[i]] = 15 - i
+        for c in nt.BLOCK_PATH[k:]:
+            g[c] = int(rng.integers(0, 16 - k + 1))
+        if not (g == 0).any():
+            continue
+        boards.append((g.tolist(), k))
+        want.append(_ref_endgame(g, k, memo, nt.BLOCK_PATH))
+    r = subprocess.run([sys.executable, "-c", _FAMILY_CHECK, str(tmp_path / "snake"), str(tmp_path / "block"),
+                        json.dumps(boards)], capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["values"] == pytest.approx(want, abs=1e-4)
+    assert got["block_reached"] == 1
+

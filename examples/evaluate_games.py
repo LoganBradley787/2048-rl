@@ -93,8 +93,9 @@ def main(argv=None) -> None:
     p.add_argument("--depth-caps", default="", help="deepest search by number of empty cells, e.g. 5,5,5,5,4,4,4,4,3")
     p.add_argument("--endgame", type=int, default=0,
                    help="exact endgame tables choose the move once this many tiles (32768 down) lie on a snake; 0 = off")
-    p.add_argument("--endgame-dir", default=None,
-                   help="tables built in advance (k<k>.u16 and caps.txt, from notes/tb/build.c) instead of solving on demand")
+    p.add_argument("--endgame-dir", action="append", default=None,
+                   help="tables built in advance (examples/build_endgame.py) instead of solving on demand; repeat it for "
+                        "several formations (play takes the best)")
     p.add_argument("--endgame-bits", type=int, default=29,
                    help="memo size for the 5-tile table as a power of two; 6 tiles get the same up to 31, 7 tiles two fewer up to 27. "
                         "Under 31: 7 bytes a slot (29 is 3.8 GB); 31 and over: 4 bytes (33 is 32 GB)")
@@ -115,7 +116,8 @@ def main(argv=None) -> None:
                 "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None,
                 "endgame_bits": args.endgame_bits if args.endgame else None,
                 "endgame_dir": args.endgame_dir,
-                "endgame_caps": args.endgame_dir and (Path(args.endgame_dir) / "caps.txt").read_text().strip(), "weights": str(path), "games": args.games}
+                "endgame_caps": args.endgame_dir and " | ".join((Path(d) / "caps.txt").read_text().strip()
+                                                                for d in args.endgame_dir), "weights": str(path), "games": args.games}
     meta = out.with_suffix(".json")
     if meta.exists():
         old = json.loads(meta.read_text())
@@ -137,11 +139,13 @@ def main(argv=None) -> None:
     net.downgrade = args.downgrade
     if args.endgame:
         nt.lib().nt_endgame_bits(args.endgame_bits)
-        if args.endgame_dir:
-            low = nt.load_endgame(args.endgame_dir)
-            if args.endgame < low:                     # below the files the tables would be solved during play
-                p.error(f"--endgame {args.endgame} is below the lowest table in {args.endgame_dir} ({low})")
-            print(f"endgame tables built in advance from {low} locked up ({args.endgame_dir})", flush=True)
+        for d in args.endgame_dir or []:
+            words = (Path(d) / "caps.txt").read_text().split()
+            snake = len(words) < 5 or [int(x) for x in words[4].split(",")] == nt.SNAKE_PATH
+            low = nt.load_endgame(d)
+            if snake and args.endgame < low:           # below the snake's files its tables would be solved during play
+                p.error(f"--endgame {args.endgame} is below the lowest table in {d} ({low})")
+            print(f"endgame tables built in advance from {low} locked up ({d}, {'snake' if snake else words[4]})", flush=True)
         net.endgame = args.endgame
     net.depth_caps = caps
     if args.tt_bits:

@@ -1367,19 +1367,32 @@ static float eg_value(int f, const uint8_t *b, int k) {
     return best;
 }
 
-/* Turns the board by symmetry s for family f: fills o with the turned board, its corner set to 32768 (see
- * eg_choose), and *corner with the real corner, and returns how many tiles lie in place along the path (kmax), or
- * 0 if the corner is not the largest. The board is then a position of every table k <= kmax that it fits: there the
- * tiles from k on are in play. */
-static int eg_orient(int f, const uint8_t *c, int s, uint8_t *o, int *corner) {
+/* Turns the board by symmetry s for family f into o and returns how many tiles lie in place along the path (kmax).
+ * In place: from the corner on, each tile is either the table's own tile there (32768 >> i on the i-th cell) or a
+ * "boulder", a larger tile than that, smaller than the one before it. Boulders come first (a larger tile cannot
+ * follow a table tile) and play exactly like the table's tiles: they never move and nothing in play can merge
+ * with them. So after a 65536, or a 65536 and a 32768, the ladder still being built is played with the same
+ * tables, and a merge into the last locked tile collapses the ladder up to the first boulder, which makes the
+ * tile the game is building. *nb = the number of boulders (the corner counts when it is above 32768); real[i]
+ * keeps the tiles of the first kmax cells as they are, and o holds the table's tiles there. Tables k <= nb are
+ * not usable (their last locked tile would be a boulder). */
+static int eg_orient(int f, const uint8_t *c, int s, uint8_t *o, uint8_t *real, int *nb) {
     const int *P = eg_path[f];
     for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
-    *corner = o[P[0]];
-    if (*corner < 15) return 0;
-    o[P[0]] = 15;
-    int kmax = 0;
-    while (kmax < 15 && o[P[kmax]] == 15 - kmax) kmax++;
-    return kmax > eg_kvalid[f] ? eg_kvalid[f] : kmax;
+    int kmax = 0, prev = 255;
+    *nb = 0;
+    while (kmax < 15) {
+        int v = o[P[kmax]], want = 15 - kmax;
+        if (v == want) { }                                         /* the table's tile */
+        else if (v > want && v < prev && *nb == kmax) (*nb)++;     /* a boulder (only before the table's tiles) */
+        else break;
+        real[kmax] = (uint8_t)v;
+        prev = v;
+        o[P[kmax]] = (uint8_t)want;
+        kmax++;
+    }
+    if (kmax > eg_kvalid[f]) kmax = eg_kvalid[f];
+    return kmax;
 }
 
 /* Whether the turned board o is a position of family f's table k (which exists, with its caps fitting). */
@@ -1392,14 +1405,14 @@ static int eg_usable(int f, const uint8_t *o, int k) {
 /* The largest k (at least kmin) for which some orientation of the board is a position of a table of a family in
  * fmask (bit f = family f), or 0. */
 static int eg_position(board_t board, int kmin, unsigned fmask) {
-    uint8_t c[16], o[16];
-    int corner, best = 0;
+    uint8_t c[16], o[16], real[16];
+    int nb, best = 0;
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
     for (int f = 0; f < eg_nfam; f++) {
         if (!((fmask >> f) & 1)) continue;
         for (int s = 0; s < 8; s++) {
-            int kmax = eg_orient(f, c, s, o, &corner);
-            for (int k = kmax; k >= kmin && k > best; k--) if (eg_usable(f, o, k)) { best = k; break; }
+            int kmax = eg_orient(f, c, s, o, real, &nb);
+            for (int k = kmax; k >= kmin && k > nb && k > best; k--) if (eg_usable(f, o, k)) { best = k; break; }
         }
     }
     return best;
@@ -1419,10 +1432,12 @@ static int eg_choose(board_t board, int kmin) {
      * larger one allows, so neither dominates: all are tried. */
     for (int f = 0; f < eg_nfam; f++)
     for (int s = 0; s < 8; s++) {
-        uint8_t o[16];                                          /* the board turned or mirrored */
-        int corner, kmax = eg_orient(f, c, s, o, &corner);
+        uint8_t o[16], real[16];                                /* the board turned or mirrored */
+        int nb, kmax = eg_orient(f, c, s, o, real, &nb);
         const int *P = eg_path[f];
-        for (int k = kmin > EG_MIN ? kmin : EG_MIN; k <= kmax; k++) {
+        int k0 = kmin > EG_MIN ? kmin : EG_MIN;
+        if (k0 <= nb) k0 = nb + 1;
+        for (int k = k0; k <= kmax; k++) {
         if (!eg_usable(f, o, k)) continue;
         for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
             int r;
@@ -1431,9 +1446,12 @@ static int eg_choose(board_t board, int kmin) {
             uint8_t a[16], t[16];
             for (int i = 0; i < 16; i++) a[i] = (uint8_t)cell(after, i);
             for (int i = 0; i < 16; i++) t[i] = a[sym_cell(i, s)];
-            if (t[P[0]] != corner) continue;                    /* the corner moved: not an allowed move */
-            t[P[0]] = 15;
-            int ok2 = 1;                                        /* the same tests as eg_try, on the turned afterstate */
+            int ok2 = 1;
+            for (int i = 0; i < nb && ok2; i++) {               /* boulders stay as they are, then read as the table's */
+                if (t[P[i]] != real[i]) ok2 = 0;
+                t[P[i]] = (uint8_t)(15 - i);
+            }
+            if (!ok2) continue;                                 /* the same tests as eg_try, on the turned afterstate */
             for (int i = 0; i < k - 1 && ok2; i++) if (t[P[i]] != 15 - i) ok2 = 0;
             if (!ok2) continue;
             float v;

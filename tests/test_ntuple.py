@@ -1662,3 +1662,35 @@ def test_search_never_picks_a_move_only_its_downgraded_twin_allows():
     assert net.best_move(nt.to_bits(g), depth=1) == -1
     r = net.play_boards(g.reshape(1, 4, 4), depth=1, threads=1, seed=1)
     assert r["moves"][0] == 0
+
+
+def test_endgame_tables_treat_finished_tiles_as_boulders():
+    """After a 65536 and a 32768 the ladder being built starts lower: 65536 32768 | 8192 4096 ... . The finished
+    tiles never move and nothing in play can merge with them, so the board plays exactly like the table's own
+    board (32768 16384 | 8192 4096 ...): same moves. Equal neighbours on the path are not boulders."""
+    rng = np.random.default_rng(9)
+    net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    net.endgame = 13
+    for _ in range(12):
+        real = np.zeros(16, dtype=np.uint8)
+        table = np.zeros(16, dtype=np.uint8)
+        for i in range(13):
+            table[SNAKE[i]] = 15 - i
+            real[SNAKE[i]] = 15 - i
+        real[SNAKE[0]], real[SNAKE[1]] = 17, 16                      # 131072 65536 as boulders
+        for c in SNAKE[13:]:
+            v = int(rng.integers(0, 4))
+            real[c] = table[c] = v
+        if not (real == 0).any():
+            continue
+        a = net.best_move(nt.to_bits(real.reshape(4, 4)), depth=1)
+        b = net.best_move(nt.to_bits(table.reshape(4, 4)), depth=1)
+        assert a == b
+        r = net.reach(real.reshape(1, 4, 4), k=13, depth=0, threads=1, seed=1)
+        assert r["reached"][0] == 1 and r["moves"][0] == 0
+    dup = np.zeros(16, dtype=np.uint8)
+    for i in range(13):
+        dup[SNAKE[i]] = 15 - i
+    dup[SNAKE[1]] = 15                                              # 32768 32768: they could merge
+    r = net.reach(dup.reshape(1, 4, 4), k=13, depth=0, threads=1, seed=1)
+    assert r["moves"][0] > 0 or r["reached"][0] == 0

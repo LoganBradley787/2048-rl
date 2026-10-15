@@ -222,6 +222,7 @@ def lib() -> ctypes.CDLL:
     L.nt_snake_decay.argtypes, L.nt_snake_decay.restype = [vp], f64
     L.nt_set_leaf_snake.argtypes = [vp, f64]
     L.nt_downgrade.argtypes = [u64, u64, P(u64), P(u64)]
+    L.nt_root_board.argtypes = [vp, u64, u64, P(u64), P(u64)]
     L.nt_set_downgrade.argtypes = [vp, i32]
     L.nt_set_endgame.argtypes = [vp, i32]
     L.nt_get_endgame.argtypes, L.nt_get_endgame.restype = [vp], i32
@@ -682,6 +683,12 @@ class NTupleNet:
         if caps:
             caps = (caps + [caps[-1]] * 17)[:17]
         self._lib.nt_set_depth_caps(self._h, (ctypes.c_int32 * 17)(*caps) if caps else None)
+
+    def root_board(self, bits: int) -> int:
+        """The board the search evaluates for this root (downgraded while it holds the threshold tile)."""
+        lo, hi = ctypes.c_uint64(0), ctypes.c_uint64(0)
+        self._lib.nt_root_board(self._h, *_lohi(bits), ctypes.byref(lo), ctypes.byref(hi))
+        return lo.value | (hi.value << 64)
 
     def best_move(self, bits: int, depth: int = 1, cutoff: float = 0.0) -> int:
         """Expectimax move for the board, -1 if none is legal. depth = spawn layers searched."""

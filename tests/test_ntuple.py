@@ -1577,3 +1577,19 @@ def test_play_boards_from_start_boards():
     assert a["moves"][0] == 0 and a["score"][0] == 0 and a["max_tile"][0] == 4
     assert (a["moves"][1:] > 20).all() and (a["max_tile"][1:] >= 16).all()
     assert len(set(a["score"][1:].tolist())) > 1                 # each game draws its own tiles
+
+
+def test_downgrade_repeats_after_a_65536():
+    """After a 65536 one downgrading step leaves a 32768 on top; the search downgrades again and plays the
+    board as the 16384 board it saw before the 65536. A board whose largest tile is 32768 still gets one step."""
+    net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    net.downgrade = 32768
+    g = np.zeros(16, dtype=np.uint8)
+    g[0], g[1], g[2], g[5] = 16, 14, 13, 3                       # 65536 16384 8192 8
+    want = g.copy(); want[0], want[1], want[2] = 14, 13, 12        # 16384 8192 4096 8
+    assert (nt.from_bits(net.root_board(nt.to_bits(g.reshape(4, 4)))).ravel() == want).all()
+    g[0] = 15                                                      # 32768 16384 8192 8: one step only
+    want[0], want[1], want[2] = 14, 13, 12
+    assert (nt.from_bits(net.root_board(nt.to_bits(g.reshape(4, 4)))).ravel() == want).all()
+    net.downgrade = 0
+    assert net.root_board(nt.to_bits(g.reshape(4, 4))) == nt.to_bits(g.reshape(4, 4))

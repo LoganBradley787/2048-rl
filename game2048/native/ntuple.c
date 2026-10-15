@@ -1611,19 +1611,37 @@ float nt_endgame_value(uint64_t lo, uint64_t hi, int k) {
     return v;
 }
 
+/* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
+ * tile and the stage rule allows. */
+static board_t root_board(const net_t *net, board_t b) {
+    /* Again while the board still holds the threshold tile: after a 65536 one step only brings it to 32768, a
+     * board the stages rarely saw; a second step shows it as the 16384 board the first 32768 was shown as. A board
+     * whose largest tile is the threshold itself drops below it in one step, so play before a 65536 is unchanged. */
+    for (int rep = 0; rep < 4 && net->downgrade && max_exp(b) >= net->downgrade; rep++) {
+        /* Only when the downgraded board belongs to the same stage: a stage made for boards with a 32768
+         * and a 16384 must see them as they are, or it would never be asked. */
+        board_t lower = downgrade(b);
+        if (lower == b) break;
+        /* A tile above 32768 is beyond what any stage trained on: downgrade it whatever stage that gives. */
+        if (!(max_exp(b) > 15 || stage_of(lower, net->bounds, net->n_bounds) == stage_of(b, net->bounds, net->n_bounds)))
+            break;
+        b = lower;
+    }
+    return b;
+}
+
+void nt_root_board(void *p, uint64_t lo, uint64_t hi, uint64_t *out_lo, uint64_t *out_hi) {
+    board_t r = root_board((net_t *)p, mk(lo, hi));
+    *out_lo = lo64(r);
+    *out_hi = hi64(r);
+}
+
 static int best_move(search_ctx_t *c, board_t b, int depth) {
     if (c->net->endgame) {                                     /* an exact table, when the board is one of its positions */
         int d = eg_choose(b, c->net->endgame);
         if (d >= 0) return d;
     }
-    if (c->net->downgrade && max_exp(b) >= c->net->downgrade) {
-        /* Only when the downgraded board belongs to the same stage: a stage made for boards with a 32768
-         * and a 16384 must see them as they are, or it would never be asked. */
-        board_t lower = downgrade(b);
-        /* A tile above 32768 is beyond what any stage trained on: downgrade it whatever stage that gives. */
-        if (max_exp(b) > 15 || stage_of(lower, c->net->bounds, c->net->n_bounds) == stage_of(b, c->net->bounds, c->net->n_bounds))
-            b = lower;
-    }
+    b = root_board(c->net, b);
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;
     int best = -1;

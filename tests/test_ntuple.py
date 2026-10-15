@@ -1861,6 +1861,21 @@ def _ref_wobble(g, k, o, memo):
     return best
 
 
+_WOBBLE_CHECK = r"""
+import json, sys
+import numpy as np
+from game2048 import ntuple as nt
+d, boards = sys.argv[1], json.loads(sys.argv[2])
+assert nt.load_endgame(d) == 12
+f = nt.lib().nt_endgame_families() - 1
+out = [nt.endgame_value(nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4)), k, f) for g, k, _ in boards]
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+net.endgame = 12
+moves = [net.best_move(nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4)), depth=1) for g, k, _ in boards]
+print(json.dumps({"values": out, "moves": moves}))
+"""
+
+
 def test_wobble_tables_match_a_plain_python_solution(tmp_path):
     """Tables built with --wobble (the last row's locked tiles may slide along it) give the plain Python values,
     with the block at home or slid, and are at least the plain tables' values at home."""
@@ -1885,8 +1900,9 @@ def test_wobble_tables_match_a_plain_python_solution(tmp_path):
         drops = (ctypes.c_int * 1)(0)
         assert L.tb2_load(str(tmp_path / d).encode(), 12, drops, 1, 6) == 0
         libs.append(L)
+    import json
     rng = np.random.default_rng(36)
-    memo, n_checked, slid = {}, 0, 0
+    memo, n_checked, slid, boards = {}, 0, 0, []
     while n_checked < 30:
         k = int(rng.integers(13, 15))
         rs, L_ = (k - 1) // 4 * 4, k - (k - 1) // 4 * 4
@@ -1910,4 +1926,12 @@ def test_wobble_tables_match_a_plain_python_solution(tmp_path):
             assert got >= libs[1].tb2_value(b, k) - 1e-4
         slid += o > 0
         n_checked += 1
+        boards.append((g.tolist(), k, float(got)))
     assert slid > 0
+    # the engine reads the same values (its own lookup, block found at any offset) and plays with them
+    r = subprocess.run([sys.executable, "-c", _WOBBLE_CHECK, str(tmp_path / "wob"), json.dumps(boards)],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["values"] == pytest.approx([v for _, _, v in boards], abs=1e-6)
+    assert all(m >= 0 for m, (_, _, v) in zip(got["moves"], boards) if v > 0)   # a chance: a table move

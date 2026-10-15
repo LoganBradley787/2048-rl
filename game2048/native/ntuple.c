@@ -1139,7 +1139,7 @@ int nt_get_deep(void *p, unsigned *need) { *need = ((net_t *)p)->deep_need; retu
 /* Formations ("families"): each is an order of cells. The k largest tiles lie on its first k cells, the next rung
  * goes on cell k and the other cells are in play. Family 0 is the snake: the only one solved on demand. Others
  * come only from tables built in advance (nt_endgame_load with their path). */
-#define EG_FAM 4
+#define EG_FAM 8
 static int eg_path[EG_FAM][16] = {{0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12}};
 static int eg_nfam = 1;
 /* eg_kvalid[f]: tables of family f are used up to this many locked tiles: the longest prefix of its path in which
@@ -1149,6 +1149,14 @@ static int eg_kvalid[EG_FAM] = {15};
  * tiles in play go up to it: a gap in the ladder is being filled (with 32768 16384 | 4096 2048 1024 the 8192 is
  * being built: g = 1, the tiles above the gap read as boulders). Their value is the chance of filling the gap. */
 static int eg_lift[EG_FAM];
+/* eg_wob[f]: wobble tables (endgame_build.c --wobble). The locked tiles after the last full row of the path (the
+ * block) may slide along their row; a position is (offset, tiles in play), the free cells being the path cells
+ * from the row's start on minus the block's (eg_free), offset-major in the file. Rows run along the path 4 cells
+ * at a time. Merging into the last locked tile wins with the block at home (offset 0). */
+static int eg_wob[EG_FAM];
+static int eg_noff[EG_FAM][16];
+static uint8_t eg_free[EG_FAM][16][4][16];   /* path index of free cell j of table k at offset o */
+static inline int eg_rowstart(int k) { return ((k - 1) / 4) * 4; }
 #define EG_SNAKE eg_path[0]
 
 static int eg_chain(const int *path) {
@@ -1181,14 +1189,30 @@ static int eg_tcap[EG_FAM][16][16];
 
 static inline int eg_units(int e) { return e ? 1 << (e - 1) : 0; }
 
-static inline int eg_fits(int f, const uint8_t *b, int k) {
+static inline int eg_fits_o(int f, const uint8_t *b, int k, int o) {
     const int *P = eg_path[f];
-    for (int j = 0; j < 16 - k; j++) if (b[P[k + j]] > eg_tcap[f][k][j]) return 0;
+    for (int j = 0; j < 16 - k; j++) if (b[P[eg_free[f][k][o][j]]] > eg_tcap[f][k][j]) return 0;
     return 1;
+}
+static inline int eg_fits(int f, const uint8_t *b, int k) { return eg_fits_o(f, b, k, 0); }
+
+static void eg_free_set(int f, int wob) {                      /* the free cells of every table and offset */
+    for (int k = 1; k < 16; k++) {
+        int rs = eg_rowstart(k), L = k - rs;
+        eg_noff[f][k] = wob ? 4 - L + 1 : 1;
+        for (int o = 0; o < eg_noff[f][k]; o++) {
+            int j = 0;
+            for (int q = wob ? rs : k; q < 16; q++)
+                if (q < rs + o || q >= rs + o + L) eg_free[f][k][o][j++] = (uint8_t)q;
+        }
+    }
 }
 
 static void eg_caps_init(void) {
-    for (int f = 0; f < EG_FAM; f++) for (int k = 0; k < 16; k++) for (int j = 0; j < 16; j++) eg_tcap[f][k][j] = 16 - k;
+    for (int f = 0; f < EG_FAM; f++) {
+        for (int k = 0; k < 16; k++) for (int j = 0; j < 16; j++) eg_tcap[f][k][j] = 16 - k;
+        eg_free_set(f, 0);
+    }
 }
 static pthread_once_t eg_caps_once = PTHREAD_ONCE_INIT;
 static void eg_caps_default(void) { pthread_once(&eg_caps_once, eg_caps_init); }   /* no caps: tiles in play up to n */
@@ -1296,19 +1320,38 @@ static inline uint32_t eg_w32_word(int k, uint64_t key, uint64_t slot, uint16_t 
 }
 
 static float eg_value(int f, const uint8_t *b, int k);
+static float eg_value_o(int f, const uint8_t *b, int k, int o);
 
-/* the expected value of an afterstate in table k, over the tile that comes next */
-static float eg_after(int f, uint8_t *a, int k) {
+/* the expected value of an afterstate in table k (block at offset o), over the tile that comes next */
+static float eg_after_o(int f, uint8_t *a, int k, int o) {
     int n = 16 - k - eg_lift[f], empty = 0;                     /* the last locked tile; tiles in play up to it */
     double sum = 0.0;
     for (int c = 0; c < 16; c++) {
         if (a[c]) continue;
         empty++;
-        a[c] = 1; sum += 0.9 * eg_value(f, a, k);
-        a[c] = 2; sum += n >= 2 ? 0.1 * eg_value(f, a, k) : 0.0;   /* a 4 cannot be in play with one cell: lost */
+        a[c] = 1; sum += 0.9 * eg_value_o(f, a, k, o);
+        a[c] = 2; sum += n >= 2 ? 0.1 * eg_value_o(f, a, k, o) : 0.0;   /* a 4 cannot be in play with one cell */
         a[c] = 0;
     }
     return empty ? (float)(sum / empty) : 0.0f;
+}
+static float eg_after(int f, uint8_t *a, int k) { return eg_after_o(f, a, k, 0); }
+
+/* A wobble family's block on the turned board t (the rows above already checked): the smallest offset whose block
+ * holds the locked tiles, the last one itself (*won = 0) or merged into (*won = 1); -1 if none. */
+static int eg_block(int f, const uint8_t *t, int k, int *won) {
+    const int *P = eg_path[f];
+    int rs = eg_rowstart(k), L = k - rs, g = eg_lift[f], n = 16 - k - g;
+    *won = 0;
+    for (int o = 0; o < eg_noff[f][k]; o++) {
+        int m = 1;
+        for (int i = 0; i < L - 1 && m; i++) if (t[P[rs + o + i]] != 15 - (rs + i) - g) m = 0;
+        if (!m) continue;
+        int last = t[P[rs + o + L - 1]];
+        if (last == n) return o;
+        if (last == n + 1) { *won = 1; return o; }
+    }
+    return -1;
 }
 
 /* -1: the move is not allowed; 2: it wins; else 0 and *a holds the afterstate */
@@ -1323,21 +1366,26 @@ static int eg_try(int f, const uint8_t *b, int k, int d, uint8_t *a) {
     return 0;
 }
 
+/* a table built in advance: the value of position b with the block at offset o (0 unless wobble) */
+static float eg_value_o(int f, const uint8_t *b, int k, int o) {
+    if (!eg_pre[f][k]) return o ? 0.0f : eg_value(f, b, k);
+    const int *P = eg_path[f];
+    const uint8_t *F = eg_free[f][k][o];
+    int n = 16 - k, r = 0;
+    for (int j = 0; j < n; j++) r += eg_units(b[P[F[j]]]);
+    uint64_t q = (uint64_t)o * eg_psize[f][k] + eg_offs[f][k][r];
+    for (int j = 0; j < n; j++) {
+        int v = b[P[F[j]]];
+        q += eg_rank[f][k][j][(size_t)r * (eg_tcap[f][k][j] + 1) + v];
+        r -= eg_units(v);
+    }
+    return (float)eg_pre[f][k][q] * (1.0f / 65535.0f);
+}
+
 static float eg_value(int f, const uint8_t *b, int k) {
     int n = 16 - k;
     if (k >= 16) return 1.0f;
-    if (eg_pre[f][k]) {
-        const int *P = eg_path[f];
-        int r = 0;
-        for (int j = 0; j < n; j++) r += eg_units(b[P[k + j]]);
-        uint64_t q = eg_offs[f][k][r];
-        for (int j = 0; j < n; j++) {
-            int v = b[P[k + j]];
-            q += eg_rank[f][k][j][(size_t)r * (eg_tcap[f][k][j] + 1) + v];
-            r -= eg_units(v);
-        }
-        return (float)eg_pre[f][k][q] * (1.0f / 65535.0f);
-    }
+    if (eg_pre[f][k]) return eg_value_o(f, b, k, 0);
     if (f) return 0.0f;                                          /* only the snake is solved on demand */
     uint64_t idx = eg_index(b, k), slot = 0;
     if (eg_alloc(k) != 0) return 0.0f;
@@ -1458,8 +1506,13 @@ static int eg_choose(board_t board, int kmin) {
         const int *P = eg_path[f];
         int k0 = kmin > EG_MIN ? kmin : EG_MIN;
         if (k0 <= nb) k0 = nb + 1;
-        for (int k = k0; k <= kmax; k++) {
-        if (!eg_usable(f, o, k)) continue;
+        const int wob = eg_wob[f];
+        for (int k = k0; k <= (wob ? eg_kvalid[f] : kmax); k++) {
+        if (wob) {                                              /* rows above in place, the block anywhere on its row */
+            int won, ob, rs = eg_rowstart(k);
+            if (kmax < rs || nb > rs || !eg_pre[f][k]) continue;
+            if ((ob = eg_block(f, o, k, &won)) < 0 || won || !eg_fits_o(f, o, k, ob)) continue;
+        } else if (!eg_usable(f, o, k)) continue;
         held = 1;
         for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
             int r;
@@ -1474,9 +1527,23 @@ static int eg_choose(board_t board, int kmin) {
                 t[P[i]] = (uint8_t)(15 - i - g);
             }
             if (!ok2) continue;                                 /* the same tests as eg_try, on the turned afterstate */
+            float v;
+            if (wob) {
+                int rs = eg_rowstart(k), won, ob2;
+                for (int i = 0; i < rs && ok2; i++) if (t[P[i]] != 15 - i - g) ok2 = 0;
+                if (!ok2 || (ob2 = eg_block(f, t, k, &won)) < 0) continue;
+                if (won) {
+                    if (ob2) continue;                          /* merged into away from home: not counted */
+                    v = 1.0f;
+                } else {
+                    if (!eg_fits_o(f, t, k, ob2)) continue;
+                    v = eg_after_o(f, t, k, ob2);
+                }
+                if (v > best_v) { best_v = v; best_dir = d; }
+                continue;
+            }
             for (int i = 0; i < k - 1 && ok2; i++) if (t[P[i]] != 15 - i - g) ok2 = 0;
             if (!ok2) continue;
-            float v;
             if (t[P[k - 1]] == 17 - k - g) v = 1.0f;
             else {
                 if (t[P[k - 1]] != 16 - k - g || !eg_fits(f, t, k)) continue;
@@ -1612,24 +1679,28 @@ void nt_play_boards(void *p, const uint64_t *starts_lohi, long n, int depth, int
  * or -1 (nothing changed) if a file is missing or the wrong size, the family is already loaded or there is no room.
  * Call before any play. */
 static int eg_family_loaded(int f) { for (int k = EG_MIN; k <= 15; k++) if (eg_pre[f][k]) return 1; return 0; }
-int nt_endgame_load_family(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path,
-                           int lift) {
+int nt_endgame_load_wobble(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path,
+                           int lift, int wob) {
     if (kmin < EG_MIN || kmin > 15 || ndrops < 0 || ndrops > 16 || lift < 0 || lift > 8) return -1;
     if (!path) path = eg_path[0];
+    wob = wob != 0;
     int fam = 0;
-    if (lift || memcmp(path, eg_path[0], sizeof eg_path[0]) != 0) {     /* family 0 is the snake without lift */
+    if (lift || wob || memcmp(path, eg_path[0], sizeof eg_path[0]) != 0) {   /* family 0: the plain snake */
         for (fam = 1; fam < eg_nfam; fam++)
-            if (memcmp(path, eg_path[fam], sizeof eg_path[0]) == 0 && eg_lift[fam] == lift) break;
+            if (memcmp(path, eg_path[fam], sizeof eg_path[0]) == 0 && eg_lift[fam] == lift && eg_wob[fam] == wob) break;
         if (fam == EG_FAM) return -1;
         unsigned seen = 0;                                       /* a path must hold every cell once */
         for (int i = 0; i < 16; i++) { if (path[i] < 0 || path[i] > 15) return -1; seen |= 1u << path[i]; }
         if (seen != 0xFFFF) return -1;
+        for (int i = 0; wob && i < 16; i++)                      /* wobble: rows run along the path */
+            if (path[i] / 4 != i / 4 || (i % 4 && abs(path[i] - path[i - 1]) != 1)) return -1;
     }
     if (eg_family_loaded(fam)) return -1;
     eg_caps_default();
     int caps[16][16];
     uint64_t *offs[16] = {0}, *rank[16][16] = {{0}}, size[16];
     uint16_t *maps[16] = {0};
+    uint64_t noff[16];
     int ok = 1;
     const int kend = 15 - lift;                                /* the last locked tile is at least a 2 */
     if (kmin > kend) return -1;
@@ -1670,20 +1741,22 @@ int nt_endgame_load_family(const char *dir, int kmin, const int *drops, int ndro
         if (!ok) break;
         char file[4096];
         snprintf(file, sizeof file, "%s/k%d.u16", dir, k);
+        noff[k] = wob ? (uint64_t)(4 - (k - eg_rowstart(k)) + 1) : 1;
         FILE *fp = fopen(file, "rb");
         void *m = MAP_FAILED;
         if (fp) {
             fseek(fp, 0, SEEK_END);
-            if ((uint64_t)ftell(fp) == size[k] * 2) m = mmap(NULL, size[k] * 2, PROT_READ, MAP_SHARED, fileno(fp), 0);
+            if ((uint64_t)ftell(fp) == size[k] * noff[k] * 2)
+                m = mmap(NULL, size[k] * noff[k] * 2, PROT_READ, MAP_SHARED, fileno(fp), 0);
             fclose(fp);
         }
         if (m == MAP_FAILED) { ok = 0; break; }
-        madvise(m, size[k] * 2, MADV_RANDOM);
+        madvise(m, size[k] * noff[k] * 2, MADV_RANDOM);
         maps[k] = (uint16_t *)m;
     }
     if (!ok) {
         for (int k = kmin; k <= kend; k++) {
-            if (maps[k]) munmap(maps[k], size[k] * 2);
+            if (maps[k]) munmap(maps[k], size[k] * noff[k] * 2);
             free(offs[k]);
             for (int j = 0; j < 16; j++) free(rank[k][j]);
         }
@@ -1692,6 +1765,8 @@ int nt_endgame_load_family(const char *dir, int kmin, const int *drops, int ndro
     if (fam && fam == eg_nfam) {
         memcpy(eg_path[fam], path, sizeof eg_path[0]);
         eg_lift[fam] = lift;
+        eg_wob[fam] = wob;
+        eg_free_set(fam, wob);
         eg_kvalid[fam] = eg_chain(path);
         if (eg_kvalid[fam] > 15 - lift) eg_kvalid[fam] = 15 - lift;    /* the last locked tile is at least a 2 */
         eg_nfam++;
@@ -1702,6 +1777,10 @@ int nt_endgame_load_family(const char *dir, int kmin, const int *drops, int ndro
     }
     for (int k = kmin; k <= kend; k++) eg_pre[fam][k] = maps[k]; /* last: a table is used only once all is set */
     return fam;
+}
+int nt_endgame_load_family(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path,
+                           int lift) {
+    return nt_endgame_load_wobble(dir, kmin, drops, ndrops, kcap, path, lift, 0);
 }
 int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path) {
     return nt_endgame_load_family(dir, kmin, drops, ndrops, kcap, path, 0);
@@ -1733,8 +1812,14 @@ float nt_endgame_value_family(uint64_t lo, uint64_t hi, int k, int f) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
     if (k < EG_MIN || k > 15 || f < 0 || f >= eg_nfam || k > eg_kvalid[f] || (f && !eg_pre[f][k])) return -1.0f;
-    for (int i = 0; i < k; i++) if (c[eg_path[f][i]] != 15 - i - eg_lift[f]) return -1.0f;
     eg_caps_default();
+    if (eg_wob[f]) {                                            /* the block may sit anywhere on its row */
+        int won, o;
+        for (int i = 0; i < eg_rowstart(k); i++) if (c[eg_path[f][i]] != 15 - i - eg_lift[f]) return -1.0f;
+        if ((o = eg_block(f, c, k, &won)) < 0 || won || !eg_fits_o(f, c, k, o)) return -1.0f;
+        return eg_value_o(f, c, k, o);
+    }
+    for (int i = 0; i < k; i++) if (c[eg_path[f][i]] != 15 - i - eg_lift[f]) return -1.0f;
     if (!eg_fits(f, c, k)) return -1.0f;
     pthread_mutex_lock(&eg_lock);
     float v = eg_value(f, c, k);

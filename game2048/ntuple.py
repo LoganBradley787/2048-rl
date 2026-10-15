@@ -235,6 +235,7 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_load_path.argtypes = [ctypes.c_char_p, i32, P(i32), i32, i32, P(i32)]
     L.nt_endgame_load_path.restype = i32
     L.nt_endgame_load_family.argtypes = [ctypes.c_char_p, i32, P(i32), i32, i32, P(i32), i32]
+    L.nt_endgame_load_wobble.argtypes = [ctypes.c_char_p, i32, P(i32), i32, i32, P(i32), i32, i32]
     L.nt_endgame_load_family.restype = i32
     L.nt_endgame_loaded_family.argtypes, L.nt_endgame_loaded_family.restype = [i32], i32
     L.nt_endgame_families.restype = i32
@@ -325,8 +326,9 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
                  path: list[int] | None = None, lift: int | None = None) -> int:
     """Use endgame tables built in advance: <directory>/k<k>.u16 for k = kmin .. 15. kmin,
     the caps (drops), the largest capped table (kcap) and the formation's cell path are read
-    from <directory>/caps.txt ("kmin d0,d1,... kcap 2 [path [lift]]"; no path = the snake, no lift = 0)
-    unless given. lift g: sub-goal tables whose last locked tile is g sizes below the usual one.
+    from <directory>/caps.txt ("kmin d0,d1,... kcap 2 [path [lift [wobble]]]"; no path = the snake, no lift
+    = 0) unless given. lift g: sub-goal tables whose last locked tile is g sizes below the usual one. wobble:
+    the locked tiles after the last full row may slide along it (built with --wobble).
     Each formation once per process; several formations can be loaded and play takes the best.
     Returns the lowest table loaded. Call before any play."""
     from pathlib import Path
@@ -341,9 +343,11 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
         path = [int(x) for x in words[4].split(",")]
     if lift is None:
         lift = int(words[5]) if len(words) > 5 else 0
+    wobble = len(words) > 6 and words[6] == "wobble"            # the last row's locked tiles may slide
     arr = (ctypes.c_int32 * 16)(*drops)
     p = (ctypes.c_int32 * 16)(*path) if path else None
-    if lib().nt_endgame_load_family(str(d).encode(), int(kmin), arr, len(drops), int(kcap), p, int(lift)) < 0:
+    if lib().nt_endgame_load_wobble(str(d).encode(), int(kmin), arr, len(drops), int(kcap), p, int(lift),
+                                    int(wobble)) < 0:
         raise ValueError(f"no tables for {kmin} locked and up in {d} with caps {drops} (or that formation is loaded)")
     return int(kmin)
 

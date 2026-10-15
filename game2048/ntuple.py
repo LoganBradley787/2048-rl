@@ -239,7 +239,7 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_loaded_family.argtypes, L.nt_endgame_loaded_family.restype = [i32], i32
     L.nt_endgame_families.restype = i32
     L.nt_endgame_value_family.argtypes, L.nt_endgame_value_family.restype = [u64, u64, i32, i32], f32
-    L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, ctypes.c_uint, i32, i32, u64, P(i32), P(i32)]
+    L.nt_reach.argtypes = [vp, P(u64), ctypes.c_long, i32, ctypes.c_uint, i32, i32, u64, P(i32), P(i32), P(u64)]
     L.nt_play_boards.argtypes = [vp, P(u64), ctypes.c_long, i32, i32, u64, P(i32), P(ctypes.c_int64), P(i32),
                                  P(ctypes.c_uint32)]
     L.nt_get_downgrade.argtypes, L.nt_get_downgrade.restype = [vp], i32
@@ -844,12 +844,18 @@ class NTupleNet:
         this network's search settings (tables off). `families` is a bit mask of the formations
         that count: 1 = the snake, 2 = the next formation loaded with `load_endgame`, and so on
         (formations other than the snake count only where their tables are loaded).
-        Returns `reached` (0/1) and `moves`."""
+        Returns `reached` (0/1), `moves` and `boards`: (n, 4, 4) exponent grids where each game stopped (the
+        table position it got to, or the lost board)."""
         packed, n = starts if isinstance(starts, tuple) else pack_starts(starts)
         reached, moves = (ctypes.c_int32 * max(1, n))(), (ctypes.c_int32 * max(1, n))()
+        at = (ctypes.c_uint64 * max(2, 2 * n))()
         self._lib.nt_reach(self._h, packed, n, int(k), int(families), int(depth), threads, seed & 0xFFFFFFFFFFFFFFFF,
-                           reached, moves)
-        return {"reached": np.ctypeslib.as_array(reached)[:n].copy(), "moves": np.ctypeslib.as_array(moves)[:n].copy()}
+                           reached, moves, at)
+        lohi = np.ctypeslib.as_array(at)[:2 * n]
+        boards = np.array([from_bits(int(lohi[2 * i]) | (int(lohi[2 * i + 1]) << 64)) for i in range(n)],
+                          dtype=np.uint8).reshape(-1, 4, 4)
+        return {"reached": np.ctypeslib.as_array(reached)[:n].copy(), "moves": np.ctypeslib.as_array(moves)[:n].copy(),
+                "boards": boards}
 
     def play_boards(self, starts, depth: int = 0, threads: int = 1, seed: int = 0) -> dict:
         """From each start board (bitboards or an (n, 4, 4) grid array), play to the end with

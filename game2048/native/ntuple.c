@@ -1507,6 +1507,7 @@ typedef struct {
     uint64_t seed;
     const board_t *starts;
     int32_t *reached, *moves;
+    uint64_t *at;                 /* the board where each game stopped (lo, hi), or NULL */
 } reach_job_t;
 
 static void *reach_worker(void *arg) {
@@ -1528,6 +1529,7 @@ static void *reach_worker(void *arg) {
         }
         j->reached[g] = got;
         j->moves[g] = mv;
+        if (j->at) { j->at[2 * g] = lo64(b); j->at[2 * g + 1] = hi64(b); }
     }
     ctx_free(c);
     return NULL;
@@ -1535,14 +1537,14 @@ static void *reach_worker(void *arg) {
 
 /* fmask: which formations count (bit f = family f; family 0 = the snake, also without tables) */
 void nt_reach(void *p, const uint64_t *starts_lohi, long n, int k, unsigned fmask, int depth, int threads,
-              uint64_t seed, int32_t *reached, int32_t *moves) {
+              uint64_t seed, int32_t *reached, int32_t *moves, uint64_t *at) {
     net_t *net = (net_t *)p;
     long nn = n;
     board_t *starts = unpack_boards(starts_lohi, &nn);
     int keep = net->endgame;
     net->endgame = 0;                                       /* the point is to see how the network gets there */
     long next = 0;
-    reach_job_t job = {net, depth, k, fmask, &next, nn, seed, starts, reached, moves};
+    reach_job_t job = {net, depth, k, fmask, &next, nn, seed, starts, reached, moves, at};
     run_workers(reach_worker, &job, threads);
     net->endgame = keep;
     free(starts);

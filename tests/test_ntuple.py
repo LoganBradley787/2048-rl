@@ -1805,3 +1805,109 @@ def test_deep_window_searches_deeper_only_when_the_board_holds_the_tiles():
     assert differ > 0
     net.deep = None
     assert net.deep == (0, [])
+
+
+def _ref_wobble(g, k, o, memo):
+    """Plain Python version of the builder's wobble rule (uncapped tables): the locked tiles after the last full
+    row (the block) may slide along their row; the block sits o cells beyond home; a win only at home."""
+    key = (bytes(g), k, o)
+    if key in memo:
+        return memo[key]
+    rs = (k - 1) // 4 * 4
+    L, n = k - rs, 16 - k
+
+    def block(a):
+        for p in range(4 - L + 1):
+            if all(a[SNAKE[rs + p + i]] == 15 - (rs + i) for i in range(L - 1)):
+                last = a[SNAKE[rs + p + L - 1]]
+                if last in (n, n + 1):
+                    return p, last == n + 1
+        return -1, False
+
+    def free(p):
+        return [SNAKE[q] for q in range(rs, 16) if not rs + p <= q < rs + p + L]
+
+    best = 0.0
+    for d in range(4):
+        moved, _ = nt.move(nt.to_bits(g.reshape(4, 4)), d)
+        a = nt.from_bits(moved).ravel().copy()
+        if (a == g).all() or any(a[SNAKE[i]] != 15 - i for i in range(rs)):
+            continue
+        p, won = block(a)
+        if p < 0:
+            continue
+        if won:
+            if p == 0:
+                best = 1.0
+                break
+            continue
+        if any(a[c] > n for c in free(p)):
+            continue
+        empty = [c for c in range(16) if a[c] == 0]
+        total = 0.0
+        for c in empty:
+            for v, pr in ((1, 0.9), (2, 0.1)):
+                if v > n:
+                    continue
+                a[c] = v
+                total += pr * _ref_wobble(a.copy(), k, p, memo)
+                a[c] = 0
+        best = max(best, total / len(empty) if empty else 0.0)
+    q = rs + o + L
+    if k < 15 and (q < rs + 4 if L < 4 else True) and g[SNAKE[q]] == n - 1 \
+            and all(g[c] <= n - 1 for c in free(o) if c != SNAKE[q]):
+        best = max(best, _ref_wobble(g, k + 1, o if L < 4 else 0, memo))
+    memo[key] = best
+    return best
+
+
+def test_wobble_tables_match_a_plain_python_solution(tmp_path):
+    """Tables built with --wobble (the last row's locked tiles may slide along it) give the plain Python values,
+    with the block at home or slid, and are at least the plain tables' values at home."""
+    import ctypes
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for wob, d in ((True, "wob"), (False, "plain")):
+        subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--kmin", "12", "--threads", "2",
+                        "--out", str(tmp_path / d)] + (["--wobble"] if wob else []), check=True, capture_output=True)
+    assert (tmp_path / "wob" / "caps.txt").read_text().split()[-1] == "wobble"
+    libs = []
+    for d in ("wob", "plain"):
+        so = tmp_path / f"egb_{d}.so"
+        subprocess.run([os.environ.get("CC", "cc"), "-O2", "-shared", "-fPIC", "-o", str(so),
+                        str(root / "game2048" / "native" / "endgame_build.c")], check=True)
+        L = ctypes.CDLL(str(so))
+        L.tb2_value.restype = ctypes.c_float
+        L.tb2_set_wobble(int(d == "wob"))
+        drops = (ctypes.c_int * 1)(0)
+        assert L.tb2_load(str(tmp_path / d).encode(), 12, drops, 1, 6) == 0
+        libs.append(L)
+    rng = np.random.default_rng(36)
+    memo, n_checked, slid = {}, 0, 0
+    while n_checked < 30:
+        k = int(rng.integers(13, 15))
+        rs, L_ = (k - 1) // 4 * 4, k - (k - 1) // 4 * 4
+        o = int(rng.integers(0, 4 - L_ + 1))
+        g = np.zeros(16, dtype=np.uint8)
+        for i in range(rs):
+            g[SNAKE[i]] = 15 - i
+        for i in range(L_):
+            g[SNAKE[rs + o + i]] = 15 - (rs + i)
+        for q in range(rs, 16):
+            if not rs + o <= q < rs + o + L_:
+                g[SNAKE[q]] = int(rng.integers(0, 16 - k + 1))
+        if not (g == 0).any():
+            continue
+        b = (ctypes.c_uint8 * 16)(*g.tolist())
+        got = libs[0].tb2_value(b, k)
+        if got < 0:                       # another reading of the board (a smaller offset) won or does not fit
+            continue
+        assert got == pytest.approx(_ref_wobble(g, k, o, memo), abs=1e-4)
+        if o == 0:
+            assert got >= libs[1].tb2_value(b, k) - 1e-4
+        slid += o > 0
+        n_checked += 1
+    assert slid > 0

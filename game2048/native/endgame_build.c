@@ -34,6 +34,18 @@
 
 static int SNAKE[16] = {0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12};   /* the formation's cell path */
 static int PATHSET = 0;
+/* tables are built up to KVALID locked tiles: the longest prefix of the path whose consecutive cells are neighbours
+ * (beyond it a merge into the last locked tile would not collapse the ladder); tables above it are left at 0 */
+static int KVALID = 15;
+static int chain_length(void) {
+    int k = 1;
+    while (k < 16) {
+        int a = SNAKE[k - 1], b = SNAKE[k], dr = a / 4 - b / 4, dc = a % 4 - b % 4;
+        if (dr * dr + dc * dc != 1) break;
+        k++;
+    }
+    return k > 15 ? 15 : k;
+}
 static int DROP[16], NDROP, KCAP = 15;
 static int CAP[16][16], MAXS[16];
 static uint64_t *OFFS[16], *PR[16][16], SIZE[16];
@@ -149,7 +161,7 @@ static float solve(const uint8_t *b, int k, int *best_dir) {
         if (bd < 0 || v > best) { best = v; bd = d; }
     }
     if (best_dir) *best_dir = bd;
-    if (k < 15 && b[SNAKE[k]] == n - 1 && fits(b, k + 1)) {
+    if (k < KVALID && b[SNAKE[k]] == n - 1 && fits(b, k + 1)) {
         float w = get(k + 1, b);
         if (w > best) best = w;
     }
@@ -215,13 +227,16 @@ static uint16_t *map_file(const char *path, uint64_t n, int write) {
 
 int tb2_build(int kmin, const int *drops, int ndrops, int kcap, const char *dir, int threads) {
     set_drops(drops, ndrops, kcap);
+    KVALID = chain_length();
     char path[4096];
+    snprintf(path, sizeof path, "%s/caps.txt", dir);
+    unlink(path);                                     /* written last: a directory without it is not a finished build */
     for (int k = 15; k >= kmin; k--) {
         setup(k);
         snprintf(path, sizeof path, "%s/k%d.u16", dir, k);
         if (!(V[k] = map_file(path, SIZE[k], 1))) return -1;
         time_t t = time(NULL);
-        build_table(k, threads);
+        if (k <= KVALID) build_table(k, threads);    /* else the file stays all zeros */
         msync(V[k], SIZE[k] * 2, MS_ASYNC);
         fprintf(stderr, "table %d: %llu positions, %lds\n", k, (unsigned long long)SIZE[k], (long)(time(NULL) - t));
     }
@@ -264,7 +279,13 @@ int main(int argc, char **argv) {
     int kcap = argc > 5 ? atoi(argv[5]) : 15;
     if (argc > 6) {
         int n = 0; unsigned seen = 0;
-        for (char *p = argv[6]; *p && n < 16;) { SNAKE[n] = atoi(p); seen |= 1u << (SNAKE[n] & 15); n++; while (*p && *p != ',') p++; if (*p) p++; }
+        for (char *p = argv[6]; *p && n < 17;) {
+            int c = atoi(p);
+            if (c < 0 || c > 15 || n == 16) { n = 17; break; }
+            SNAKE[n++] = c; seen |= 1u << c;
+            while (*p && *p != ',') p++;
+            if (*p) p++;
+        }
         if (n != 16 || seen != 0xFFFF) { fprintf(stderr, "path must list the 16 cells once each\n"); return 2; }
         PATHSET = 1;
     }

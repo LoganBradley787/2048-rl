@@ -1132,7 +1132,20 @@ void nt_get_depth_caps(void *p, int *out) {
 #define EG_FAM 4
 static int eg_path[EG_FAM][16] = {{0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12}};
 static int eg_nfam = 1;
+/* eg_kvalid[f]: tables of family f are used up to this many locked tiles: the longest prefix of its path in which
+ * consecutive cells are neighbours (beyond it a merge into the last locked tile does not collapse the ladder). */
+static int eg_kvalid[EG_FAM] = {15};
 #define EG_SNAKE eg_path[0]
+
+static int eg_chain(const int *path) {
+    int k = 1;
+    while (k < 16) {
+        int a = path[k - 1], b = path[k], dr = a / 4 - b / 4, dc = a % 4 - b % 4;
+        if (dr * dr + dc * dc != 1) break;
+        k++;
+    }
+    return k > 15 ? 15 : k;
+}
 static pthread_mutex_t eg_lock = PTHREAD_MUTEX_INITIALIZER;
 static float *eg_dense[16];
 static uint32_t *eg_klo[16]; static uint8_t *eg_khi[16]; static uint16_t *eg_val[16];
@@ -1354,13 +1367,11 @@ static float eg_value(int f, const uint8_t *b, int k) {
     return best;
 }
 
-/* Whether a board, turned by symmetry s, is a table position of family f: fills o with the turned board, its corner
- * set to 32768 (see eg_choose), and *corner with the real corner, and returns the table to play it in, or 0.
- * A board with kmax tiles in place is a position of every table k <= kmax whose caps it fits (the tiles from k on
- * are in play there), and the smallest such table is never worse: it may lock the next tile itself (eg_value takes
- * the better of the two) and allows the moves that locking would forbid. So: the smallest k >= kmin with a table
- * whose caps the board fits. */
-static int eg_orient(int f, const uint8_t *c, int s, int kmin, uint8_t *o, int *corner) {
+/* Turns the board by symmetry s for family f: fills o with the turned board, its corner set to 32768 (see
+ * eg_choose), and *corner with the real corner, and returns how many tiles lie in place along the path (kmax), or
+ * 0 if the corner is not the largest. The board is then a position of every table k <= kmax that it fits: there the
+ * tiles from k on are in play. */
+static int eg_orient(int f, const uint8_t *c, int s, uint8_t *o, int *corner) {
     const int *P = eg_path[f];
     for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
     *corner = o[P[0]];
@@ -1368,15 +1379,17 @@ static int eg_orient(int f, const uint8_t *c, int s, int kmin, uint8_t *o, int *
     o[P[0]] = 15;
     int kmax = 0;
     while (kmax < 15 && o[P[kmax]] == 15 - kmax) kmax++;
-    eg_caps_default();
-    for (int k = kmin > EG_MIN ? kmin : EG_MIN; k <= kmax; k++) {
-        if (f && !eg_pre[f][k]) continue;                        /* no table for this family and k */
-        if (eg_fits(f, o, k)) return k;
-    }
-    return 0;
+    return kmax > eg_kvalid[f] ? eg_kvalid[f] : kmax;
 }
 
-/* The largest k (at least kmin) for which some orientation of the board is a table position of a family in
+/* Whether the turned board o is a position of family f's table k (which exists, with its caps fitting). */
+static int eg_usable(int f, const uint8_t *o, int k) {
+    if (k < EG_MIN || k > eg_kvalid[f] || (f && !eg_pre[f][k])) return 0;
+    eg_caps_default();
+    return eg_fits(f, o, k);
+}
+
+/* The largest k (at least kmin) for which some orientation of the board is a position of a table of a family in
  * fmask (bit f = family f), or 0. */
 static int eg_position(board_t board, int kmin, unsigned fmask) {
     uint8_t c[16], o[16];
@@ -1384,7 +1397,10 @@ static int eg_position(board_t board, int kmin, unsigned fmask) {
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
     for (int f = 0; f < eg_nfam; f++) {
         if (!((fmask >> f) & 1)) continue;
-        for (int s = 0; s < 8; s++) { int k = eg_orient(f, c, s, kmin, o, &corner); if (k > best) best = k; }
+        for (int s = 0; s < 8; s++) {
+            int kmax = eg_orient(f, c, s, o, &corner);
+            for (int k = kmax; k >= kmin && k > best; k--) if (eg_usable(f, o, k)) { best = k; break; }
+        }
     }
     return best;
 }
@@ -1398,12 +1414,16 @@ static int eg_choose(board_t board, int kmin) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
     int best_dir = -1; float best_v = 0.0f;
-    for (int f = 0; f < eg_nfam; f++)                           /* every formation with tables: the best chance */
+    /* every formation, orientation and table the board is a position of: the move with the best chance. A smaller
+     * table allows moves a larger one forbids (it may lock the next tile later), but its caps may forbid moves the
+     * larger one allows, so neither dominates: all are tried. */
+    for (int f = 0; f < eg_nfam; f++)
     for (int s = 0; s < 8; s++) {
         uint8_t o[16];                                          /* the board turned or mirrored */
-        int corner, k = eg_orient(f, c, s, kmin, o, &corner);
-        if (!k) continue;
+        int corner, kmax = eg_orient(f, c, s, o, &corner);
         const int *P = eg_path[f];
+        for (int k = kmin > EG_MIN ? kmin : EG_MIN; k <= kmax; k++) {
+        if (!eg_usable(f, o, k)) continue;
         for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
             int r;
             board_t after = do_move(board, d, &r);
@@ -1428,6 +1448,7 @@ static int eg_choose(board_t board, int kmin) {
                 }
             }
             if (v > best_v) { best_v = v; best_dir = d; }
+        }
         }
     }
     return best_dir;
@@ -1621,7 +1642,7 @@ int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops
         }
         return -1;
     }
-    if (fam && fam == eg_nfam) { memcpy(eg_path[fam], path, sizeof eg_path[0]); eg_nfam++; }
+    if (fam && fam == eg_nfam) { memcpy(eg_path[fam], path, sizeof eg_path[0]); eg_kvalid[fam] = eg_chain(path); eg_nfam++; }
     for (int k = kmin; k <= 15; k++) {
         eg_offs[fam][k] = offs[k]; eg_psize[fam][k] = size[k];
         for (int j = 0; j < 16 - k; j++) { eg_tcap[fam][k][j] = caps[k][j]; eg_rank[fam][k][j] = rank[k][j]; }
@@ -1655,7 +1676,7 @@ float nt_endgame_value_family(uint64_t lo, uint64_t hi, int k, int f) {
     board_t b = mk(lo, hi);
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
-    if (k < EG_MIN || k > 15 || f < 0 || f >= eg_nfam || (f && !eg_pre[f][k])) return -1.0f;
+    if (k < EG_MIN || k > 15 || f < 0 || f >= eg_nfam || k > eg_kvalid[f] || (f && !eg_pre[f][k])) return -1.0f;
     for (int i = 0; i < k; i++) if (c[eg_path[f][i]] != 15 - i) return -1.0f;
     eg_caps_default();
     if (!eg_fits(f, c, k)) return -1.0f;
@@ -1696,6 +1717,7 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         int d = eg_choose(b, c->net->endgame);
         if (d >= 0) return d;
     }
+    board_t real = b;
     b = root_board(c->net, b);
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;
@@ -1705,6 +1727,8 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         int r;
         board_t a = do_move(b, d, &r);
         if (a == b) continue;
+        if (b != real && do_move(real, d, &r) == real) continue;   /* legal on the twin only (tiles at the top) */
+        a = do_move(b, d, &r);
         double v = (double)r + chance_node(c, a, depth, 1.0);
         if (best < 0 || v > bestv) { bestv = v; best = d; }
     }

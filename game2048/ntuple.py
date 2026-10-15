@@ -326,7 +326,7 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
     Returns the lowest table loaded. Call before any play."""
     from pathlib import Path
     d = Path(directory)
-    words = (d / "caps.txt").read_text().split() if None in (kmin, drops, kcap) else []
+    words = (d / "caps.txt").read_text().split()           # always read: it also names the formation
     if words and (len(words) < 4 or words[3] != "2"):
         raise ValueError(f"{d / 'caps.txt'} should read 'kmin d0,d1,... kcap 2' (layout 2, notes/tb/build2.c)")
     kmin = int(words[0]) if kmin is None else kmin

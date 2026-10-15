@@ -29,7 +29,7 @@ import numpy as np
 from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
-SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps"]
+SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5"]
 
 
 def weights_md5(path: Path) -> str:
@@ -116,6 +116,8 @@ def main(argv=None) -> None:
                 "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None,
                 "endgame_bits": args.endgame_bits if args.endgame else None,
                 "endgame_dir": args.endgame_dir,
+                # the engine's source: a run resumed under another engine would mix two players
+                "engine_md5": hashlib.md5(nt.SRC.read_bytes()).hexdigest(),
                 "endgame_caps": args.endgame_dir and " | ".join((Path(d) / "caps.txt").read_text().strip()
                                                                 for d in args.endgame_dir), "weights": str(path), "games": args.games}
     meta = out.with_suffix(".json")

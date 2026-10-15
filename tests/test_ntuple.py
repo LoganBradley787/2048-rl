@@ -1315,8 +1315,9 @@ def _snake_board(k, play):
     return g
 
 
-def _ref_endgame(g, k, memo, path=SNAKE):
-    """Plain Python version of the engine's endgame rule, for the few-cell tables, along a cell path."""
+def _ref_endgame(g, k, memo, path=SNAKE, kvalid=15):
+    """Plain Python version of the engine's endgame rule, for the few-cell tables, along a cell path whose first
+    kvalid cells are a chain of neighbours (no tables beyond)."""
     SNAKE = path
     n = 16 - k
     key = (bytes(g), k)
@@ -1340,11 +1341,11 @@ def _ref_endgame(g, k, memo, path=SNAKE):
                 if v > n:
                     continue
                 a[c] = v
-                total += p * _ref_endgame(a.copy(), k, memo, path)
+                total += p * _ref_endgame(a.copy(), k, memo, path, kvalid)
                 a[c] = 0
         best = max(best, total / len(empty) if empty else 0.0)
-    if k < 15 and g[SNAKE[k]] == n - 1 and all(g[SNAKE[i]] <= n - 1 for i in range(k + 1, 16)):
-        best = max(best, _ref_endgame(g, k + 1, memo, path))
+    if k < kvalid and g[SNAKE[k]] == n - 1 and all(g[SNAKE[i]] <= n - 1 for i in range(k + 1, 16)):
+        best = max(best, _ref_endgame(g, k + 1, memo, path, kvalid))
     memo[key] = best
     return best
 
@@ -1609,7 +1610,11 @@ assert nt.lib().nt_endgame_families() == 2
 out = [nt.endgame_value(nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4)), k, 1) for g, k in boards]
 net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
 r = net.reach(np.array([boards[0][0]], dtype=np.uint8).reshape(1, 4, 4), k=12, families=2)
-print(json.dumps({"values": out, "block_reached": int(r["reached"][0])}))
+g = np.zeros(16, dtype=np.uint8)
+for i in range(13):
+    g[nt.BLOCK_PATH[i]] = 15 - i
+beyond = nt.endgame_value(nt.to_bits(g.reshape(4, 4)), 13, 1)
+print(json.dumps({"values": out, "block_reached": int(r["reached"][0]), "beyond": beyond}))
 """
 
 
@@ -1628,7 +1633,7 @@ def test_endgame_tables_of_a_second_formation(tmp_path):
     rng = np.random.default_rng(21)
     boards, want, memo = [], [], {}
     while len(boards) < 16:
-        k = int(rng.integers(12, 14))
+        k = 12                       # the block path's cells are neighbours up to 12 locked (cell 3 to 15 is not)
         g = np.zeros(16, dtype=np.uint8)
         for i in range(k):
             g[nt.BLOCK_PATH[i]] = 15 - i
@@ -1637,11 +1642,23 @@ def test_endgame_tables_of_a_second_formation(tmp_path):
         if not (g == 0).any():
             continue
         boards.append((g.tolist(), k))
-        want.append(_ref_endgame(g, k, memo, nt.BLOCK_PATH))
+        want.append(_ref_endgame(g, k, memo, nt.BLOCK_PATH, 12))
     r = subprocess.run([sys.executable, "-c", _FAMILY_CHECK, str(tmp_path / "snake"), str(tmp_path / "block"),
                         json.dumps(boards)], capture_output=True, text=True, cwd=root)
     assert r.returncode == 0, r.stderr
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got["values"] == pytest.approx(want, abs=1e-4)
     assert got["block_reached"] == 1
+    assert got["beyond"] == -1.0     # 13 locked along the block path is past its chain: no table
 
+
+
+def test_search_never_picks_a_move_only_its_downgraded_twin_allows():
+    """Two 131072s cannot merge (the largest tile), but downgraded they look like two smaller tiles that can:
+    the search must only take moves that are legal on the real board, or play_boards would loop forever."""
+    net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+    net.downgrade = 32768
+    g = np.array([[17, 17, 1, 2], [3, 4, 2, 1], [4, 3, 1, 2], [3, 4, 2, 1]], dtype=np.uint8)
+    assert net.best_move(nt.to_bits(g), depth=1) == -1
+    r = net.play_boards(g.reshape(1, 4, 4), depth=1, threads=1, seed=1)
+    assert r["moves"][0] == 0

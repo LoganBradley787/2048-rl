@@ -1715,6 +1715,31 @@ print(json.dumps({"values": out, "gap_reached": int(r["reached"][0] and r["moves
 """
 
 
+_LIFT_PRIORITY_CHECK = r"""
+import json, sys
+import numpy as np
+from game2048 import ntuple as nt
+d = sys.argv[1]
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+net.endgame = 12
+rng = np.random.default_rng(5)
+boards = []
+while len(boards) < 40:
+    g = np.zeros(16, dtype=np.uint8)
+    for i in range(12):
+        g[nt.SNAKE_PATH[i]] = 15 - i                               # a whole ladder 32768 ... 16
+    for c in nt.SNAKE_PATH[13:]:
+        g[c] = int(rng.integers(0, 4))
+    g[nt.SNAKE_PATH[12]] = 2                                       # a 4 next: also a lift-1 position (13 locked)
+    if (g == 0).any():
+        boards.append(g.reshape(4, 4))
+before = [net.best_move(nt.to_bits(g), depth=1) for g in boards]
+assert nt.load_endgame(d) == 11
+after = [net.best_move(nt.to_bits(g), depth=1) for g in boards]
+print(json.dumps({"same": sum(a == b for a, b in zip(before, after)), "n": len(boards)}))
+"""
+
+
 def test_sub_goal_tables_with_a_lift(tmp_path):
     """Tables with lift 1 (the last locked tile one size below the usual one) give the values of the plain
     Python solution, and a real board with a gap in its ladder is a position of them (the tiles above the gap
@@ -1746,4 +1771,11 @@ def test_sub_goal_tables_with_a_lift(tmp_path):
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got["values"] == pytest.approx(want, abs=1e-4)
     assert got["gap_reached"] == 1
+    # a board the snake tables hold plays the snake's move: the lift-1 chance (of the next tile alone) never
+    # outbids it
+    r = subprocess.run([sys.executable, "-c", _LIFT_PRIORITY_CHECK, str(tmp_path / "lift1")],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["same"] == got["n"]
 

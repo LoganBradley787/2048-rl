@@ -1433,9 +1433,16 @@ static int eg_choose(board_t board, int kmin) {
     int best_dir = -1; float best_v = 0.0f;
     /* every formation, orientation and table the board is a position of: the move with the best chance. A smaller
      * table allows moves a larger one forbids (it may lock the next tile later), but its caps may forbid moves the
-     * larger one allows, so neither dominates: all are tried. */
+     * larger one allows, so neither dominates: all are tried.
+     * Lifts are tried from 0 up, and a higher lift only when no table of a lower one holds the board: a lift-g table's
+     * chance is that of a nearer goal (filling the gap), not comparable with a lower lift's. On a whole ladder with
+     * a small tile after it, the lift-1 tables read the ladder as boulders and would play for the next tile alone. */
+    int gmax = 0;
+    for (int f = 0; f < eg_nfam; f++) if (eg_lift[f] > gmax) gmax = eg_lift[f];
+    for (int g = 0, held = 0; g <= gmax && !held; g++)
     for (int f = 0; f < eg_nfam; f++)
     for (int s = 0; s < 8; s++) {
+        if (eg_lift[f] != g) break;
         uint8_t o[16], real[16];                                /* the board turned or mirrored */
         int nb, kmax = eg_orient(f, c, s, o, real, &nb);
         const int *P = eg_path[f];
@@ -1443,6 +1450,7 @@ static int eg_choose(board_t board, int kmin) {
         if (k0 <= nb) k0 = nb + 1;
         for (int k = k0; k <= kmax; k++) {
         if (!eg_usable(f, o, k)) continue;
+        held = 1;
         for (int d = 0; d < 4; d++) {                           /* each move, made on the real board */
             int r;
             board_t after = do_move(board, d, &r);
@@ -1451,7 +1459,6 @@ static int eg_choose(board_t board, int kmin) {
             for (int i = 0; i < 16; i++) a[i] = (uint8_t)cell(after, i);
             for (int i = 0; i < 16; i++) t[i] = a[sym_cell(i, s)];
             int ok2 = 1;
-            const int g = eg_lift[f];
             for (int i = 0; i < nb && ok2; i++) {               /* boulders stay as they are, then read as the table's */
                 if (t[P[i]] != real[i]) ok2 = 0;
                 t[P[i]] = (uint8_t)(15 - i - g);

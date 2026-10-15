@@ -1779,3 +1779,29 @@ def test_sub_goal_tables_with_a_lift(tmp_path):
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got["same"] == got["n"]
 
+
+
+
+def test_deep_window_searches_deeper_only_when_the_board_holds_the_tiles():
+    """net.deep = (depth, tiles): boards holding every listed tile are searched at that depth, others as asked."""
+    rng = np.random.default_rng(12)
+    net = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)
+    net.deep = (3, [2048, 1024])
+    assert net.deep == (3, [1024, 2048])
+    differ = 0
+    for i in range(60):
+        g = rng.integers(0, 8, size=16).astype(np.uint8)
+        g[rng.integers(0, 16)] = 0
+        if i % 2:
+            g[0], g[1] = 11, 10
+        b = nt.to_bits(g.reshape(4, 4))
+        has = {11, 10} <= set(int(x) for x in g)
+        got = net.best_move(b, depth=1)
+        net.deep = None
+        shallow, deep = net.best_move(b, depth=1), net.best_move(b, depth=3)
+        net.deep = (3, [2048, 1024])
+        assert got == (deep if has else shallow)
+        differ += has and deep != shallow
+    assert differ > 0
+    net.deep = None
+    assert net.deep == (0, [])

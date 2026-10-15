@@ -250,6 +250,8 @@ def lib() -> ctypes.CDLL:
     L.nt_get_tt_bits.argtypes, L.nt_get_tt_bits.restype = [vp], i32
     L.nt_set_depth_caps.argtypes = [vp, P(i32)]
     L.nt_get_depth_caps.argtypes = [vp, P(i32)]
+    L.nt_set_deep.argtypes = [vp, i32, ctypes.c_uint]
+    L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
     L.nt_beam_plan.argtypes, L.nt_beam_plan.restype = [vp, u64, u64, i32, i32, i32, f64, i32, P(i32), P(i32), P(i32)], i32
@@ -705,6 +707,23 @@ class NTupleNet:
         if caps:
             caps = (caps + [caps[-1]] * 17)[:17]
         self._lib.nt_set_depth_caps(self._h, (ctypes.c_int32 * 17)(*caps) if caps else None)
+
+    @property
+    def deep(self) -> tuple[int, list[int]]:
+        """(depth, tiles): search at least `depth` deep whenever the board holds every tile in `tiles` (tile
+        values, e.g. [32768, 16384, 8192]); (0, []) = off. Boards the endgame tables hold are still played by
+        them. Set it between searches."""
+        need = ctypes.c_uint(0)
+        d = int(self._lib.nt_get_deep(self._h, ctypes.byref(need)))
+        return d, [1 << e for e in range(32) if need.value >> e & 1]
+
+    @deep.setter
+    def deep(self, value) -> None:
+        depth, tiles = value if value else (0, [])
+        need = 0
+        for t in tiles:
+            need |= 1 << (int(t).bit_length() - 1)
+        self._lib.nt_set_deep(self._h, int(depth), need)
 
     def root_board(self, bits: int) -> int:
         """The board the search evaluates for this root (downgraded while it holds the threshold tile)."""

@@ -228,6 +228,8 @@ typedef struct net {
     int expect;              /* training target: 0 = the tile that appeared, 1 = the average over every tile that could */
     int tt_bits;             /* transposition table size for searches on this network */
     int depth_cap[17];       /* random-spawn search: deepest search for a root with this many empty cells (0 = no cap) */
+    int deep_depth;          /* search at least this deep when the board holds every tile in deep_need (0 = off) */
+    unsigned deep_need;      /* bit e: a tile 2^e (before the depth caps; tables still take their boards first) */
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -1108,6 +1110,14 @@ void nt_get_depth_caps(void *p, int *out) {
     for (int i = 0; i < 17; i++) out[i] = ((net_t *)p)->depth_cap[i];
 }
 
+void nt_set_deep(void *p, int depth, unsigned need) {
+    net_t *net = (net_t *)p;
+    net->deep_depth = depth > 0 ? depth : 0;
+    net->deep_need = need;
+}
+
+int nt_get_deep(void *p, unsigned *need) { *need = ((net_t *)p)->deep_need; return ((net_t *)p)->deep_depth; }
+
 /* ------------------------------------------------------------- endgame --- */
 
 /* Exact tables for the end of the game, used to choose the move once a board qualifies.
@@ -1762,6 +1772,11 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         if (d >= 0) return d;
     }
     board_t real = b;
+    if (c->net->deep_depth > depth) {                          /* a deeper search while the board holds certain tiles */
+        unsigned present = 0;
+        for (int i = 0; i < 16; i++) present |= 1u << cell(real, i);
+        if ((present & c->net->deep_need) == c->net->deep_need) depth = c->net->deep_depth;
+    }
     b = root_board(c->net, b);
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;

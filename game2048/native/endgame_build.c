@@ -14,8 +14,8 @@
  * (stored just after it) and table k+1: the files are written in place through a shared mapping, and no table
  * needs to fit in memory. Values: uint16, v * 65535 rounded.
  *
- * Program:  endgame_build <kmin> <d0,d1,...> <outdir> [threads] [kcap] [path]
- *           writes <outdir>/k<k>.u16 for k = kmin .. 15 and <outdir>/caps.txt ("kmin drops kcap 2 [path]").
+ * Program:  endgame_build <kmin> <d0,d1,...> <outdir> [threads] [kcap] [path|-] [lift]
+ *           writes <outdir>/k<k>.u16 for k = kmin .. 15 and <outdir>/caps.txt ("kmin drops kcap 2 [path [lift]]").
  *           path: 16 cells, comma-separated, the order the big tiles lie in (default: the snake
  *           0,1,2,3,7,6,5,4,8,9,10,11,15,14,13,12); consecutive locked cells must be neighbours.
  * Library:  tb2_build, tb2_load, tb2_value, tb2_size (for checks).
@@ -37,6 +37,11 @@ static int PATHSET = 0;
 /* tables are built up to KVALID locked tiles: the longest prefix of the path whose consecutive cells are neighbours
  * (beyond it a merge into the last locked tile would not collapse the ladder); tables above it are left at 0 */
 static int KVALID = 15;
+/* LIFT g: sub-goal tables. The i-th locked tile is 2^(15 - i - g), so the last one (the tile to merge into) is
+ * 2^(16 - k - g) and tiles in play go up to it. In a real game the tiles above a gap in the ladder are boulders
+ * (see eg_orient in ntuple.c): with 32768 16384 | 4096 2048 1024 the 8192 is being built, a table with g = 1. */
+static int LIFT = 0;
+static inline int top_of(int k) { return 16 - k - LIFT; }
 static int chain_length(void) {
     int k = 1;
     while (k < 16) {
@@ -54,7 +59,7 @@ static uint16_t *V[16];
 static inline int units(int e) { return e ? 1 << (e - 1) : 0; }
 
 static int cap_of(int k, int j) {
-    int n = 16 - k, d = NDROP && k <= KCAP ? DROP[j < NDROP ? j : NDROP - 1] : 0, c = n - d;
+    int n = top_of(k), d = NDROP && k <= KCAP ? DROP[j < NDROP ? j : NDROP - 1] : 0, c = n - d;
     if (c < 2) c = 2;
     return c > n ? n : c;
 }
@@ -139,13 +144,13 @@ static int move(const uint8_t *b, int dir, uint8_t *out) {
 
 /* the value of position b of table k: the best allowed move, or locking the next rung (as eg_value in ntuple.c) */
 static float solve(const uint8_t *b, int k, int *best_dir) {
-    int n = 16 - k;
+    int n = top_of(k);                                   /* the last locked tile; tiles in play up to it */
     float best = 0.0f; int bd = -1;
     for (int d = 0; d < 4; d++) {
         uint8_t a[16];
         if (!move(b, d, a)) continue;
         int ok = 1;
-        for (int i = 0; i < k - 1 && ok; i++) if (a[SNAKE[i]] != 15 - i) ok = 0;
+        for (int i = 0; i < k - 1 && ok; i++) if (a[SNAKE[i]] != 15 - i - LIFT) ok = 0;
         if (!ok) continue;
         if (a[SNAKE[k - 1]] == n + 1) { best = 1.0f; bd = d; break; }
         if (a[SNAKE[k - 1]] != n || !fits(a, k)) continue;
@@ -197,7 +202,7 @@ static void build_table(int k, int threads) {
             int rem = s - units(e0) - (split == 2 ? units(e1) : 0);
             if (rem < 0 || rem > maxrem[split]) continue;
             uint8_t b[16];
-            for (int i = 0; i < k; i++) b[SNAKE[i]] = (uint8_t)(15 - i);
+            for (int i = 0; i < k; i++) b[SNAKE[i]] = (uint8_t)(15 - i - LIFT);
             for (int i = k; i < 16; i++) b[SNAKE[i]] = 0;
             b[SNAKE[k]] = (uint8_t)e0;
             if (split == 2) b[SNAKE[k + 1]] = (uint8_t)e1;
@@ -228,10 +233,11 @@ static uint16_t *map_file(const char *path, uint64_t n, int write) {
 int tb2_build(int kmin, const int *drops, int ndrops, int kcap, const char *dir, int threads) {
     set_drops(drops, ndrops, kcap);
     KVALID = chain_length();
+    if (KVALID > 15 - LIFT) KVALID = 15 - LIFT;         /* the last locked tile must be at least a 2 */
     char path[4096];
     snprintf(path, sizeof path, "%s/caps.txt", dir);
     unlink(path);                                     /* written last: a directory without it is not a finished build */
-    for (int k = 15; k >= kmin; k--) {
+    for (int k = 15 - LIFT; k >= kmin; k--) {
         setup(k);
         snprintf(path, sizeof path, "%s/k%d.u16", dir, k);
         if (!(V[k] = map_file(path, SIZE[k], 1))) return -1;
@@ -240,13 +246,14 @@ int tb2_build(int kmin, const int *drops, int ndrops, int kcap, const char *dir,
         msync(V[k], SIZE[k] * 2, MS_ASYNC);
         fprintf(stderr, "table %d: %llu positions, %lds\n", k, (unsigned long long)SIZE[k], (long)(time(NULL) - t));
     }
-    for (int k = kmin; k <= 15; k++) msync(V[k], SIZE[k] * 2, MS_SYNC);
+    for (int k = kmin; k <= 15 - LIFT; k++) msync(V[k], SIZE[k] * 2, MS_SYNC);
     snprintf(path, sizeof path, "%s/caps.txt", dir);
     FILE *f = fopen(path, "w"); if (!f) return -1;
     fprintf(f, "%d ", kmin);
     for (int j = 0; j < NDROP; j++) fprintf(f, j ? ",%d" : "%d", DROP[j]);
     fprintf(f, " %d 2", KCAP);
-    if (PATHSET) for (int i = 0; i < 16; i++) fprintf(f, i ? ",%d" : " %d", SNAKE[i]);
+    if (PATHSET || LIFT) for (int i = 0; i < 16; i++) fprintf(f, i ? ",%d" : " %d", SNAKE[i]);
+    if (LIFT) fprintf(f, " %d", LIFT);
     fprintf(f, "\n");
     return fclose(f) == 0 ? 0 : -1;
 }
@@ -254,7 +261,7 @@ int tb2_build(int kmin, const int *drops, int ndrops, int kcap, const char *dir,
 int tb2_load(const char *dir, int kmin, const int *drops, int ndrops, int kcap) {
     set_drops(drops, ndrops, kcap);
     char path[4096];
-    for (int k = kmin; k <= 15; k++) {
+    for (int k = kmin; k <= 15 - LIFT; k++) {
         setup(k);
         snprintf(path, sizeof path, "%s/k%d.u16", dir, k);
         if (!(V[k] = map_file(path, SIZE[k], 0))) return -1;
@@ -267,17 +274,19 @@ unsigned long long tb2_size(int k) { return (unsigned long long)SIZE[k]; }
 /* board: 16 exponents turned so the locked tiles are on the snake; -1 if not a position of table k */
 float tb2_value(const uint8_t *b, int k) {
     if (k < 1 || k > 15 || !V[k]) return -1.0f;
-    for (int i = 0; i < k; i++) if (b[SNAKE[i]] != 15 - i) return -1.0f;
+    for (int i = 0; i < k; i++) if (b[SNAKE[i]] != 15 - i - LIFT) return -1.0f;
     if (!fits(b, k)) return -1.0f;
     return get(k, b);
 }
 
 #ifdef EGB_MAIN
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "build2 <kmin> <d0,d1,...> <outdir> [threads] [kcap]\n"); return 2; }
+    if (argc < 4) { fprintf(stderr, "endgame_build <kmin> <d0,d1,...> <outdir> [threads] [kcap] [path|-] [lift]\n"); return 2; }
     int kmin = atoi(argv[1]), drops[16], nd = 0, threads = argc > 4 ? atoi(argv[4]) : 1;
     int kcap = argc > 5 ? atoi(argv[5]) : 15;
-    if (argc > 6) {
+    if (argc > 7) LIFT = atoi(argv[7]);
+    if (LIFT < 0 || LIFT > 8) { fprintf(stderr, "lift must be 0 .. 8\n"); return 2; }
+    if (argc > 6 && strcmp(argv[6], "-") != 0) {
         int n = 0; unsigned seen = 0;
         for (char *p = argv[6]; *p && n < 17;) {
             int c = atoi(p);

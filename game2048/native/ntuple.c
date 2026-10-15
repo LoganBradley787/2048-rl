@@ -1135,6 +1135,10 @@ static int eg_nfam = 1;
 /* eg_kvalid[f]: tables of family f are used up to this many locked tiles: the longest prefix of its path in which
  * consecutive cells are neighbours (beyond it a merge into the last locked tile does not collapse the ladder). */
 static int eg_kvalid[EG_FAM] = {15};
+/* eg_lift[f] (g): sub-goal tables. The i-th locked tile is 2^(15 - i - g), so the last one is 2^(16 - k - g) and
+ * tiles in play go up to it: a gap in the ladder is being filled (with 32768 16384 | 4096 2048 1024 the 8192 is
+ * being built: g = 1, the tiles above the gap read as boulders). Their value is the chance of filling the gap. */
+static int eg_lift[EG_FAM];
 #define EG_SNAKE eg_path[0]
 
 static int eg_chain(const int *path) {
@@ -1285,7 +1289,7 @@ static float eg_value(int f, const uint8_t *b, int k);
 
 /* the expected value of an afterstate in table k, over the tile that comes next */
 static float eg_after(int f, uint8_t *a, int k) {
-    int n = 16 - k, empty = 0;
+    int n = 16 - k - eg_lift[f], empty = 0;                     /* the last locked tile; tiles in play up to it */
     double sum = 0.0;
     for (int c = 0; c < 16; c++) {
         if (a[c]) continue;
@@ -1382,7 +1386,7 @@ static int eg_orient(int f, const uint8_t *c, int s, uint8_t *o, uint8_t *real, 
     int kmax = 0, prev = 255;
     *nb = 0;
     while (kmax < 15) {
-        int v = o[P[kmax]], want = 15 - kmax;
+        int v = o[P[kmax]], want = 15 - kmax - eg_lift[f];
         if (v == want) { }                                         /* the table's tile */
         else if (v > want && v < prev && *nb == kmax) (*nb)++;     /* a boulder (only before the table's tiles) */
         else break;
@@ -1447,17 +1451,18 @@ static int eg_choose(board_t board, int kmin) {
             for (int i = 0; i < 16; i++) a[i] = (uint8_t)cell(after, i);
             for (int i = 0; i < 16; i++) t[i] = a[sym_cell(i, s)];
             int ok2 = 1;
+            const int g = eg_lift[f];
             for (int i = 0; i < nb && ok2; i++) {               /* boulders stay as they are, then read as the table's */
                 if (t[P[i]] != real[i]) ok2 = 0;
-                t[P[i]] = (uint8_t)(15 - i);
+                t[P[i]] = (uint8_t)(15 - i - g);
             }
             if (!ok2) continue;                                 /* the same tests as eg_try, on the turned afterstate */
-            for (int i = 0; i < k - 1 && ok2; i++) if (t[P[i]] != 15 - i) ok2 = 0;
+            for (int i = 0; i < k - 1 && ok2; i++) if (t[P[i]] != 15 - i - g) ok2 = 0;
             if (!ok2) continue;
             float v;
-            if (t[P[k - 1]] == 17 - k) v = 1.0f;
+            if (t[P[k - 1]] == 17 - k - g) v = 1.0f;
             else {
-                if (t[P[k - 1]] != 16 - k || !eg_fits(f, t, k)) continue;
+                if (t[P[k - 1]] != 16 - k - g || !eg_fits(f, t, k)) continue;
                 if (eg_pre[f][k]) v = eg_after(f, t, k);        /* read-only: no lock */
                 else {
                     pthread_mutex_lock(&eg_lock);
@@ -1588,11 +1593,14 @@ void nt_play_boards(void *p, const uint64_t *starts_lohi, long n, int depth, int
  * or -1 (nothing changed) if a file is missing or the wrong size, the family is already loaded or there is no room.
  * Call before any play. */
 static int eg_family_loaded(int f) { for (int k = EG_MIN; k <= 15; k++) if (eg_pre[f][k]) return 1; return 0; }
-int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path) {
-    if (kmin < EG_MIN || kmin > 15 || ndrops < 0 || ndrops > 16) return -1;
+int nt_endgame_load_family(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path,
+                           int lift) {
+    if (kmin < EG_MIN || kmin > 15 || ndrops < 0 || ndrops > 16 || lift < 0 || lift > 8) return -1;
+    if (!path) path = eg_path[0];
     int fam = 0;
-    if (path && memcmp(path, eg_path[0], sizeof eg_path[0]) != 0) {
-        for (fam = 1; fam < eg_nfam; fam++) if (memcmp(path, eg_path[fam], sizeof eg_path[0]) == 0) break;
+    if (lift || memcmp(path, eg_path[0], sizeof eg_path[0]) != 0) {     /* family 0 is the snake without lift */
+        for (fam = 1; fam < eg_nfam; fam++)
+            if (memcmp(path, eg_path[fam], sizeof eg_path[0]) == 0 && eg_lift[fam] == lift) break;
         if (fam == EG_FAM) return -1;
         unsigned seen = 0;                                       /* a path must hold every cell once */
         for (int i = 0; i < 16; i++) { if (path[i] < 0 || path[i] > 15) return -1; seen |= 1u << path[i]; }
@@ -1604,12 +1612,14 @@ int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops
     uint64_t *offs[16] = {0}, *rank[16][16] = {{0}}, size[16];
     uint16_t *maps[16] = {0};
     int ok = 1;
-    for (int k = kmin; k <= 15 && ok; k++) {
-        int n = 16 - k, S = 0;
+    const int kend = 15 - lift;                                /* the last locked tile is at least a 2 */
+    if (kmin > kend) return -1;
+    for (int k = kmin; k <= kend && ok; k++) {
+        int n = 16 - k, top = n - lift, S = 0;                  /* n cells in play, tiles up to 2^top */
         for (int j = 0; j < n; j++) {
-            int d = ndrops && k <= kcap ? drops[j < ndrops ? j : ndrops - 1] : 0, c = n - d;
+            int d = ndrops && k <= kcap ? drops[j < ndrops ? j : ndrops - 1] : 0, c = top - d;
             if (c < 2) c = 2;
-            if (c > n) c = n;
+            if (c > top) c = top;
             caps[k][j] = c; S += eg_units(c);
         }
         uint64_t *cnt = (uint64_t *)calloc((size_t)(n + 1) * (S + 1), sizeof(uint64_t));   /* cells j.. with r units */
@@ -1653,20 +1663,29 @@ int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops
         maps[k] = (uint16_t *)m;
     }
     if (!ok) {
-        for (int k = kmin; k <= 15; k++) {
+        for (int k = kmin; k <= kend; k++) {
             if (maps[k]) munmap(maps[k], size[k] * 2);
             free(offs[k]);
             for (int j = 0; j < 16; j++) free(rank[k][j]);
         }
         return -1;
     }
-    if (fam && fam == eg_nfam) { memcpy(eg_path[fam], path, sizeof eg_path[0]); eg_kvalid[fam] = eg_chain(path); eg_nfam++; }
-    for (int k = kmin; k <= 15; k++) {
+    if (fam && fam == eg_nfam) {
+        memcpy(eg_path[fam], path, sizeof eg_path[0]);
+        eg_lift[fam] = lift;
+        eg_kvalid[fam] = eg_chain(path);
+        if (eg_kvalid[fam] > 15 - lift) eg_kvalid[fam] = 15 - lift;    /* the last locked tile is at least a 2 */
+        eg_nfam++;
+    }
+    for (int k = kmin; k <= kend; k++) {
         eg_offs[fam][k] = offs[k]; eg_psize[fam][k] = size[k];
         for (int j = 0; j < 16 - k; j++) { eg_tcap[fam][k][j] = caps[k][j]; eg_rank[fam][k][j] = rank[k][j]; }
     }
-    for (int k = kmin; k <= 15; k++) eg_pre[fam][k] = maps[k]; /* last: a table is used only once all is set */
+    for (int k = kmin; k <= kend; k++) eg_pre[fam][k] = maps[k]; /* last: a table is used only once all is set */
     return fam;
+}
+int nt_endgame_load_path(const char *dir, int kmin, const int *drops, int ndrops, int kcap, const int *path) {
+    return nt_endgame_load_family(dir, kmin, drops, ndrops, kcap, path, 0);
 }
 int nt_endgame_load(const char *dir, int kmin, const int *drops, int ndrops, int kcap) {
     return nt_endgame_load_path(dir, kmin, drops, ndrops, kcap, NULL) < 0 ? -1 : 0;
@@ -1695,7 +1714,7 @@ float nt_endgame_value_family(uint64_t lo, uint64_t hi, int k, int f) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
     if (k < EG_MIN || k > 15 || f < 0 || f >= eg_nfam || k > eg_kvalid[f] || (f && !eg_pre[f][k])) return -1.0f;
-    for (int i = 0; i < k; i++) if (c[eg_path[f][i]] != 15 - i) return -1.0f;
+    for (int i = 0; i < k; i++) if (c[eg_path[f][i]] != 15 - i - eg_lift[f]) return -1.0f;
     eg_caps_default();
     if (!eg_fits(f, c, k)) return -1.0f;
     pthread_mutex_lock(&eg_lock);

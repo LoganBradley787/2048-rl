@@ -234,6 +234,8 @@ def lib() -> ctypes.CDLL:
     L.nt_endgame_loaded.restype = i32
     L.nt_endgame_load_path.argtypes = [ctypes.c_char_p, i32, P(i32), i32, i32, P(i32)]
     L.nt_endgame_load_path.restype = i32
+    L.nt_endgame_load_family.argtypes = [ctypes.c_char_p, i32, P(i32), i32, i32, P(i32), i32]
+    L.nt_endgame_load_family.restype = i32
     L.nt_endgame_loaded_family.argtypes, L.nt_endgame_loaded_family.restype = [i32], i32
     L.nt_endgame_families.restype = i32
     L.nt_endgame_value_family.argtypes, L.nt_endgame_value_family.restype = [u64, u64, i32, i32], f32
@@ -318,10 +320,11 @@ def endgame_value(bits: int, k: int, family: int = 0) -> float:
 
 
 def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = None, kcap: int | None = None,
-                 path: list[int] | None = None) -> int:
+                 path: list[int] | None = None, lift: int | None = None) -> int:
     """Use endgame tables built in advance: <directory>/k<k>.u16 for k = kmin .. 15. kmin,
     the caps (drops), the largest capped table (kcap) and the formation's cell path are read
-    from <directory>/caps.txt ("kmin d0,d1,... kcap 2 [path]"; no path = the snake) unless given.
+    from <directory>/caps.txt ("kmin d0,d1,... kcap 2 [path [lift]]"; no path = the snake, no lift = 0)
+    unless given. lift g: sub-goal tables whose last locked tile is g sizes below the usual one.
     Each formation once per process; several formations can be loaded and play takes the best.
     Returns the lowest table loaded. Call before any play."""
     from pathlib import Path
@@ -334,9 +337,11 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
     kcap = (int(words[2]) if len(words) > 2 else 15) if kcap is None else kcap
     if path is None and len(words) > 4:
         path = [int(x) for x in words[4].split(",")]
+    if lift is None:
+        lift = int(words[5]) if len(words) > 5 else 0
     arr = (ctypes.c_int32 * 16)(*drops)
     p = (ctypes.c_int32 * 16)(*path) if path else None
-    if lib().nt_endgame_load_path(str(d).encode(), int(kmin), arr, len(drops), int(kcap), p) < 0:
+    if lib().nt_endgame_load_family(str(d).encode(), int(kmin), arr, len(drops), int(kcap), p, int(lift)) < 0:
         raise ValueError(f"no tables for {kmin} locked and up in {d} with caps {drops} (or that formation is loaded)")
     return int(kmin)
 

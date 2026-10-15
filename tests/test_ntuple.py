@@ -1315,11 +1315,11 @@ def _snake_board(k, play):
     return g
 
 
-def _ref_endgame(g, k, memo, path=SNAKE, kvalid=15):
+def _ref_endgame(g, k, memo, path=SNAKE, kvalid=15, lift=0):
     """Plain Python version of the engine's endgame rule, for the few-cell tables, along a cell path whose first
-    kvalid cells are a chain of neighbours (no tables beyond)."""
+    kvalid cells are a chain of neighbours (no tables beyond); lift g: the locked tiles are 2^(15 - i - g)."""
     SNAKE = path
-    n = 16 - k
+    n = 16 - k - lift
     key = (bytes(g), k)
     if key in memo:
         return memo[key]
@@ -1327,7 +1327,7 @@ def _ref_endgame(g, k, memo, path=SNAKE, kvalid=15):
     for d in range(4):
         moved, _ = nt.move(nt.to_bits(g.reshape(4, 4)), d)
         a = nt.from_bits(moved).ravel().copy()
-        if (a == g).all() or any(a[SNAKE[i]] != 15 - i for i in range(k - 1)):
+        if (a == g).all() or any(a[SNAKE[i]] != 15 - i - lift for i in range(k - 1)):
             continue
         if a[SNAKE[k - 1]] == n + 1:
             best = 1.0
@@ -1341,11 +1341,11 @@ def _ref_endgame(g, k, memo, path=SNAKE, kvalid=15):
                 if v > n:
                     continue
                 a[c] = v
-                total += p * _ref_endgame(a.copy(), k, memo, path, kvalid)
+                total += p * _ref_endgame(a.copy(), k, memo, path, kvalid, lift)
                 a[c] = 0
         best = max(best, total / len(empty) if empty else 0.0)
-    if k < kvalid and g[SNAKE[k]] == n - 1 and all(g[SNAKE[i]] <= n - 1 for i in range(k + 1, 16)):
-        best = max(best, _ref_endgame(g, k + 1, memo, path, kvalid))
+    if k < min(kvalid, 15 - lift) and g[SNAKE[k]] == n - 1 and all(g[SNAKE[i]] <= n - 1 for i in range(k + 1, 16)):
+        best = max(best, _ref_endgame(g, k + 1, memo, path, kvalid, lift))
     memo[key] = best
     return best
 
@@ -1694,3 +1694,56 @@ def test_endgame_tables_treat_finished_tiles_as_boulders():
     dup[SNAKE[1]] = 15                                              # 32768 32768: they could merge
     r = net.reach(dup.reshape(1, 4, 4), k=13, depth=0, threads=1, seed=1)
     assert r["moves"][0] > 0 or r["reached"][0] == 0
+
+
+_LIFT_CHECK = r"""
+import json, sys
+import numpy as np
+from game2048 import ntuple as nt
+d, boards = sys.argv[1], json.loads(sys.argv[2])
+assert nt.load_endgame(d) == 11
+out = [nt.endgame_value(nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4)), k, 1) for g, k in boards]
+# a real board with a gap: 32768 16384 | 4096 2048 ... (8192 being built) is a position of the lifted tables
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+g = np.zeros(16, dtype=np.uint8)
+top = [15, 14] + [12 - i for i in range(9)]                      # 11 locked: 32768 16384 | 4096 ... 8
+for i, e in enumerate(top):
+    g[nt.SNAKE_PATH[i]] = e
+g[nt.SNAKE_PATH[13]] = 1
+r = net.reach(g.reshape(1, 4, 4), k=11, depth=0, threads=1, seed=1, families=2)
+print(json.dumps({"values": out, "gap_reached": int(r["reached"][0] and r["moves"][0] == 0)}))
+"""
+
+
+def test_sub_goal_tables_with_a_lift(tmp_path):
+    """Tables with lift 1 (the last locked tile one size below the usual one) give the values of the plain
+    Python solution, and a real board with a gap in its ladder is a position of them (the tiles above the gap
+    read as boulders)."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--kmin", "11", "--threads", "2",
+                    "--lift", "1", "--out", str(tmp_path / "lift1")], check=True, capture_output=True)
+    assert (tmp_path / "lift1" / "caps.txt").read_text().split()[5] == "1"
+    rng = np.random.default_rng(31)
+    boards, want, memo = [], [], {}
+    while len(boards) < 12:
+        k = int(rng.integers(11, 13))
+        g = np.zeros(16, dtype=np.uint8)
+        for i in range(k):
+            g[SNAKE[i]] = 14 - i
+        for c in SNAKE[k:]:
+            g[c] = int(rng.integers(0, 16 - k - 1 + 1))
+        if not (g == 0).any():
+            continue
+        boards.append((g.tolist(), k))
+        want.append(_ref_endgame(g, k, memo, SNAKE, 15, 1))
+    r = subprocess.run([sys.executable, "-c", _LIFT_CHECK, str(tmp_path / "lift1"), json.dumps(boards)],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["values"] == pytest.approx(want, abs=1e-4)
+    assert got["gap_reached"] == 1
+

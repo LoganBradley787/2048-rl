@@ -143,7 +143,8 @@ def main(argv=None) -> None:
         nt.lib().nt_endgame_bits(args.endgame_bits)
         for d in args.endgame_dir or []:
             words = (Path(d) / "caps.txt").read_text().split()
-            snake = len(words) < 5 or [int(x) for x in words[4].split(",")] == nt.SNAKE_PATH
+            snake = (len(words) < 5 or [int(x) for x in words[4].split(",")] == nt.SNAKE_PATH) and \
+                (len(words) < 6 or words[5] == "0")
             low = nt.load_endgame(d)
             if snake and args.endgame < low:           # below the snake's files its tables would be solved during play
                 p.error(f"--endgame {args.endgame} is below the lowest table in {d} ({low})")

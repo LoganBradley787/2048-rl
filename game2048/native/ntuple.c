@@ -1354,21 +1354,26 @@ static float eg_value(int f, const uint8_t *b, int k) {
     return best;
 }
 
-/* Whether a board, turned by symmetry s, is a table position: returns k (locked tiles, at least kmin) or 0, and
- * fills o with the turned board, its corner set to 32768 (see eg_choose) and *corner with the real corner. */
+/* Whether a board, turned by symmetry s, is a table position of family f: fills o with the turned board, its corner
+ * set to 32768 (see eg_choose), and *corner with the real corner, and returns the table to play it in, or 0.
+ * A board with kmax tiles in place is a position of every table k <= kmax whose caps it fits (the tiles from k on
+ * are in play there), and the smallest such table is never worse: it may lock the next tile itself (eg_value takes
+ * the better of the two) and allows the moves that locking would forbid. So: the smallest k >= kmin with a table
+ * whose caps the board fits. */
 static int eg_orient(int f, const uint8_t *c, int s, int kmin, uint8_t *o, int *corner) {
     const int *P = eg_path[f];
     for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
     *corner = o[P[0]];
     if (*corner < 15) return 0;
     o[P[0]] = 15;
-    int k = 0;
-    while (k < 15 && o[P[k]] == 15 - k) k++;
-    if (k < kmin || k < EG_MIN) return 0;
-    if (f && !eg_pre[f][k]) return 0;                            /* no table for this family and k */
+    int kmax = 0;
+    while (kmax < 15 && o[P[kmax]] == 15 - kmax) kmax++;
     eg_caps_default();
-    if (!eg_fits(f, o, k)) return 0;
-    return k;
+    for (int k = kmin > EG_MIN ? kmin : EG_MIN; k <= kmax; k++) {
+        if (f && !eg_pre[f][k]) continue;                        /* no table for this family and k */
+        if (eg_fits(f, o, k)) return k;
+    }
+    return 0;
 }
 
 /* The largest k (at least kmin) for which some orientation of the board is a table position of a family in
@@ -1493,6 +1498,7 @@ typedef struct {
     const board_t *starts;
     int32_t *maxtile, *moves;
     int64_t *score;
+    uint32_t *seen;
 } from_job_t;
 
 static void *from_worker(void *arg) {
@@ -1505,7 +1511,9 @@ static void *from_worker(void *arg) {
         board_t b = j->starts[g];
         int64_t sc = 0;
         int32_t mv = 0;
+        uint32_t seen = 0;
         for (;;) {
+            for (int i = 0; i < 16; i++) seen |= 1u << cell(b, i);
             int d = best_move(c, b, j->depth);
             if (d < 0) break;
             int r;
@@ -1513,6 +1521,7 @@ static void *from_worker(void *arg) {
             sc += r;
             mv++;
         }
+        if (j->seen) j->seen[g] = seen;
         j->maxtile[g] = max_exp(b) ? 1 << max_exp(b) : 0;
         j->score[g] = sc;
         j->moves[g] = mv;
@@ -1521,12 +1530,13 @@ static void *from_worker(void *arg) {
     return NULL;
 }
 
+/* seen (may be NULL): bit e set when a tile 2^e was on the board at some point of the game */
 void nt_play_boards(void *p, const uint64_t *starts_lohi, long n, int depth, int threads, uint64_t seed,
-                    int32_t *maxtile, int64_t *score, int32_t *moves) {
+                    int32_t *maxtile, int64_t *score, int32_t *moves, uint32_t *seen) {
     net_t *net = (net_t *)p;
     long nn = n, next = 0;
     board_t *starts = unpack_boards(starts_lohi, &nn);
-    from_job_t job = {net, depth, &next, nn, seed, starts, maxtile, moves, score};
+    from_job_t job = {net, depth, &next, nn, seed, starts, maxtile, moves, score, seen};
     run_workers(from_worker, &job, threads);
     free(starts);
 }

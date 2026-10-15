@@ -1578,6 +1578,9 @@ def test_play_boards_from_start_boards():
     assert a["moves"][0] == 0 and a["score"][0] == 0 and a["max_tile"][0] == 4
     assert (a["moves"][1:] > 20).all() and (a["max_tile"][1:] >= 16).all()
     assert len(set(a["score"][1:].tolist())) > 1                 # each game draws its own tiles
+    assert a["seen"][0] == (1 << 1) | (1 << 2)                    # the dead board: only 2s and 4s
+    assert all((s >> 1) & 1 and (int(t).bit_length() - 1) <= 31 and (s >> (int(t).bit_length() - 1)) & 1
+               for s, t in zip(a["seen"][1:], a["max_tile"][1:]))  # the largest tile was seen
 
 
 def test_downgrade_repeats_after_a_65536():

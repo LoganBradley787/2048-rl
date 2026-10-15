@@ -228,6 +228,7 @@ typedef struct net {
     int expect;              /* training target: 0 = the tile that appeared, 1 = the average over every tile that could */
     int tt_bits;             /* transposition table size for searches on this network */
     int depth_cap[17];       /* random-spawn search: deepest search for a root with this many empty cells (0 = no cap) */
+    double eg_bonus;         /* root moves into an endgame table position gain eg_bonus x the table's chance (0 = off) */
     int deep_depth;          /* search at least this deep when the board holds every tile in deep_need (0 = off) */
     unsigned deep_need;      /* bit e: a tile 2^e (before the depth caps; tables still take their boards first) */
 } net_t;
@@ -1110,6 +1111,9 @@ void nt_get_depth_caps(void *p, int *out) {
     for (int i = 0; i < 17; i++) out[i] = ((net_t *)p)->depth_cap[i];
 }
 
+void nt_set_eg_bonus(void *p, double v) { ((net_t *)p)->eg_bonus = v; }
+double nt_get_eg_bonus(void *p) { return ((net_t *)p)->eg_bonus; }
+
 void nt_set_deep(void *p, int depth, unsigned need) {
     net_t *net = (net_t *)p;
     net->deep_depth = depth > 0 ? depth : 0;
@@ -1629,7 +1633,22 @@ typedef struct {
     int32_t *maxtile, *moves;
     int64_t *score;
     uint32_t *seen;
+    /* trace (nt_play_boards_trace; NULL otherwise): every `every`-th board of game g, at most cap, in
+     * tr[(g * cap + i) * 2 ..]; tr_n[g] boards kept; entry_mv[g] the move at which the board first is a table
+     * position with 5 or more locked tiles of a formation without lift or wobble (-1: never), entry[2g..] that board;
+     * rung4_mv[g] the first move with the snake's first four rungs in place (finished tiles above as boulders). */
+    int every, cap;
+    uint64_t *tr, *entry;
+    int32_t *tr_n, *entry_mv, *rung4_mv;
 } from_job_t;
+
+static int rungs_in_place(board_t b) {                      /* the snake's rungs in place, best orientation */
+    uint8_t c[16], o[16], real[16];
+    int nb, best = 0;
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
+    for (int s = 0; s < 8; s++) { int k = eg_orient(0, c, s, o, real, &nb); if (k > best) best = k; }
+    return best;
+}
 
 static void *from_worker(void *arg) {
     from_job_t *j = (from_job_t *)arg;
@@ -1642,8 +1661,22 @@ static void *from_worker(void *arg) {
         int64_t sc = 0;
         int32_t mv = 0;
         uint32_t seen = 0;
+        int32_t kept = 0, emv = -1, r4 = -1;
+        unsigned plain = 0;
+        for (int f = 0; f < eg_nfam; f++) if (!eg_lift[f] && !eg_wob[f]) plain |= 1u << f;
         for (;;) {
             for (int i = 0; i < 16; i++) seen |= 1u << cell(b, i);
+            if (j->tr) {
+                if (mv % j->every == 0 && kept < j->cap) {
+                    j->tr[((size_t)g * j->cap + kept) * 2] = lo64(b);
+                    j->tr[((size_t)g * j->cap + kept) * 2 + 1] = hi64(b);
+                    kept++;
+                }
+                if (r4 < 0 && rungs_in_place(b) >= 4) r4 = mv;
+                if (emv < 0 && eg_position(b, 5, plain)) {
+                    emv = mv; j->entry[2 * g] = lo64(b); j->entry[2 * g + 1] = hi64(b);
+                }
+            }
             int d = best_move(c, b, j->depth);
             if (d < 0) break;
             int r;
@@ -1652,6 +1685,7 @@ static void *from_worker(void *arg) {
             mv++;
         }
         if (j->seen) j->seen[g] = seen;
+        if (j->tr) { j->tr_n[g] = kept; j->entry_mv[g] = emv; j->rung4_mv[g] = r4; }
         j->maxtile[g] = max_exp(b) ? 1 << max_exp(b) : 0;
         j->score[g] = sc;
         j->moves[g] = mv;
@@ -1666,7 +1700,20 @@ void nt_play_boards(void *p, const uint64_t *starts_lohi, long n, int depth, int
     net_t *net = (net_t *)p;
     long nn = n, next = 0;
     board_t *starts = unpack_boards(starts_lohi, &nn);
-    from_job_t job = {net, depth, &next, nn, seed, starts, maxtile, moves, score, seen};
+    from_job_t job = {net, depth, &next, nn, seed, starts, maxtile, moves, score, seen, 0, 0, NULL, NULL, NULL, NULL, NULL};
+    run_workers(from_worker, &job, threads);
+    free(starts);
+}
+
+/* nt_play_boards with a trace (see from_job_t): tr holds n * cap boards (lo, hi), entry n boards. */
+void nt_play_boards_trace(void *p, const uint64_t *starts_lohi, long n, int depth, int threads, uint64_t seed,
+                          int32_t *maxtile, int64_t *score, int32_t *moves, uint32_t *seen, int every, int cap,
+                          uint64_t *tr, int32_t *tr_n, uint64_t *entry, int32_t *entry_mv, int32_t *rung4_mv) {
+    net_t *net = (net_t *)p;
+    long nn = n, next = 0;
+    board_t *starts = unpack_boards(starts_lohi, &nn);
+    from_job_t job = {net, depth, &next, nn, seed, starts, maxtile, moves, score, seen,
+                      every < 1 ? 1 : every, cap, tr, entry, tr_n, entry_mv, rung4_mv};
     run_workers(from_worker, &job, threads);
     free(starts);
 }
@@ -1830,6 +1877,29 @@ float nt_endgame_value(uint64_t lo, uint64_t hi, int k) { return nt_endgame_valu
 
 /* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
  * tile and the stage rule allows. */
+/* The best table chance of an afterstate on the real board (before the new tile), over the formations without lift
+ * (the lifted tables aim at nearer goals) and every table that holds it with kmin or more locked tiles; 0 if none. */
+static float eg_entry(board_t after, int kmin) {
+    uint8_t c[16];
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(after, i);
+    float best = 0.0f;
+    for (int f = 0; f < eg_nfam; f++) {
+        if (eg_lift[f] || eg_wob[f]) continue;
+        for (int s = 0; s < 8; s++) {
+            uint8_t o[16], real[16];
+            int nb, kmax = eg_orient(f, c, s, o, real, &nb);
+            int k0 = kmin > EG_MIN ? kmin : EG_MIN;
+            if (k0 <= nb) k0 = nb + 1;
+            for (int k = k0; k <= kmax; k++) {
+                if (!eg_usable(f, o, k) || !eg_pre[f][k]) continue;   /* tables built in advance only: no lock */
+                float v = eg_after(f, o, k);
+                if (v > best) best = v;
+            }
+        }
+    }
+    return best;
+}
+
 static board_t root_board(const net_t *net, board_t b) {
     /* Again while the board still holds the threshold tile: after a 65536 one step only brings it to 32768, a
      * board the stages rarely saw; a second step shows it as the 16384 board the first 32768 was shown as. A board
@@ -1876,6 +1946,10 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         if (b != real && do_move(real, d, &r) == real) continue;   /* legal on the twin only (tiles at the top) */
         a = do_move(b, d, &r);
         double v = (double)r + chance_node(c, a, depth, 1.0);
+        if (c->net->eg_bonus > 0.0 && c->net->endgame) {          /* into a table position on the real board */
+            board_t ra = do_move(real, d, &r);
+            v += c->net->eg_bonus * eg_entry(ra, c->net->endgame);
+        }
         if (best < 0 || v > bestv) { bestv = v; best = d; }
     }
     return best;

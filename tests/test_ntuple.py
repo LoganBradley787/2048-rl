@@ -1935,3 +1935,41 @@ def test_wobble_tables_match_a_plain_python_solution(tmp_path):
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got["values"] == pytest.approx([v for _, _, v in boards], abs=1e-6)
     assert all(m >= 0 for m, (_, _, v) in zip(got["moves"], boards) if v > 0)   # a chance: a table move
+
+
+_BONUS_CHECK = r"""
+import json, sys
+import numpy as np
+from game2048 import ntuple as nt
+assert nt.load_endgame(sys.argv[1]) == 12
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+net.endgame = 12                                  # 11 rungs are not a table position: the search plays
+g = np.zeros(16, dtype=np.uint8)
+for i in range(11):
+    g[nt.SNAKE_PATH[i]] = 15 - i                  # 32768 ... 32 on the snake's first 11 cells
+g[11] = 3
+g[12:16] = 3                                      # UP merges the 8s on cells 11 and 15: the 16 on cell 11 is the
+                                                  # 12th rung; a sideways move scores 32 (UP only 16), no table
+b = nt.to_bits(g.reshape(4, 4))
+plain = net.best_move(b, depth=0)            # greedy: the move and its points only
+net.endgame_bonus = 1e9
+print(json.dumps({"plain": plain, "bonus": net.best_move(b, depth=0), "get": net.endgame_bonus}))
+"""
+
+
+def test_endgame_bonus_steers_a_root_move_into_a_table(tmp_path):
+    """With endgame_bonus a root move whose afterstate is a table position (tables built in advance) gains the
+    bonus times the table's chance: a huge bonus makes the search take the move into the table."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--kmin", "12", "--threads", "2",
+                    "--out", str(tmp_path / "t")], check=True, capture_output=True)
+    r = subprocess.run([sys.executable, "-c", _BONUS_CHECK, str(tmp_path / "t")], capture_output=True, text=True,
+                       cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["plain"] in (1, 3)                 # without the bonus: the 32 points
+    assert got["bonus"] == 0 and got["get"] == 1e9

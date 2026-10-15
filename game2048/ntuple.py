@@ -252,6 +252,9 @@ def lib() -> ctypes.CDLL:
     L.nt_set_depth_caps.argtypes = [vp, P(i32)]
     L.nt_get_depth_caps.argtypes = [vp, P(i32)]
     L.nt_set_deep.argtypes = [vp, i32, ctypes.c_uint]
+    L.nt_set_eg_bonus.argtypes = [vp, f64]
+    L.nt_get_eg_bonus.argtypes, L.nt_get_eg_bonus.restype = [vp], f64
+
     L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
     L.nt_beam_value.argtypes, L.nt_beam_value.restype = [vp, u64, u64, i32, i32, i32, f64, i32], f64
@@ -711,6 +714,16 @@ class NTupleNet:
         if caps:
             caps = (caps + [caps[-1]] * 17)[:17]
         self._lib.nt_set_depth_caps(self._h, (ctypes.c_int32 * 17)(*caps) if caps else None)
+
+    @property
+    def endgame_bonus(self) -> float:
+        """A root move whose afterstate (on the real board) is an endgame-table position gains this many points
+        times the table's chance (formations without lift, tables built in advance; needs `endgame` on). 0 = off."""
+        return float(self._lib.nt_get_eg_bonus(self._h))
+
+    @endgame_bonus.setter
+    def endgame_bonus(self, v: float) -> None:
+        self._lib.nt_set_eg_bonus(self._h, float(v))
 
     @property
     def deep(self) -> tuple[int, list[int]]:

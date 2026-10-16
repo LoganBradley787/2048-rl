@@ -191,6 +191,8 @@ typedef struct search_ctx {
     double cutoff;
     struct net *net;
     uint64_t version;
+    int heur_sym;            /* sticky heuristic (net.heur 3): the orientation this game plays in, -1 = not chosen yet.
+                              * A context plays one game at a time; every loop that starts a game calls ctx_new_game */
 } search_ctx_t;
 
 /* Stages: a board's stage is the number of boundaries its tile set has reached
@@ -231,8 +233,10 @@ typedef struct net {
     double eg_bonus;         /* root moves into an endgame table position gain eg_bonus x the table's chance (0 = off) */
     int deep_depth;          /* search at least this deep when the board holds every tile in deep_need (0 = off) */
     unsigned deep_need;      /* bit e: a tile 2^e (before the depth caps; tables still take their boards first) */
-    int heur;                /* late boards (see HEUR_FROM) are searched with macroxue's heuristic, not the tables */
+    int heur;                /* late boards (see HEUR_FROM) are searched with macroxue's heuristic, not the tables:
+                              * 1 = turned per move, 2 = as given, 3 = turned once per game (see heur_best) */
     int heur_prune;          /* ... with his pruning and loss value (see heur_best) */
+    int heur_depth;          /* ... at this depth instead of the game's (0 = the game's; depth caps still apply) */
     int block_tier;          /* block-tier tables (nt_block_load) play boards no ladder table holds (0 = off) */
 } net_t;
 
@@ -910,12 +914,16 @@ static search_ctx_t *ctx_create_tt(net_t *net, double cutoff, int use_tt) {
     c->cutoff = cutoff;
     c->net = net;
     c->version = net->version;
+    c->heur_sym = -1;
     return c;
 }
 
 static search_ctx_t *ctx_create(net_t *net, double cutoff) {
     return ctx_create_tt(net, cutoff, 1);
 }
+
+/* A new game on this context: per-game choices (the sticky heuristic orientation) are made afresh. */
+static void ctx_new_game(search_ctx_t *c) { c->heur_sym = -1; }
 
 static void ctx_sync(search_ctx_t *c, double cutoff) {
     if (c->version != c->net->version || c->cutoff != cutoff) {
@@ -1722,6 +1730,7 @@ static void *reach_worker(void *arg) {
         uint64_t rng = game_seed(j->seed, g);
         board_t b = j->starts[g];
         int32_t mv = 0, got = 0;
+        ctx_new_game(c);
         for (;;) {
             if (eg_position(b, j->k, j->fmask)) { got = 1; break; }
             int d = best_move(c, b, j->depth);
@@ -1796,6 +1805,7 @@ static void *from_worker(void *arg) {
         int32_t kept = 0, emv = -1, r4 = -1;
         unsigned plain = 0;
         for (int f = 0; f < eg_nfam; f++) if (!eg_lift[f] && !eg_wob[f]) plain |= 1u << f;
+        ctx_new_game(c);
         for (;;) {
             for (int i = 0; i < 16; i++) seen |= 1u << cell(b, i);
             if (j->tr) {
@@ -2260,13 +2270,23 @@ static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, int depth, d
     return best;
 }
 
-/* The move for the real board b, searched in the orientation heur_orient picks: each move is made on b and its
+/* The orientation of the search for the real board b: heur_orient's (1), the board's own (2), or heur_orient's for
+ * the first board the heuristic plays in this game, kept until the game ends (3, sticky: the anchor corner cannot
+ * flip while the largest tile is away from it). */
+static int heur_sym(search_ctx_t *c, board_t b) {
+    if (c->net->heur == 2) return 0;
+    if (c->net->heur != 3) return heur_orient(b);
+    if (c->heur_sym < 0) c->heur_sym = heur_orient(b);
+    return c->heur_sym;
+}
+
+/* The move for the real board b, searched in the orientation heur_sym picks: each move is made on b and its
  * afterstate turned. Without pruning, his settings without his tables (-T): a loss is worth -2^22. With it, his
  * settings beside his tables: a loss is worth -max(2^17, 2 x the largest tile's score), and spawn nodes below
  * twice the largest tile's score are not searched further, unless the root itself scores below 0. */
 static int heur_best(search_ctx_t *c, board_t b, int depth) {
     pthread_once(&heur_once, heur_init);
-    int s = c->net->heur == 2 ? 0 : heur_orient(b), top = max_exp(b);   /* 2: the board's own orientation */
+    int s = heur_sym(c, b), top = max_exp(b);
     heur_t h = {(board_t)0x80 << 120, -HUGE_VAL, -(double)(1 << 22)};
     if (c->net->heur_prune) {
         double ts = (double)((int64_t)top << top);
@@ -2289,10 +2309,12 @@ static int heur_best(search_ctx_t *c, board_t b, int depth) {
 
 /* Not for use while games are being played on other threads. */
 void nt_set_heur(void *p, int on, int prune) {
-    ((net_t *)p)->heur = on < 0 ? 0 : on > 2 ? 2 : on;             /* 1: turned per move (heur_orient), 2: as given */
+    ((net_t *)p)->heur = on < 0 ? 0 : on > 3 ? 3 : on;   /* 1: turned per move, 2: as given, 3: turned once a game */
     ((net_t *)p)->heur_prune = prune != 0;
 }
 int nt_get_heur(void *p, int *prune) { *prune = ((net_t *)p)->heur_prune; return ((net_t *)p)->heur; }
+void nt_set_heur_depth(void *p, int depth) { ((net_t *)p)->heur_depth = depth < 0 ? 0 : depth; }
+int nt_get_heur_depth(void *p) { return ((net_t *)p)->heur_depth; }
 
 static int best_move(search_ctx_t *c, board_t b, int depth) {
     int held = 0;
@@ -2312,6 +2334,7 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
     }
     int heur = c->net->heur && board_scale(real) >= HEUR_FROM;   /* the late game by hand: the real board, no bonus */
     if (!heur) b = root_board(c->net, b);
+    else if (c->net->heur_depth) depth = c->net->heur_depth;
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;
     if (heur) return heur_best(c, b, depth);
@@ -2344,6 +2367,17 @@ int nt_best_move(void *p, uint64_t lo, uint64_t hi, int depth, double cutoff) {
     return best_move(main_ctx(net, cutoff), mk(lo, hi), depth);
 }
 
+/* nt_best_move's games: nt_heur_new_game starts a new one (the sticky heuristic orientation is chosen afresh);
+ * nt_heur_game_sym is the orientation chosen in the current one (-1: none yet). */
+void nt_heur_new_game(void *p) {
+    net_t *net = (net_t *)p;
+    if (net->main_ctx) ctx_new_game(net->main_ctx);
+}
+int nt_heur_game_sym(void *p) {
+    net_t *net = (net_t *)p;
+    return net->main_ctx ? net->main_ctx->heur_sym : -1;
+}
+
 double nt_search_value(void *p, uint64_t lo, uint64_t hi, int depth, double cutoff) {
     net_t *net = (net_t *)p;
     return max_node(main_ctx(net, cutoff), mk(lo, hi), depth, 1.0);
@@ -2369,6 +2403,7 @@ static void *play_worker(void *arg) {
         board_t b = spawn(spawn(0, &rng), &rng);
         int64_t sc = 0;
         int32_t mv = 0;
+        ctx_new_game(c);
         for (;;) {
             int d = best_move(c, b, j->depth);
             if (d < 0) break;
@@ -2400,6 +2435,7 @@ int64_t nt_play_trace(void *p, long game, int depth, double cutoff, uint64_t see
     int64_t sc = 0;
     int32_t mv = 0;
     long kept = 0;
+    ctx_new_game(c);
     for (;;) {
         int d = best_move(c, b, depth);
         if (kept < cap) {
@@ -2457,6 +2493,7 @@ static void *collect_worker(void *arg) {
         uint64_t rng = game_seed(j->seed, g);
         board_t b = spawn(spawn(0, &rng), &rng);
         int64_t sc = 0;
+        ctx_new_game(c);
         while (board_scale(b) < j->scale) {
             int d = best_move(c, b, j->depth);
             if (d < 0) break;

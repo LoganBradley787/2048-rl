@@ -2318,3 +2318,79 @@ def test_heuristic_late_leaves_other_boards_and_the_default_alone():
     n.heuristic_late = False
     assert [n.best_move(b, depth=1) for b in early + late] == off
     n.close()
+
+
+def _heuristic_player(how):
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)       # empty tables: the heuristic alone
+    n.heuristic_orientation, n.heuristic_late = how, True
+    return n
+
+
+def test_sticky_heuristic_keeps_its_first_orientation_for_the_whole_game():
+    """Sticky: heuristic_orient of the game's first late board, every move after, even where heuristic_orient of
+    the board itself has changed; the same search as the board's own orientation on the board turned that way."""
+    sticky, own = _heuristic_player("sticky"), _heuristic_player("own")
+    assert sticky.heuristic_late and sticky.heuristic_orientation == "sticky" and own.heuristic_orientation == "own"
+    rng, seed, flips = np.random.default_rng(36), 0, 0
+    for start in _late_boards(rng, 3, empties=6):
+        sticky.heuristic_new_game()
+        assert sticky.heuristic_game_orientation == -1
+        s0, b = nt.heuristic_orient(start)[0], start
+        for _ in range(120):
+            d = sticky.best_move(b, depth=1)
+            if d < 0:
+                break
+            assert sticky.heuristic_game_orientation == s0
+            d_own = own.best_move(_turn(b, s0), depth=1)
+            assert _turn(nt.move(b, d)[0], s0) == nt.move(_turn(b, s0), d_own)[0]
+            flips += nt.heuristic_orient(b)[0] != s0
+            b, seed = nt.spawn(nt.move(b, d)[0], seed), seed + 1
+    assert flips > 0                              # boards where turning per move would have picked another corner
+    sticky.close()
+    own.close()
+
+
+def test_sticky_heuristic_orientation_is_chosen_afresh_every_game():
+    """A game's play does not depend on the games played before it on the same thread."""
+    n = _heuristic_player("sticky")
+    boards = _late_boards(np.random.default_rng(35), 6, empties=8, ordered=True)
+    game = boards[1]                              # game 1 of seed 7 from it: hundreds of moves
+    before = [b for b in boards if nt.heuristic_orient(b)[0] != nt.heuristic_orient(game)[0]][:3]
+    assert len(before) == 3
+    runs = [n.play_boards([b, game], depth=1, threads=1, seed=7) for b in [game] + before]
+    runs.append(n.play_boards([before[0], game], depth=1, threads=2, seed=7))
+    for r in runs[1:]:
+        for k in ("max_tile", "score", "moves", "seen"):
+            assert r[k][1] == runs[0][k][1]
+    turn = _heuristic_player("turn")
+    assert turn.play_boards([game, game], depth=1, threads=1, seed=7)["moves"][1] != runs[0]["moves"][1]
+    turn.close()                                  # (sticky plays this game differently from turning per move)
+    n.close()
+
+
+def test_heuristic_orientation_and_depth_change_nothing_else():
+    """Off: play is unchanged whatever the orientation and depth say; on, early boards are unchanged and the late
+    ones are searched at heuristic_depth."""
+    n = _trained_small_net()
+    assert n.heuristic_orientation == "turn" and n.heuristic_depth == 0
+    plain = n.play(4, depth=1, threads=2, seed=9)["scores"].tolist()
+    rng = np.random.default_rng(37)
+    early = [nt.to_bits(rand_exps(rng, density=0.7, max_exp=14)) for _ in range(30)]
+    early = [b for b in early if not ({14, 15} <= {nt.cell(b, i) for i in range(16)})]
+    off = [n.best_move(b, depth=1) for b in early]
+    n.heuristic_orientation, n.heuristic_depth = "sticky", 2
+    assert not n.heuristic_late and n.heuristic_orientation == "sticky"
+    assert n.play(4, depth=1, threads=2, seed=9)["scores"].tolist() == plain
+    n.heuristic_late = True                       # this small network's games never reach a late board
+    n.heuristic_prune = True
+    assert n.heuristic_orientation == "sticky" and n.heuristic_late and n.heuristic_prune
+    assert n.play(4, depth=1, threads=2, seed=9)["scores"].tolist() == plain
+    assert [n.best_move(b, depth=1) for b in early] == off
+    n.heuristic_orientation, n.heuristic_prune = "turn", False
+    for b in _late_boards(rng, 2, empties=3):
+        assert n.best_move(b, depth=1) == _ref_heur_move(b, 2)
+    n.heuristic_late = False
+    assert n.heuristic_orientation == "turn" and n.heuristic_depth == 2
+    with pytest.raises(ValueError):
+        n.heuristic_orientation = "corner"
+    n.close()

@@ -256,6 +256,10 @@ def lib() -> ctypes.CDLL:
     L.nt_get_eg_bonus.argtypes, L.nt_get_eg_bonus.restype = [vp], f64
     L.nt_set_heur.argtypes = [vp, i32, i32]
     L.nt_get_heur.argtypes, L.nt_get_heur.restype = [vp, P(i32)], i32
+    L.nt_set_heur_depth.argtypes = [vp, i32]
+    L.nt_get_heur_depth.argtypes, L.nt_get_heur_depth.restype = [vp], i32
+    L.nt_heur_new_game.argtypes = [vp]
+    L.nt_heur_game_sym.argtypes, L.nt_heur_game_sym.restype = [vp], i32
     L.nt_heur_score.argtypes, L.nt_heur_score.restype = [u64, u64], f64
     L.nt_heur_orient.argtypes, L.nt_heur_orient.restype = [u64, u64, P(u64), P(u64)], i32
     L.nt_block_load.argtypes, L.nt_block_load.restype = [ctypes.c_char_p, i32, i32, P(i32), P(i32), i32], i32
@@ -365,7 +369,9 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
     return int(kmin)
 
 
-BLOCK_SHAPES = {"b6": 0, "b5": 1}   # block-tier shapes (game2048/native/block_build.c)
+BLOCK_SHAPES = {"b6": 0, "b5": 1}
+# how the late-game heuristic turns the board (NTupleNet.heuristic_orientation), by engine mode (nt_set_heur)
+HEURISTIC_ORIENTATIONS = {"turn": 1, "own": 2, "sticky": 3}   # block-tier shapes (game2048/native/block_build.c)
 
 
 def load_block_tables(directory) -> list[int]:
@@ -793,19 +799,68 @@ class NTupleNet:
     def block_tier(self, on: bool) -> None:
         self._lib.nt_set_block_tier(self._h, int(bool(on)))
 
+    def _heur_mode(self) -> tuple[int, int]:
+        prune = ctypes.c_int(0)
+        mode = int(self._lib.nt_get_heur(self._h, ctypes.byref(prune)))
+        return mode, prune.value
+
     @property
     def heuristic_late(self) -> bool:
         """Search late boards (a 32768 and a 16384, or a 65536 or larger) with macroxue's hand-written heuristic
-        (`heuristic_score`) at the leaves instead of the tables: the real board (no downgrading), turned so its
-        largest tile is nearest the top left corner (`heuristic_orient`), the same depth and spawns, no points for
-        merges, a loss worth -2**22, no endgame bonus. Boards the endgame tables hold are still played by them.
+        (`heuristic_score`) at the leaves instead of the tables: the real board (no downgrading), turned as
+        `heuristic_orientation` says, the same depth (or `heuristic_depth`) and spawns, no points for merges, a
+        loss worth -2**22, no endgame bonus. Boards the endgame and block tables hold are still played by them.
         Set it between searches."""
-        prune = ctypes.c_int(0)
-        return bool(self._lib.nt_get_heur(self._h, ctypes.byref(prune)))
+        return self._heur_mode()[0] != 0
 
     @heuristic_late.setter
     def heuristic_late(self, on: bool) -> None:
-        self._lib.nt_set_heur(self._h, int(bool(on)), int(self.heuristic_prune))
+        mode, prune = self._heur_mode()
+        if on and not mode:
+            mode = HEURISTIC_ORIENTATIONS[self.heuristic_orientation]
+        self._lib.nt_set_heur(self._h, mode if on else 0, prune)
+
+    @property
+    def heuristic_orientation(self) -> str:
+        """How `heuristic_late` turns the board for its search: "turn" (default) by `heuristic_orient` for every
+        move; "own" the board as it stands (for boards turned in advance); "sticky" by `heuristic_orient` of the
+        first board the heuristic plays in a game, kept for the rest of that game (the anchor corner cannot flip
+        while the largest tile is away from it). Every game `play`, `play_boards`, `play_trace` and `reach` start
+        chooses afresh; for games played with `best_move`, call `heuristic_new_game` before each one. Kept while
+        `heuristic_late` is off. Set it between searches."""
+        mode = self._heur_mode()[0]
+        if mode:
+            return next(k for k, v in HEURISTIC_ORIENTATIONS.items() if v == mode)
+        return self.__dict__.get("_heur_orientation", "turn")
+
+    @heuristic_orientation.setter
+    def heuristic_orientation(self, how: str) -> None:
+        if how not in HEURISTIC_ORIENTATIONS:
+            raise ValueError(f"heuristic_orientation is one of {list(HEURISTIC_ORIENTATIONS)}, not {how!r}")
+        self._heur_orientation = how
+        mode, prune = self._heur_mode()
+        if mode:
+            self._lib.nt_set_heur(self._h, HEURISTIC_ORIENTATIONS[how], prune)
+
+    def heuristic_new_game(self) -> None:
+        """`best_move` plays a new game from now on: the "sticky" heuristic orientation is chosen afresh."""
+        self._lib.nt_heur_new_game(self._h)
+
+    @property
+    def heuristic_game_orientation(self) -> int:
+        """The symmetry (as in `heuristic_orient`) the "sticky" heuristic chose in the current `best_move` game;
+        -1 before it has played a board."""
+        return int(self._lib.nt_heur_game_sym(self._h))
+
+    @property
+    def heuristic_depth(self) -> int:
+        """With `heuristic_late`: search the late boards this deep, whatever the depth asked for (0 = the depth
+        asked for; `depth_caps` still apply). Set it between searches."""
+        return int(self._lib.nt_get_heur_depth(self._h))
+
+    @heuristic_depth.setter
+    def heuristic_depth(self, depth: int) -> None:
+        self._lib.nt_set_heur_depth(self._h, int(depth))
 
     @property
     def heuristic_prune(self) -> bool:
@@ -818,7 +873,7 @@ class NTupleNet:
 
     @heuristic_prune.setter
     def heuristic_prune(self, on: bool) -> None:
-        self._lib.nt_set_heur(self._h, int(self.heuristic_late), int(bool(on)))
+        self._lib.nt_set_heur(self._h, self._heur_mode()[0], int(bool(on)))
 
     @property
     def deep(self) -> tuple[int, list[int]]:

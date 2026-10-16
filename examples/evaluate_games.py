@@ -29,7 +29,8 @@ import numpy as np
 from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
-SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5"]
+SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5",
+            "endgame_bonus"]
 
 
 def weights_md5(path: Path) -> str:
@@ -96,6 +97,8 @@ def main(argv=None) -> None:
     p.add_argument("--endgame-dir", action="append", default=None,
                    help="tables built in advance (examples/build_endgame.py) instead of solving on demand; repeat it for "
                         "several formations (play takes the best)")
+    p.add_argument("--endgame-bonus", type=float, default=0.0,
+                   help="points times the table's chance for a move into a table position (tables built in advance)")
     p.add_argument("--endgame-bits", type=int, default=29,
                    help="memo size for the 5-tile table as a power of two; 6 tiles get the same up to 31, 7 tiles two fewer up to 27. "
                         "Under 31: 7 bytes a slot (29 is 3.8 GB); 31 and over: 4 bytes (33 is 32 GB)")
@@ -115,7 +118,7 @@ def main(argv=None) -> None:
     settings = {"weights_md5": weights_md5(path), "depth": args.depth, "seed": args.seed, "cutoff": args.cutoff,
                 "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None,
                 "endgame_bits": args.endgame_bits if args.endgame else None,
-                "endgame_dir": args.endgame_dir,
+                "endgame_dir": args.endgame_dir, "endgame_bonus": args.endgame_bonus or None,
                 # the engine's source: a run resumed under another engine would mix two players
                 "engine_md5": hashlib.md5(nt.SRC.read_bytes()).hexdigest(),
                 "endgame_caps": args.endgame_dir and " | ".join((Path(d) / "caps.txt").read_text().strip()
@@ -150,6 +153,7 @@ def main(argv=None) -> None:
                 p.error(f"--endgame {args.endgame} is below the lowest table in {d} ({low})")
             print(f"endgame tables built in advance from {low} locked up ({d}, {'snake' if snake else words[4]})", flush=True)
         net.endgame = args.endgame
+        net.endgame_bonus = args.endgame_bonus
     net.depth_caps = caps
     if args.tt_bits:
         net.tt_bits = args.tt_bits

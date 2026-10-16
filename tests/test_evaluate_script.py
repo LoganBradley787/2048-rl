@@ -51,6 +51,39 @@ def test_evaluate_games_resumes_and_shards_add_up_to_the_same_games(tmp_path, ca
         evaluate_games.main([*common[:2], "--depth", "2", "--seed", "11", "--games", "6", "--out", str(tmp_path / "a.csv")])
 
 
+def test_evaluate_games_heuristic_and_block_flags(tmp_path):
+    """--heuristic, --heuristic-prune, --heuristic-depth and --block-dir play and are part of the settings
+    (in a process of their own: block tables load once per process)."""
+    import os
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
+    script = [sys.executable, str(root / "examples" / "evaluate_games.py")]
+    usage = subprocess.run([*script, "--help"], capture_output=True, text=True, env=env, check=True).stdout
+    for flag in ("--heuristic {off,turn,own,sticky}", "--heuristic-prune", "--heuristic-depth", "--block-dir"):
+        assert flag in usage
+    subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--block", "b6", "--anchors", "4,5",
+                    "--threads", "2", "--out", str(tmp_path / "b6")], check=True, capture_output=True, env=env)
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(200, threads=1, seed=1, alpha_plain=0.1)
+    n.save(tmp_path / "w.bin", weights_only=True)
+    n.close()
+    common = [*script, "--weights", str(tmp_path / "w.bin"), "--games", "2", "--depth", "1", "--threads", "2",
+              "--out", str(tmp_path / "e.csv")]
+    flags = ["--heuristic", "sticky", "--heuristic-prune", "--heuristic-depth", "2", "--block-dir", str(tmp_path / "b6")]
+    r = subprocess.run([*common, *flags], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "2 games" in r.stdout and "block tier:" in r.stdout and "block tier: 0 moves" not in r.stdout
+    s = json.loads((tmp_path / "e.json").read_text())
+    assert (s["heuristic"], s["heuristic_prune"], s["heuristic_depth"]) == ("sticky", True, 2)
+    assert s["block_tables"].startswith("b6 4,5 ")
+    r = subprocess.run([*common, *flags[:2]], capture_output=True, text=True, env=env)   # other settings, same file
+    assert r.returncode != 0 and "other settings" in r.stderr
+    r = subprocess.run([*common[:-1], str(tmp_path / "f.csv"), "--heuristic-prune"], capture_output=True, text=True,
+                       env=env)
+    assert r.returncode != 0 and "need --heuristic" in r.stderr
+
+
 def test_average_weights_is_the_mean_of_the_files(tmp_path):
     import average_weights
 

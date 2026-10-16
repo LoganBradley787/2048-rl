@@ -30,7 +30,7 @@ from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
 SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5",
-            "endgame_bonus"]
+            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "block_tables"]
 
 
 def weights_md5(path: Path) -> str:
@@ -102,6 +102,16 @@ def main(argv=None) -> None:
     p.add_argument("--endgame-bits", type=int, default=29,
                    help="memo size for the 5-tile table as a power of two; 6 tiles get the same up to 31, 7 tiles two fewer up to 27. "
                         "Under 31: 7 bytes a slot (29 is 3.8 GB); 31 and over: 4 bytes (33 is 32 GB)")
+    p.add_argument("--heuristic", choices=["off", *nt.HEURISTIC_ORIENTATIONS], default="off",
+                   help="late boards (a 32768 and a 16384, or a 65536 and up) searched with macroxue's hand-written "
+                        "heuristic, the board turned per move (turn), as it stands (own) or once per game (sticky)")
+    p.add_argument("--heuristic-prune", action="store_true",
+                   help="with --heuristic: macroxue's pruning and loss value (his settings beside his tables)")
+    p.add_argument("--heuristic-depth", type=int, default=0,
+                   help="with --heuristic: search the late boards this deep (0 = --depth; --depth-caps still apply)")
+    p.add_argument("--block-dir", action="append", default=None,
+                   help="block-tier tables (examples/build_endgame.py --block) play the boards no ladder table holds; "
+                        "repeat it for several shapes")
     p.add_argument("--trace-dir", default=None,
                    help="keep every game's history here, one game_<n>.npz each: `boards` (the board before each "
                         "move, then the final one, as exponents) and `dirs` (0 up, 1 right, 2 down, 3 left, -1 at the end)")
@@ -115,6 +125,8 @@ def main(argv=None) -> None:
     out, path = Path(args.out), nt.resolve_weights(args.weights)
     out.parent.mkdir(parents=True, exist_ok=True)
     caps = [int(x) for x in args.depth_caps.split(",") if x.strip()]
+    if args.heuristic == "off" and (args.heuristic_prune or args.heuristic_depth):
+        p.error("--heuristic-prune and --heuristic-depth need --heuristic")
     settings = {"weights_md5": weights_md5(path), "depth": args.depth, "seed": args.seed, "cutoff": args.cutoff,
                 "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None,
                 "endgame_bits": args.endgame_bits if args.endgame else None,
@@ -122,7 +134,13 @@ def main(argv=None) -> None:
                 # the engine's source: a run resumed under another engine would mix two players
                 "engine_md5": hashlib.md5(nt.SRC.read_bytes()).hexdigest(),
                 "endgame_caps": args.endgame_dir and " | ".join((Path(d) / "caps.txt").read_text().strip()
-                                                                for d in args.endgame_dir), "weights": str(path), "games": args.games}
+                                                                for d in args.endgame_dir), "weights": str(path), "games": args.games,
+                # off = absent, so files written before these options existed still match
+                "heuristic": None if args.heuristic == "off" else args.heuristic,
+                "heuristic_prune": args.heuristic_prune or None, "heuristic_depth": args.heuristic_depth or None,
+                "block_dir": args.block_dir,
+                "block_tables": args.block_dir and " | ".join((Path(d) / "block.txt").read_text().strip()
+                                                              for d in args.block_dir)}
     meta = out.with_suffix(".json")
     if meta.exists():
         old = json.loads(meta.read_text())
@@ -154,6 +172,12 @@ def main(argv=None) -> None:
             print(f"endgame tables built in advance from {low} locked up ({d}, {'snake' if snake else words[4]})", flush=True)
         net.endgame = args.endgame
         net.endgame_bonus = args.endgame_bonus
+    for d in args.block_dir or []:
+        print(f"block-tier tables, anchors {nt.load_block_tables(d)} ({d})", flush=True)
+    net.block_tier = bool(args.block_dir)
+    if args.heuristic != "off":
+        net.heuristic_orientation = args.heuristic
+        net.heuristic_late, net.heuristic_prune, net.heuristic_depth = True, args.heuristic_prune, args.heuristic_depth
     net.depth_caps = caps
     if args.tt_bits:
         net.tt_bits = args.tt_bits
@@ -190,6 +214,8 @@ def main(argv=None) -> None:
     finally:
         f.close()
     show(summarize([out]))
+    if args.block_dir:
+        print(f"block tier: {nt.block_tier_moves():,} moves chosen", flush=True)
     if args.endgame:                                   # a table that ran out of room makes play slow and timing-dependent
         L = nt.lib()
         print("endgame tables: positions kept " + ", ".join(f"{k} locked {L.nt_endgame_used(k):,}" for k in range(5, 8))

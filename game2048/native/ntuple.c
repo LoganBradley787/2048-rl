@@ -193,6 +193,7 @@ typedef struct search_ctx {
     uint64_t version;
     int heur_sym;            /* sticky heuristic (net.heur 3): the orientation this game plays in, -1 = not chosen yet.
                               * A context plays one game at a time; every loop that starts a game calls ctx_new_game */
+    struct hleaf *hleaf;     /* the heuristic's leaf scores (see heur_leaf), made on first use */
 } search_ctx_t;
 
 /* Stages: a board's stage is the number of boundaries its tile set has reached
@@ -943,6 +944,7 @@ static void ctx_sync(search_ctx_t *c, double cutoff) {
 static void ctx_free(search_ctx_t *c) {
     if (!c) return;
     free(c->tt);
+    free(c->hleaf);
     free(c);
 }
 
@@ -2244,13 +2246,15 @@ static void heur_init(void) {
     }
 }
 
-static inline double heur_score(board_t b) {
+static inline __attribute__((always_inline)) int64_t heur_points(board_t b) {
     board_t t = transpose(b);
     int64_t s = 0;
     for (int r = 0; r < 4; r++)
         s += heur_line[(uint32_t)(b >> (ROW_BITS * r)) & ROW_MASK] + heur_line[(uint32_t)(t >> (ROW_BITS * r)) & ROW_MASK];
-    return (double)s;
+    return s;
 }
+
+static inline double heur_score(board_t b) { return (double)heur_points(b); }
 
 double nt_heur_score(uint64_t lo, uint64_t hi) {
     pthread_once(&heur_once, heur_init);
@@ -2296,25 +2300,157 @@ int nt_heur_orient(uint64_t lo, uint64_t hi, uint64_t *out_lo, uint64_t *out_hi)
  * probability cutoff; leaves are afterstates; merges earn nothing; a board with no move is worth `lost`. A spawn
  * node whose own score is below `pass` is not searched further (his pruning; -inf = off). Values share the
  * transposition table with the network's under a tag in the key's unused top bits, which also names pass and
- * lost when they depend on the root. */
+ * lost when they depend on the root. Leaves, whose value is their score alone, have a table of their own. */
 typedef struct { board_t tag; double pass, lost; } heur_t;
 
-static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, int depth, double prob);
+/* A leaf's score, kept (search_ctx_t.hleaf, 2^HLEAF_BITS of them, direct mapped): the board's 80 bits, lo and the
+ * top 16 in hi with bit 31 set (an empty slot matches nothing), and its points. Points fit 32 bits: a line scores
+ * from -12 x 3 x (17 << 17) to 3 x 3 x (17 << 17), so eight lines stay within +-2^30. */
+#define HLEAF_BITS 12            /* 64 KB a search thread */
+typedef struct hleaf { uint64_t lo; uint32_t hi; int32_t points; } hleaf_t;
+
+/* A leaf's value: its score, as heur_score gives it. Any board that scores the same may stand for it, so a leaf
+ * can be looked up turned: heur_points(b) == heur_points(transpose(b)), the rows of one being the other's columns. */
+static inline double heur_leaf(search_ctx_t *c, board_t b) {
+    uint64_t lo = lo64(b);
+    uint32_t hi = (uint32_t)hi64(b) | 0x80000000u;
+    hleaf_t *e = &c->hleaf[hash128(b) >> (64 - HLEAF_BITS)];
+    if (e->lo == lo && e->hi == hi) return (double)e->points;
+    int64_t p = heur_points(b);
+    e->lo = lo;
+    e->hi = hi;
+    e->points = (int32_t)p;
+    return (double)p;
+}
+
+/* The empty cells of b, bit i for cell i. */
+static inline unsigned empty_cells(board_t b) {
+#ifdef NT_SIMD
+    __m128i cells = _mm_set_epi64x((long long)_pdep_u64((uint64_t)(b >> 40), 0x1F1F1F1F1F1F1F1FULL),
+                                   (long long)_pdep_u64((uint64_t)b, 0x1F1F1F1F1F1F1F1FULL));
+    return (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(cells, _mm_setzero_si128()));
+#else
+    unsigned m = 0;
+    for (int i = 0; i < 16; i++) m |= (unsigned)(cell(b, i) == 0) << i;
+    return m;
+#endif
+}
+
+/* A spawn node's moves, made once for all its spawns: a spawn changes one row and one column, so a spawned
+ * board's moves are the afterstate's with that row and that column looked up again. */
+typedef struct {
+    board_t after, t, l, r, u, d;    /* t: after turned; l, r: after moved left, right; u, d: up, down, turned */
+    uint32_t row[4], col[4];         /* after's rows and columns (t's rows) */
+} hspawn_t;
+
+static inline void hspawn_init(hspawn_t *s, board_t after) {
+    s->after = after;
+    s->t = transpose(after);
+    s->l = s->r = s->u = s->d = 0;
+    for (int i = 0; i < 4; i++) {
+        s->row[i] = (uint32_t)(after >> (ROW_BITS * i)) & ROW_MASK;
+        s->col[i] = (uint32_t)(s->t >> (ROW_BITS * i)) & ROW_MASK;
+        s->l |= (board_t)rowtab[s->row[i]].left << (ROW_BITS * i);
+        s->r |= (board_t)rowtab[s->row[i]].right << (ROW_BITS * i);
+        s->u |= (board_t)rowtab[s->col[i]].left << (ROW_BITS * i);
+        s->d |= (board_t)rowtab[s->col[i]].right << (ROW_BITS * i);
+    }
+}
+
+/* Tile v spawned in cell i: the board b, b turned (tb), and its moves as do_move makes them (without the points),
+ * but for up and down, which are left turned. A move is legal when it changes the board: up, down != tb; left,
+ * right != b. */
+static inline void hspawn_kid(const hspawn_t *s, int i, int v, board_t *b, board_t *tb, board_t *up, board_t *right,
+                              board_t *down, board_t *left) {
+    int y = i >> 2, x = i & 3;
+    board_t rm = ~((board_t)ROW_MASK << (ROW_BITS * y)), cm = ~((board_t)ROW_MASK << (ROW_BITS * x));
+    const rowent_t *re = &rowtab[s->row[y] | (uint32_t)v << (CB * x)], *ce = &rowtab[s->col[x] | (uint32_t)v << (CB * y)];
+    *b = s->after | put(v, i);
+    *tb = s->t | put(v, 4 * x + y);
+    *up = (s->u & cm) | (board_t)ce->left << (ROW_BITS * x);
+    *right = (s->r & rm) | (board_t)re->right << (ROW_BITS * y);
+    *down = (s->d & cm) | (board_t)ce->right << (ROW_BITS * x);
+    *left = (s->l & rm) | (board_t)re->left << (ROW_BITS * y);
+}
+
+/* heur_max's choice: the first legal move's value, then any larger one. */
+static inline void heur_take(double val, double *best, int *any) {
+    if (!*any || val > *best) { *best = val; *any = 1; }
+}
+
+/* The sum over the spawns of a spawn node at depth 1, whose spawns' moves all end in leaves (heur_max at depth 0).
+ * Up and down leaves are looked up turned. */
+static inline double heur_spawns1(search_ctx_t *c, const heur_t *h, board_t after, unsigned free_mask) {
+    hspawn_t s;
+    hspawn_init(&s, after);
+    double sum = 0.0;
+    for (unsigned m = free_mask; m; m &= m - 1) {
+        int i = __builtin_ctz(m);
+        for (int v = 1; v <= 2; v++) {
+            board_t b, tb, up, right, down, left;
+            hspawn_kid(&s, i, v, &b, &tb, &up, &right, &down, &left);
+            double best = h->lost;
+            int any = 0;
+            if (up != tb) heur_take(heur_leaf(c, up), &best, &any);
+            if (right != b) heur_take(heur_leaf(c, right), &best, &any);
+            if (down != tb) heur_take(heur_leaf(c, down), &best, &any);
+            if (left != b) heur_take(heur_leaf(c, left), &best, &any);
+            sum += (v == 1 ? 0.9 : 0.1) * best;
+        }
+    }
+    return sum;
+}
+
+static double heur_chance(search_ctx_t *c, const heur_t *h, board_t after, int depth, double prob);
+
+/* A spawned board b with moves a (a[d] == b: not legal): its best move's value at depth, or lost. */
+static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, const board_t a[4], int depth, double prob) {
+    double best = h->lost;
+    int any = 0;
+    for (int d = 0; d < 4; d++)
+        if (a[d] != b) heur_take(heur_chance(c, h, a[d], depth, prob), &best, &any);
+    return best;
+}
+
+/* The sum over the spawns of a spawn node deeper down, its children searched to depth. Spawn k (cell by cell, the
+ * 2 then the 4) has its moves made, and their table entries fetched, while spawn k - 1 is searched. */
+static double heur_spawns(search_ctx_t *c, const heur_t *h, board_t after, unsigned free_mask, int depth,
+                          double p2, double p4) {
+    hspawn_t s;
+    hspawn_init(&s, after);
+    int cells[16], n = 0;
+    for (unsigned m = free_mask; m; m &= m - 1) cells[n++] = __builtin_ctz(m);
+    n *= 2;
+    board_t kid[2], ka[2][4];
+    double sum = 0.0;
+    for (int k = 0; k < n; k++) {
+        for (int j = k == 0 ? 0 : k + 1; j <= k + 1 && j < n; j++) {     /* spawn 0 first, then always the next */
+            board_t tb, *a = ka[j & 1];
+            hspawn_kid(&s, cells[j >> 1], 1 + (j & 1), &kid[j & 1], &tb, &a[0], &a[1], &a[2], &a[3]);
+            a[0] = a[0] == tb ? kid[j & 1] : transpose(a[0]);
+            a[2] = a[2] == tb ? kid[j & 1] : transpose(a[2]);
+            if (c->tt && !((j & 1 ? p4 : p2) < c->cutoff))
+                for (int d = 0; d < 4; d++)
+                    if (a[d] != kid[j & 1]) __builtin_prefetch(&c->tt[tt_hash(c, a[d] | h->tag)]);
+        }
+        sum += (k & 1 ? 0.1 : 0.9) * heur_max(c, h, kid[k & 1], ka[k & 1], depth, k & 1 ? p4 : p2);
+    }
+    return sum;
+}
 
 static double heur_chance(search_ctx_t *c, const heur_t *h, board_t after, int depth, double prob) {
     if (prob < c->cutoff) depth = 0;
+    if (depth == 0) return heur_leaf(c, after);
     board_t key = after | h->tag;
-    tt_entry_t *e = !c->tt ? NULL : depth == 0 ? leaf_slot(c, key) : &c->tt[tt_hash(c, key)];
+    tt_entry_t *e = c->tt ? &c->tt[tt_hash(c, key)] : NULL;
     if (e && e->key == key && e->depth == depth + 1) return e->val;
-    double v = heur_score(after);
-    if (depth > 0 && v >= h->pass) {
-        int empty = count_empty(after);
-        double p2 = prob * 0.9 / empty, p4 = prob * 0.1 / empty, sum = 0.0;
-        for (int i = 0; i < 16; i++) {
-            if (cell(after, i) != 0) continue;
-            sum += 0.9 * heur_max(c, h, after | put(1, i), depth - 1, p2);
-            sum += 0.1 * heur_max(c, h, after | put(2, i), depth - 1, p4);
-        }
+    double v;
+    /* a score is finite: with pass = -inf every node is searched, and its own score is not needed */
+    if (h->pass == -HUGE_VAL || (v = heur_score(after)) >= h->pass) {
+        unsigned free_mask = empty_cells(after);
+        int empty = __builtin_popcount(free_mask);
+        double sum = depth == 1 ? heur_spawns1(c, h, after, free_mask)
+                                : heur_spawns(c, h, after, free_mask, depth - 1, prob * 0.9 / empty, prob * 0.1 / empty);
         v = sum / empty;
     }
     if (e) {
@@ -2323,19 +2459,6 @@ static double heur_chance(search_ctx_t *c, const heur_t *h, board_t after, int d
         e->val = v;
     }
     return v;
-}
-
-static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, int depth, double prob) {
-    double best = h->lost;
-    int any = 0;
-    for (int d = 0; d < 4; d++) {
-        int r;
-        board_t a = do_move(b, d, &r);
-        if (a == b) continue;
-        double v = heur_chance(c, h, a, depth, prob);
-        if (!any || v > best) { best = v; any = 1; }
-    }
-    return best;
 }
 
 /* The orientation of the search for the real board b: heur_orient's (1), the board's own (2), or heur_orient's for
@@ -2354,6 +2477,7 @@ static int heur_sym(search_ctx_t *c, board_t b) {
  * twice the largest tile's score are not searched further, unless the root itself scores below 0. */
 static int heur_best(search_ctx_t *c, board_t b, int depth) {
     pthread_once(&heur_once, heur_init);
+    if (!c->hleaf) c->hleaf = (hleaf_t *)calloc((size_t)1 << HLEAF_BITS, sizeof(hleaf_t));
     int s = heur_sym(c, b), top = max_exp(b);
     heur_t h = {(board_t)0x80 << 120, -HUGE_VAL, -(double)(1 << 22)};
     if (c->net->heur_prune) {

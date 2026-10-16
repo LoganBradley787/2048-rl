@@ -1983,12 +1983,16 @@ _BLK_CAP = {"b6": dict(zip(_BLK_FREE["b6"], [1, 2, 1, 2, 3, 3, 3, 3, 3, 3])),   
             "b5": dict(zip(_BLK_FREE["b5"], [2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]))}
 
 
-def _blk_anchor(sh, b):
-    """The block's anchor (0: not a regular block), by the rule in block_build.c."""
+def _blk_anchor(sh, b, loose=False):
+    """The block's anchor (0: not a regular block), by the rule in block_build.c; loose: a b6 r0c2 may sit below
+    r1c2 (not equal to it, and not below the anchor)."""
     if not b[0] or not b[1] or b[0] == b[1] or b[1] == b[2] or b[0] == b[4] or b[1] == b[5]:
         return 0
     if sh == "b6":
-        return 0 if b[4] == b[5] or b[5] == b[6] or b[2] <= b[6] else min(b[4], b[5], b[6])
+        if b[4] == b[5] or b[5] == b[6] or (b[2] == b[6] if loose else b[2] <= b[6]):
+            return 0
+        a = min(b[4], b[5], b[6])
+        return 0 if loose and b[2] < a else a
     return 0 if b[5] == b[2] or b[4] <= b[5] else min(b[5], b[2])
 
 
@@ -2176,19 +2180,20 @@ def test_block_tier_off_or_without_tables_leaves_play_unchanged(tmp_path):
     assert got["count"] > 0                       # small blocks turn up early in every game
 
 
-def _blk_reach(sh, b):
+def _blk_reach(sh, b, loose=False):
     """The largest table anchor that soundly holds the block: every free cap below each block tile it can reach.
     b6: r0c3 / r2c0 (cap A-1) reach r0c2 / r1c0, r1c3 / r2c1 (A-2) reach r1c2 / r1c1; b5: r1c2 (A-1) touches r1c1
     and r0c2, which is the anchor itself."""
-    a = _blk_anchor(sh, b)
-    return a if sh == "b5" or not a else min(b[4], b[5] + 1, b[6] + 1)
+    a = _blk_anchor(sh, b, loose)
+    return a if sh == "b5" or not a else min(b[4], b[5] + 1, b[6] + 1, b[2])
 
 
 def _blk_fits(sh, b, a):
     return all(b[c] <= a - k for c, k in _BLK_CAP[sh].items())
 
 
-def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_first=False, far=0, trace=None):
+def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_first=False, far=0, trace=None,
+                    loose=False):
     """The block tier's rule written out plainly: (move, (shape, table anchor, orientation)) or (-1, None).
     loaded {shape: anchors}; value(sh, a, t): the table's float32 chance of the free tiles of t; after_of(real, d):
     the board after move d or None if it does not change; sym(i, s): the engine's cell map (o[i] = real[sym(i, s)]).
@@ -2203,8 +2208,8 @@ def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_firs
     for s in range(8):
         o = [real[sym(i, s)] for i in range(16)]
         for shi, sh in enumerate(("b6", "b5")):
-            own = _blk_anchor(sh, o)
-            top = _blk_reach(sh, o) if far else own
+            own = _blk_anchor(sh, o, loose)
+            top = _blk_reach(sh, o, loose) if far else own
             a = max([x for x in loaded.get(sh, ()) if x <= top], default=0)
             if not a or not _blk_fits(sh, o, a) or _blk_goal(sh, o, a):
                 continue
@@ -2244,7 +2249,7 @@ def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_firs
     return -1, None
 
 
-def _blk_random_boards(rng, loaded, n):
+def _blk_random_boards(rng, loaded, n, loose=False):
     """n real boards holding a regular block of either shape (any orientation), its anchor near the loaded
     tables' ({shape: anchors}), free tiles under the caps of the anchor or one above, at least one empty cell."""
     CAP = {"b6": [1, 2, 1, 2, 3, 3, 3, 3, 3, 3], "b5": [2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]}
@@ -2257,7 +2262,7 @@ def _blk_random_boards(rng, loaded, n):
             b = [int(rng.integers(2, own + 6)) if c in _BLK_CELLS[sh] else 0 for c in range(16)]
             if down:
                 b[4], b[5], b[6] = sorted((b[4], b[5], b[6]), reverse=True)
-            if _blk_anchor(sh, b) == own:
+            if _blk_anchor(sh, b, loose) == own:
                 break
         ca = own + int(rng.integers(0, 2)) if sh == "b6" else own   # free tiles under the caps of own or own + 1
         for c, k in zip(_BLK_FREE[sh], CAP[sh]):
@@ -2296,7 +2301,8 @@ def value(sh, a, t):                      # the table's entry for t's free tiles
 def after_of(real, d):
     b = bits(real); m = nt.move(b, d)[0]
     return None if m == b else [int(x) for x in nt.from_bits(m).ravel()]
-boards = _blk_random_boards(np.random.default_rng(int(sys.argv[4])), loaded, int(sys.argv[5]))
+loose_boards = len(sys.argv) > 7 and sys.argv[7] == "1"
+boards = _blk_random_boards(np.random.default_rng(int(sys.argv[4])), loaded, int(sys.argv[5]), loose_boards)
 net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
 net.block_tier = True
 mode = sys.argv[6] if len(sys.argv) > 6 else "ref"   # ref, trace (ref and its readings), engine (engine only)
@@ -2304,6 +2310,7 @@ out = []
 for st in settings:
     net.block_min_b6, net.block_min_b5 = st.get("min_b6", 0), st.get("min_b5", 0)
     net.block_b5_first, net.block_far = st.get("b5_first", 0), st.get("far", 0)
+    net.block_loose = st.get("loose", 0)
     eng, ref, traces = [], [], []
     for real in boards:
         c0 = nt.block_tier_moves()
@@ -2312,7 +2319,8 @@ for st in settings:
         if mode != "engine":
             traces.append([])
             ref.append(_blk_choose_ref(real, loaded, value, after_of, nt.sym_cell, (st.get("min_b6", 0),
-                       st.get("min_b5", 0)), bool(st.get("b5_first", 0)), st.get("far", 0), traces[-1])[0])
+                       st.get("min_b5", 0)), bool(st.get("b5_first", 0)), st.get("far", 0), traces[-1],
+                       bool(st.get("loose", 0)))[0])
     out.append({"engine": eng, "ref": ref} | ({"trace": traces} if mode == "trace" else {}))
 print(json.dumps(out))
 """
@@ -2347,6 +2355,31 @@ def test_block_chooser_options_match_the_rule(tmp_path):
     # block), so b5 first changes nothing; with far a b6 table one above its anchor can tie with b5's.
     assert diff(2, 0) == 0 and diff(6, 4) >= 4
     assert diff(4, 0) >= 40 and diff(5, 0) >= 8 and diff(4, 5) >= 30 and diff(7, 0) >= 20
+
+
+def test_block_loose_rule_matches_the_reference(tmp_path):
+    """block_loose (macroxue's big build's b6 rule: r0c2 below r1c2 allowed, never equal, never below the anchor)
+    chooses as the plainly written rule on boards that include such blocks, alone and with far; off, those blocks
+    are not read."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for sh, anchors in (("b6", "4,5,6"), ("b5", "4,5")):
+        subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--block", sh, "--anchors",
+                        anchors, "--threads", "2", "--out", str(tmp_path / sh)], check=True, capture_output=True)
+    settings = [{}, {"loose": 1}, {"loose": 1, "far": 1}, {"loose": 1, "far": 2}]
+    r = subprocess.run([sys.executable, "-c", _CHOOSER_CHECK, f"{tmp_path / 'b6'},{tmp_path / 'b5'}",
+                        json.dumps(settings), str(root / "tests"), "11", "1000", "ref", "1"],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    for st, g in zip(settings, got):
+        assert g["engine"] == g["ref"], st
+    diff = lambda i, j: sum(x != y for x, y in zip(got[i]["ref"], got[j]["ref"]))
+    assert diff(1, 0) >= 50                                     # loose reads blocks the default turns down
+    assert sum(d >= 0 for d in got[1]["ref"]) > sum(d >= 0 for d in got[0]["ref"])
 
 
 def _code6(u):

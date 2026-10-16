@@ -247,6 +247,8 @@ typedef struct net {
                               * b6 reading's (b5 needs r1c2 below its table, r1c2 >= the b6 anchor) */
     int block_far;           /* ... 1: a b6 block reads the largest table that soundly holds it (see blk_reach);
                               * 2: as 1, but only while it fits its own anchor's caps and is not at its goal */
+    int block_loose;         /* ... 1: a b6 block may have r0c2 below r1c2 (not equal, and at least the anchor so
+                              * that r0c3, cap anchor-1, cannot merge into it): macroxue's big build's rule */
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -1618,12 +1620,13 @@ static uint64_t *blk_offs[2][BLK_AMAX + 1], *blk_rank[2][BLK_AMAX + 1][11], blk_
 static long blk_count;                                    /* moves the tier chose (all threads) */
 
 /* the anchor of the block on board b (in the shape's frame), or 0 if the block is not regular */
-static int blk_anchor(int sh, const uint8_t *b) {
+static int blk_anchor(int sh, const uint8_t *b, int loose) {
     if (!b[0] || !b[1] || b[0] == b[1] || b[1] == b[2] || b[0] == b[4] || b[1] == b[5]) return 0;
     if (sh == 0) {
-        if (b[4] == b[5] || b[5] == b[6] || b[2] <= b[6]) return 0;
+        if (b[4] == b[5] || b[5] == b[6] || (loose ? b[2] == b[6] : b[2] <= b[6])) return 0;
         int a = b[4] < b[5] ? b[4] : b[5];
-        return a < b[6] ? a : b[6];
+        a = a < b[6] ? a : b[6];
+        return loose && b[2] < a ? 0 : a;   /* loose: r0c2 may sit below r1c2 while r0c3 (cap a-1) cannot reach it */
     }
     if (b[5] == b[2] || b[4] <= b[5]) return 0;
     return b[5] < b[2] ? b[5] : b[2];
@@ -1637,12 +1640,13 @@ static int blk_anchor(int sh, const uint8_t *b) {
  * above the anchor when the smallest second-row tile is not at r1c0. b5: r1c2 (cap A-1) touches both r1c1 and
  * r0c2, so A <= min(r1c1, r0c2) = the anchor: no larger table is ever sound. Under the bound the game on the free
  * cells is the table's game exactly, so the value read is the true chance of that table's (farther) goal. */
-static int blk_reach(int sh, const uint8_t *b) {
-    int a = blk_anchor(sh, b);
+static int blk_reach(int sh, const uint8_t *b, int loose) {
+    int a = blk_anchor(sh, b, loose);
     if (sh || !a) return a;
     int r = b[4];
     if (b[5] + 1 < r) r = b[5] + 1;
     if (b[6] + 1 < r) r = b[6] + 1;
+    if (b[2] < r) r = b[2];                                 /* r0c3 (cap A-1) reaches r0c2 (only binds when loose) */
     return r;
 }
 
@@ -1719,7 +1723,7 @@ static int blk_choose(const net_t *n, board_t board) {
         uint8_t o[16];
         for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
         for (int sh = 0; sh < 2; sh++) {
-            int own = blk_anchor(sh, o), a = blk_table(sh, n->block_far ? blk_reach(sh, o) : own);
+            int own = blk_anchor(sh, o, n->block_loose), a = blk_table(sh, n->block_far ? blk_reach(sh, o, n->block_loose) : own);
             if (!a || !blk_fits(sh, o, a) || blk_goal(sh, o, a)) continue;
             if (n->block_far == 2 && a > own && (!blk_fits(sh, o, own) || blk_goal(sh, o, own))) continue;
             int k = ((n->block_b5_first ? 1 - sh : 0) << 12) | ((BLK_AMAX - a) << 8) | (sh << 4) | s, i = nc++;
@@ -2146,7 +2150,7 @@ float nt_block_value(uint64_t lo, uint64_t hi, int sh, int a) {
     board_t b = mk(lo, hi);
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
-    if (blk_anchor(sh, c) < a || !blk_fits(sh, c, a)) return -1.0f;
+    if (blk_anchor(sh, c, 0) < a || !blk_fits(sh, c, a)) return -1.0f;
     if (blk_fmt[sh][a]) return blk_value6(((const uint8_t *)blk_map[sh][a])[blk_index(sh, a, c)] >> 2);
     return blk_get(sh, a, c);
 }
@@ -2171,6 +2175,8 @@ void nt_set_block_b5_first(void *p, int on) { ((net_t *)p)->block_b5_first = on 
 int nt_get_block_b5_first(void *p) { return ((net_t *)p)->block_b5_first; }
 void nt_set_block_far(void *p, int mode) { ((net_t *)p)->block_far = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
 int nt_get_block_far(void *p) { return ((net_t *)p)->block_far; }
+void nt_set_block_loose(void *p, int on) { ((net_t *)p)->block_loose = on != 0; }
+int nt_get_block_loose(void *p) { return ((net_t *)p)->block_loose; }
 
 /* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
  * tile and the stage rule allows. */

@@ -280,6 +280,8 @@ def lib() -> ctypes.CDLL:
     L.nt_get_block_b5_first.argtypes, L.nt_get_block_b5_first.restype = [vp], i32
     L.nt_set_block_far.argtypes = [vp, i32]
     L.nt_get_block_far.argtypes, L.nt_get_block_far.restype = [vp], i32
+    L.nt_set_block_loose.argtypes = [vp, i32]
+    L.nt_get_block_loose.argtypes, L.nt_get_block_loose.restype = [vp], i32
 
     L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
@@ -881,6 +883,17 @@ class NTupleNet:
             mode = mode.strip().lower()
             mode = int(mode) if mode.isdigit() else int(_flag(mode))
         self._lib.nt_set_block_far(self._h, int(mode))
+
+    @property
+    def block_loose(self) -> bool:
+        """With `block_tier`: a b6 block also counts when its r0c2 is below r1c2 (never equal to it, and at least
+        the anchor, so that no free tile under the table's caps can reach it): macroxue's big build's rule. The
+        tables are the same; more boards are read in them. Accepts a string."""
+        return bool(self._lib.nt_get_block_loose(self._h))
+
+    @block_loose.setter
+    def block_loose(self, on) -> None:
+        self._lib.nt_set_block_loose(self._h, int(_flag(on)))
 
     def _heur_mode(self) -> tuple[int, int]:
         prune = ctypes.c_int(0)

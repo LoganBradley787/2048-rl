@@ -377,7 +377,12 @@ cost is listed here. All were built on the ThinkPad, 8 to 12 threads.
 | Lift, two tiles | the snake with two large tiles moved off the path | 15 October | 1.0 billion | 1.9 GB | 9 min |
 | Corner block, 2 by 3 | six large tiles in a 2 by 3 corner block, one table per smallest tile | 16 October | 2.9 billion | 5.8 GB | 19 min |
 | Block, 3 and 2 | five large tiles, three on the edge and two below | 16 October | 7.1 billion | 14.2 GB | 31 min |
-| **Kept** | | | **52 billion** | **104 GB** | **2.8 h** |
+| **All six** | | | **52 billion** | **104 GB** | **2.8 h** |
+
+On 16 October the four ladder sets (78 GB) were deleted to free disk: the
+player as it stands, with the heuristic search and the two block sets, scores
+the same without them. Built again from the same builder they come out
+identical, so they can return when a player needs them.
 
 Not kept: the snake ladder was deleted once to free disk and built again
 (36 min), and a set of tables that let one large tile move around was built

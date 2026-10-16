@@ -34,7 +34,7 @@ from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
 SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5",
-            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "block_tables", "block_from"]
+            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "heuristic_from", "block_tables", "block_from"]
 TRACE_CAP = 200_000                                    # boards kept during play; a longer game is played again
 
 
@@ -111,6 +111,9 @@ def add_play_args(p: argparse.ArgumentParser) -> None:
                         "root, search again unpruned when the best move scores below 0)")
     p.add_argument("--heuristic-depth", type=int, default=0,
                    help="with --heuristic: search the late boards this deep (0 = --depth; --depth-caps still apply)")
+    p.add_argument("--heuristic-from", type=int, default=0,
+                   help="with --heuristic: it plays boards whose tile set is at least this (0 = 49152, a 32768 and "
+                        "a 16384; 32768: from the first 32768)")
     p.add_argument("--block-dir", action="append", default=None,
                    help="block-tier tables (examples/build_endgame.py --block) play the boards no ladder table holds; "
                         "repeat it for several shapes")
@@ -132,8 +135,8 @@ def add_trace_args(p: argparse.ArgumentParser, trace_min: int = 0, report_min: i
 
 def check_args(p: argparse.ArgumentParser, args) -> list[int]:
     """Option errors; returns the depth caps."""
-    if args.heuristic == "off" and (args.heuristic_prune or args.heuristic_depth):
-        p.error("--heuristic-prune and --heuristic-depth need --heuristic")
+    if args.heuristic == "off" and (args.heuristic_prune or args.heuristic_depth or args.heuristic_from):
+        p.error("--heuristic-prune, --heuristic-depth and --heuristic-from need --heuristic")
     if args.block_from and not args.block_dir:
         p.error("--block-from needs --block-dir")
     if getattr(args, "trace_min_score", 0) and not getattr(args, "trace_dir", None):
@@ -156,6 +159,7 @@ def play_settings(args, path: Path, caps: list[int]) -> dict:
             # off = absent, so files written before these options existed still match
             "heuristic": None if args.heuristic == "off" else args.heuristic,
             "heuristic_prune": {"small": True, "big": "big"}.get(args.heuristic_prune), "heuristic_depth": args.heuristic_depth or None,
+            "heuristic_from": args.heuristic_from or None,
             "block_dir": args.block_dir,
             "block_tables": args.block_dir and " | ".join((Path(d) / "block.txt").read_text().strip()
                                                           for d in args.block_dir),
@@ -199,6 +203,8 @@ def args_from_settings(s: dict) -> list[str]:
             argv += ["--heuristic-prune", "big" if s["heuristic_prune"] == "big" else "small"]
         if s.get("heuristic_depth"):
             argv += ["--heuristic-depth", str(s["heuristic_depth"])]
+        if s.get("heuristic_from"):
+            argv += ["--heuristic-from", str(s["heuristic_from"])]
     argv += [a for d in s.get("block_dir") or [] for a in ("--block-dir", at(d))]
     if s.get("block_from"):
         argv += ["--block-from", str(s["block_from"])]
@@ -227,6 +233,7 @@ def load_net(args, path: Path, caps: list[int]) -> nt.NTupleNet:
     if args.heuristic != "off":
         net.heuristic_orientation = args.heuristic
         net.heuristic_late, net.heuristic_depth = True, args.heuristic_depth
+        net.heuristic_from = args.heuristic_from
         net.heuristic_prune = {"small": True, "big": "big"}.get(args.heuristic_prune, False)
     net.depth_caps = caps
     if args.tt_bits:

@@ -258,6 +258,8 @@ def lib() -> ctypes.CDLL:
     L.nt_get_heur.argtypes, L.nt_get_heur.restype = [vp, P(i32)], i32
     L.nt_set_heur_depth.argtypes = [vp, i32]
     L.nt_get_heur_depth.argtypes, L.nt_get_heur_depth.restype = [vp], i32
+    L.nt_set_heur_from.argtypes = [vp, ctypes.c_int64]
+    L.nt_get_heur_from.argtypes, L.nt_get_heur_from.restype = [vp], ctypes.c_int64
     L.nt_heur_new_game.argtypes = [vp]
     L.nt_heur_game_sym.argtypes, L.nt_heur_game_sym.restype = [vp], i32
     L.nt_heur_score.argtypes, L.nt_heur_score.restype = [u64, u64], f64
@@ -942,6 +944,16 @@ class NTupleNet:
     @heuristic_depth.setter
     def heuristic_depth(self, depth: int) -> None:
         self._lib.nt_set_heur_depth(self._h, int(depth))
+
+    @property
+    def heuristic_from(self) -> int:
+        """With `heuristic_late`: the heuristic plays boards whose tile set (see `board_scale`) is at least this
+        (0 = the default, 49152: a 32768 and a 16384, or more). Set it between searches."""
+        return int(self._lib.nt_get_heur_from(self._h))
+
+    @heuristic_from.setter
+    def heuristic_from(self, value: int) -> None:
+        self._lib.nt_set_heur_from(self._h, int(value))
 
     @property
     def heuristic_prune(self):

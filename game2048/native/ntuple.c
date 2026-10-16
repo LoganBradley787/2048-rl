@@ -238,6 +238,7 @@ typedef struct net {
                               * 1 = turned per move, 2 = as given, 3 = turned once per game (see heur_best) */
     int heur_prune;          /* ... with his pruning and loss value (see heur_best) */
     int heur_depth;          /* ... at this depth instead of the game's (0 = the game's; depth caps still apply) */
+    int64_t heur_from;       /* ... from boards whose tile set (board_scale) is at least this (0 = HEUR_FROM) */
     int block_tier;          /* block-tier tables (nt_block_load) play boards no ladder table holds (0 = off) */
     int64_t block_from;      /* ... whose tile set (board_scale) is at least this (0 = every board) */
     float block_min[2];      /* ... a reading of shape sh (0 b6, 1 b5) plays only if its best chance is above this */
@@ -2521,6 +2522,8 @@ void nt_set_heur(void *p, int on, int prune) {
 int nt_get_heur(void *p, int *prune) { *prune = ((net_t *)p)->heur_prune; return ((net_t *)p)->heur; }
 void nt_set_heur_depth(void *p, int depth) { ((net_t *)p)->heur_depth = depth < 0 ? 0 : depth; }
 int nt_get_heur_depth(void *p) { return ((net_t *)p)->heur_depth; }
+void nt_set_heur_from(void *p, int64_t from) { ((net_t *)p)->heur_from = from < 0 ? 0 : from; }
+int64_t nt_get_heur_from(void *p) { return ((net_t *)p)->heur_from; }
 
 static int best_move(search_ctx_t *c, board_t b, int depth) {
     int held = 0;
@@ -2539,7 +2542,7 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         for (int i = 0; i < 16; i++) present |= 1u << cell(real, i);
         if ((present & c->net->deep_need) == c->net->deep_need) depth = c->net->deep_depth;
     }
-    int heur = c->net->heur && board_scale(real) >= HEUR_FROM;   /* the late game by hand: the real board, no bonus */
+    int heur = c->net->heur && board_scale(real) >= (c->net->heur_from ? c->net->heur_from : HEUR_FROM);   /* the late game by hand: the real board, no bonus */
     if (!heur) b = root_board(c->net, b);
     else if (c->net->heur_depth) depth = c->net->heur_depth;
     int cap = c->net->depth_cap[count_empty(b)];

@@ -2684,3 +2684,30 @@ def test_heuristic_orientation_and_depth_change_nothing_else():
     with pytest.raises(ValueError):
         n.heuristic_orientation = "corner"
     n.close()
+
+
+def test_heuristic_from_moves_where_the_heuristic_takes_over():
+    """heuristic_from 0 keeps the default (boards holding a 32768 and a 16384); 32768 hands boards with a 32768 and
+    no 16384 to the heuristic too, and leaves boards without a 32768 alone."""
+    n = _trained_small_net()
+    assert n.heuristic_from == 0
+    rng = np.random.default_rng(41)
+    mid = []
+    for _ in range(40):
+        e = rand_exps(rng, density=0.7, max_exp=12)
+        e[divmod(int(rng.integers(16)), 4)] = 15
+        mid.append(nt.to_bits(e))
+    low = [nt.to_bits(rand_exps(rng, density=0.7, max_exp=13)) for _ in range(20)]
+    net_mid = [n.best_move(b, depth=1) for b in mid]
+    net_low = [n.best_move(b, depth=1) for b in low]
+    n.heuristic_late = True
+    assert [n.best_move(b, depth=1) for b in mid] == net_mid      # default: not late enough
+    n.heuristic_from = 32768
+    assert n.heuristic_from == 32768
+    got = [n.best_move(b, depth=1) for b in mid]
+    assert got == [_ref_heur_move(b, 1) for b in mid]
+    assert got != net_mid                                         # the test can tell the two players apart
+    assert [n.best_move(b, depth=1) for b in low] == net_low
+    n.heuristic_from = 0
+    assert [n.best_move(b, depth=1) for b in mid] == net_mid
+    n.close()

@@ -231,6 +231,8 @@ typedef struct net {
     double eg_bonus;         /* root moves into an endgame table position gain eg_bonus x the table's chance (0 = off) */
     int deep_depth;          /* search at least this deep when the board holds every tile in deep_need (0 = off) */
     unsigned deep_need;      /* bit e: a tile 2^e (before the depth caps; tables still take their boards first) */
+    int heur;                /* late boards (see HEUR_FROM) are searched with macroxue's heuristic, not the tables */
+    int heur_prune;          /* ... with his pruning and loss value (see heur_best) */
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -1923,6 +1925,159 @@ void nt_root_board(void *p, uint64_t lo, uint64_t hi, uint64_t *out_lo, uint64_t
     *out_hi = hi64(r);
 }
 
+/* ------------------------------------------------------------ heuristic --- */
+
+/* macroxue's hand-written evaluation (github.com/macroxue/2048-ai, node.h: BuildScoreMap, Evaluate), for the late
+ * game, where the tables have seen too little to tell boards apart. A tile 2^r scores r << r. A line of four, read
+ * from its first cell, scores its first tile, plus for each pair of neighbours a, b: a + b when a >= b, else
+ * 12 (a - b), plus a again when they are equal. A board scores its rows read left to right plus its columns read
+ * top to bottom (his non-interactive player: one corner, the top left). */
+#define HEUR_FROM 49152          /* boards that hold a 32768 and a 16384, or more (see board_scale) */
+static int32_t *heur_line;       /* by line of four, its first cell in the low bits */
+static pthread_once_t heur_once = PTHREAD_ONCE_INIT;
+
+static void heur_init(void) {
+    heur_line = (int32_t *)malloc(ROW_N * sizeof(int32_t));
+    for (uint32_t i = 0; i < ROW_N; i++) {
+        int64_t t[4];
+        for (int j = 0; j < 4; j++) {
+            int r = (int)((i >> (CB * j)) & CMASK);
+            t[j] = r <= MAX_EXP ? (int64_t)r << r : 0;
+        }
+        int64_t s = t[0];
+        for (int j = 0; j < 3; j++) {
+            s += t[j] >= t[j + 1] ? t[j] + t[j + 1] : (t[j] - t[j + 1]) * 12;
+            if (t[j] == t[j + 1]) s += t[j];
+        }
+        heur_line[i] = (int32_t)s;               /* at most 3 x 12 x (17 << 17) in size: fits */
+    }
+}
+
+static inline double heur_score(board_t b) {
+    board_t t = transpose(b);
+    int64_t s = 0;
+    for (int r = 0; r < 4; r++)
+        s += heur_line[(uint32_t)(b >> (ROW_BITS * r)) & ROW_MASK] + heur_line[(uint32_t)(t >> (ROW_BITS * r)) & ROW_MASK];
+    return (double)s;
+}
+
+double nt_heur_score(uint64_t lo, uint64_t hi) {
+    pthread_once(&heur_once, heur_init);
+    return heur_score(mk(lo, hi));
+}
+
+static board_t sym_board(board_t b, int s) {
+    board_t o = 0;
+    for (int i = 0; i < 16; i++) o |= put(cell(b, sym_cell(i, s)), i);
+    return o;
+}
+
+/* The orientation the heuristic sees the game in, fixed for the whole search of a move: the largest tile nearest
+ * the top left corner (fewest steps), then the larger first row (read from the corner), the larger first column,
+ * the larger rest read row by row; the first such orientation. */
+static int heur_orient(board_t b) {
+    static const int order[15] = {0, 1, 2, 3, 4, 8, 12, 5, 6, 7, 9, 10, 11, 13, 14};
+    int best = 0, bkey[17];
+    for (int s = 0; s < 8; s++) {
+        board_t o = sym_board(b, s);
+        int key[17], top = max_exp(o), near = 6;
+        for (int i = 0; i < 16; i++) if (cell(o, i) == top && i / 4 + i % 4 < near) near = i / 4 + i % 4;
+        key[0] = -near;
+        for (int j = 0; j < 15; j++) key[1 + j] = cell(o, order[j]);
+        key[16] = cell(o, 15);
+        int j = 0;
+        while (s > 0 && j < 17 && key[j] == bkey[j]) j++;
+        if (s == 0 || (j < 17 && key[j] > bkey[j])) { best = s; memcpy(bkey, key, sizeof(key)); }
+    }
+    return best;
+}
+
+int nt_heur_orient(uint64_t lo, uint64_t hi, uint64_t *out_lo, uint64_t *out_hi) {
+    board_t b = mk(lo, hi);
+    int s = heur_orient(b);
+    board_t o = sym_board(b, s);
+    *out_lo = lo64(o);
+    *out_hi = hi64(o);
+    return s;
+}
+
+/* His search (node.h: Search, TryAllTiles, TryAllMoves), in the shape of ours: the same spawns, depth and
+ * probability cutoff; leaves are afterstates; merges earn nothing; a board with no move is worth `lost`. A spawn
+ * node whose own score is below `pass` is not searched further (his pruning; -inf = off). Values share the
+ * transposition table with the network's under a tag in the key's unused top bits, which also names pass and
+ * lost when they depend on the root. */
+typedef struct { board_t tag; double pass, lost; } heur_t;
+
+static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, int depth, double prob);
+
+static double heur_chance(search_ctx_t *c, const heur_t *h, board_t after, int depth, double prob) {
+    if (prob < c->cutoff) depth = 0;
+    board_t key = after | h->tag;
+    tt_entry_t *e = !c->tt ? NULL : depth == 0 ? leaf_slot(c, key) : &c->tt[tt_hash(c, key)];
+    if (e && e->key == key && e->depth == depth + 1) return e->val;
+    double v = heur_score(after);
+    if (depth > 0 && v >= h->pass) {
+        int empty = count_empty(after);
+        double p2 = prob * 0.9 / empty, p4 = prob * 0.1 / empty, sum = 0.0;
+        for (int i = 0; i < 16; i++) {
+            if (cell(after, i) != 0) continue;
+            sum += 0.9 * heur_max(c, h, after | put(1, i), depth - 1, p2);
+            sum += 0.1 * heur_max(c, h, after | put(2, i), depth - 1, p4);
+        }
+        v = sum / empty;
+    }
+    if (e) {
+        e->key = key;
+        e->depth = (uint8_t)(depth + 1);
+        e->val = v;
+    }
+    return v;
+}
+
+static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, int depth, double prob) {
+    double best = h->lost;
+    int any = 0;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(b, d, &r);
+        if (a == b) continue;
+        double v = heur_chance(c, h, a, depth, prob);
+        if (!any || v > best) { best = v; any = 1; }
+    }
+    return best;
+}
+
+/* The move for the real board b, searched in the orientation heur_orient picks: each move is made on b and its
+ * afterstate turned. Without pruning, his settings without his tables (-T): a loss is worth -2^22. With it, his
+ * settings beside his tables: a loss is worth -max(2^17, 2 x the largest tile's score), and spawn nodes below
+ * twice the largest tile's score are not searched further, unless the root itself scores below 0. */
+static int heur_best(search_ctx_t *c, board_t b, int depth) {
+    pthread_once(&heur_once, heur_init);
+    int s = heur_orient(b), top = max_exp(b);
+    heur_t h = {(board_t)0x80 << 120, -HUGE_VAL, -(double)(1 << 22)};
+    if (c->net->heur_prune) {
+        double ts = (double)((int64_t)top << top);
+        int open = heur_score(sym_board(b, s)) < 0.0;
+        h.pass = open ? -HUGE_VAL : 2.0 * ts;
+        h.lost = -fmax((double)(1 << 17), 2.0 * ts);
+        h.tag = (board_t)(0xC0 | (open ? 0x20 : 0) | top) << 120;
+    }
+    int best = -1;
+    double bestv = 0.0;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(b, d, &r);
+        if (a == b) continue;
+        double v = heur_chance(c, &h, sym_board(a, s), depth, 1.0);
+        if (best < 0 || v > bestv) { bestv = v; best = d; }
+    }
+    return best;
+}
+
+/* Not for use while games are being played on other threads. */
+void nt_set_heur(void *p, int on, int prune) { ((net_t *)p)->heur = on != 0; ((net_t *)p)->heur_prune = prune != 0; }
+int nt_get_heur(void *p, int *prune) { *prune = ((net_t *)p)->heur_prune; return ((net_t *)p)->heur; }
+
 static int best_move(search_ctx_t *c, board_t b, int depth) {
     if (c->net->endgame) {                                     /* an exact table, when the board is one of its positions */
         int d = eg_choose(b, c->net->endgame);
@@ -1934,9 +2089,11 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         for (int i = 0; i < 16; i++) present |= 1u << cell(real, i);
         if ((present & c->net->deep_need) == c->net->deep_need) depth = c->net->deep_depth;
     }
-    b = root_board(c->net, b);
+    int heur = c->net->heur && board_scale(real) >= HEUR_FROM;   /* the late game by hand: the real board, no bonus */
+    if (!heur) b = root_board(c->net, b);
     int cap = c->net->depth_cap[count_empty(b)];
     if (cap && depth > cap) depth = cap;
+    if (heur) return heur_best(c, b, depth);
     int best = -1;
     double bestv = 0.0;
     for (int d = 0; d < 4; d++) {

@@ -1973,3 +1973,147 @@ def test_endgame_bonus_steers_a_root_move_into_a_table(tmp_path):
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert got["plain"] in (1, 3)                 # without the bonus: the 32 points
     assert got["bonus"] == 0 and got["get"] == 1e9
+
+
+# --- macroxue's heuristic for the late game ------------------------------------
+
+def _ref_heur(bits):
+    """macroxue's node.h (BuildScoreMap, Evaluate without -I), written out plainly."""
+    def line(cells):
+        t = [c << c for c in cells]
+        s = t[0]
+        for a, b in zip(t, t[1:]):
+            s += a + b if a >= b else (a - b) * 12
+            s += a if a == b else 0
+        return s
+    g = [nt.cell(bits, i) for i in range(16)]
+    return sum(line(g[4 * r:4 * r + 4]) for r in range(4)) + sum(line(g[c::4]) for c in range(4))
+
+
+def _ref_orient(bits):
+    """Largest tile nearest the top left, then the larger first row, first column, rest row by row."""
+    order = [0, 1, 2, 3, 4, 8, 12, 5, 6, 7, 9, 10, 11, 13, 14, 15]
+    best = None
+    for s in range(8):
+        o = [nt.cell(bits, nt.sym_cell(i, s)) for i in range(16)]
+        near = min(i // 4 + i % 4 for i in range(16) if o[i] == max(o))
+        key = [-near] + [o[i] for i in order]
+        if best is None or key > best[0]:
+            best = (key, s)
+    return best[1]
+
+
+def _turn(bits, s):
+    return sum(nt.cell(bits, nt.sym_cell(i, s)) << (5 * i) for i in range(16))
+
+
+def _ref_heur_move(bits, depth, prune=False):
+    """The heuristic search by its definition: oriented afterstates, no merge points, a loss at -2**22 (or, with
+    prune, macroxue's pass score and loss value beside his tables)."""
+    s = _ref_orient(bits)
+    top = max(nt.cell(bits, i) for i in range(16))
+    ts = top << top
+    pass_, lost = -np.inf, -float(1 << 22)
+    if prune:
+        pass_ = -np.inf if _ref_heur(_turn(bits, s)) < 0 else 2.0 * ts
+        lost = -float(max(1 << 17, 2 * ts))
+
+    def chance(after, depth):
+        v = float(_ref_heur(after))
+        if depth == 0 or v < pass_:
+            return v
+        empties = [i for i in range(16) if nt.cell(after, i) == 0]
+        total = 0.0
+        for i in empties:
+            total += 0.9 * maxnode(nt.with_cell(after, i, 1), depth - 1)
+            total += 0.1 * maxnode(nt.with_cell(after, i, 2), depth - 1)
+        return total / len(empties)
+
+    def maxnode(b, depth):
+        vals = [chance(nb, depth) for nb in (nt.move(b, d)[0] for d in range(4)) if nb != b]
+        return max(vals) if vals else lost
+
+    best, best_v = -1, None
+    for d in range(4):
+        nb = nt.move(bits, d)[0]
+        if nb != bits:
+            v = chance(_turn(nb, s), depth)
+            if best_v is None or v > best_v:
+                best, best_v = d, v
+    return best
+
+
+def _late_boards(rng, count, empties=4, ordered=False):
+    """Crowded boards holding a 32768 and a 16384 (or a 65536), small tiles elsewhere, with a legal move.
+    ordered: tiles descending from the top left, two small ones swapped (boards the heuristic scores above 0)."""
+    out = []
+    while len(out) < count:
+        g = rng.integers(1, 9, size=16).astype(np.uint8)
+        cells = rng.permutation(16)
+        g[cells[0]], g[cells[1]] = (16 if len(out) % 3 == 2 else 15), 14
+        g[cells[2:2 + empties]] = 0
+        if ordered:
+            g = np.sort(g)[::-1].copy()
+            i, j = rng.choice(np.arange(2, 16 - empties), 2, replace=False)
+            g[i], g[j] = g[j], g[i]
+            k, turned = int(rng.integers(8)), g.copy()               # in any of the eight orientations
+            for c in range(16):
+                turned[nt.sym_cell(c, k)] = g[c]
+            g = turned
+        b = nt.to_bits(g.reshape(4, 4))
+        if nt.afterstates_valid(b):
+            out.append(b)
+    return out
+
+
+def test_heuristic_score_is_macroxues_formula():
+    row = nt.to_bits(np.array([[15, 14, 13, 12], [0] * 4, [0] * 4, [0] * 4], dtype=np.uint8))
+    assert nt.heuristic_score(row) == 3457024          # 1703936 for the row, 983040 + 458752 + 212992 + 98304 down
+    two = nt.to_bits(np.array([[0, 1, 0, 0], [0] * 4, [0] * 4, [0] * 4], dtype=np.uint8))
+    assert nt.heuristic_score(two) == -18               # (0 - 2) x 12 + 2 along the row, 2 + 2 down its column
+    rng = np.random.default_rng(31)
+    for _ in range(200):
+        b = nt.to_bits(rand_exps(rng, density=0.8, max_exp=17))
+        assert nt.heuristic_score(b) == _ref_heur(b)
+
+
+def test_heuristic_orientation_puts_the_largest_tile_at_the_top_left():
+    rng = np.random.default_rng(32)
+    for b in _late_boards(rng, 40, empties=3):
+        s, o = nt.heuristic_orient(b)
+        assert s == _ref_orient(b) and o == _turn(b, s)
+    corner = nt.to_bits(np.array([[0, 0, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0], [15, 14, 0, 0]], dtype=np.uint8))
+    s, o = nt.heuristic_orient(corner)
+    assert nt.cell(o, 0) == 15 and nt.cell(o, 1) == 14     # the 16384 along the first row, not down the column
+
+
+@pytest.mark.parametrize("prune", [False, True])
+def test_heuristic_late_search_is_the_plain_expectimax_over_the_heuristic(prune):
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)
+    n.heuristic_late, n.heuristic_prune = True, prune
+    assert n.heuristic_late and n.heuristic_prune == prune
+    rng = np.random.default_rng(33)
+    for b in _late_boards(rng, 24) + _late_boards(rng, 24, ordered=True):
+        assert n.best_move(b, depth=1) == _ref_heur_move(b, 1, prune)
+    for b in _late_boards(rng, 2, empties=3) + _late_boards(rng, 2, empties=3, ordered=True):
+        assert n.best_move(b, depth=2) == _ref_heur_move(b, 2, prune)
+    n.close()
+
+
+def test_heuristic_late_leaves_other_boards_and_the_default_alone():
+    """Off by default; on, it changes late boards only."""
+    n = _trained_small_net()
+    assert not n.heuristic_late and not n.heuristic_prune
+    rng = np.random.default_rng(34)
+    early = [nt.to_bits(rand_exps(rng, density=0.7, max_exp=14)) for _ in range(30)]
+    early = [b for b in early if not ({14, 15} <= {nt.cell(b, i) for i in range(16)})]
+    late = _late_boards(rng, 30)
+    off = [n.best_move(b, depth=1) for b in early + late]
+    n.heuristic_late = True
+    on = [n.best_move(b, depth=1) for b in early + late]
+    assert on[:len(early)] == off[:len(early)]
+    assert on[len(early):] != off[len(early):]
+    assert on[len(early):] == [_ref_heur_move(b, 1) for b in late]
+    n.heuristic_late = False
+    assert [n.best_move(b, depth=1) for b in early + late] == off
+    n.close()

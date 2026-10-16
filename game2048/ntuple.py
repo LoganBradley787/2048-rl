@@ -254,6 +254,10 @@ def lib() -> ctypes.CDLL:
     L.nt_set_deep.argtypes = [vp, i32, ctypes.c_uint]
     L.nt_set_eg_bonus.argtypes = [vp, f64]
     L.nt_get_eg_bonus.argtypes, L.nt_get_eg_bonus.restype = [vp], f64
+    L.nt_set_heur.argtypes = [vp, i32, i32]
+    L.nt_get_heur.argtypes, L.nt_get_heur.restype = [vp, P(i32)], i32
+    L.nt_heur_score.argtypes, L.nt_heur_score.restype = [u64, u64], f64
+    L.nt_heur_orient.argtypes, L.nt_heur_orient.restype = [u64, u64, P(u64), P(u64)], i32
 
     L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
@@ -436,6 +440,20 @@ def snake_score(bits: int, decay: float = SNAKE_DECAY) -> float:
     decay**k, best of the 8 symmetries. A chain laid out as a snake scores highest.
     A search uses its network's decay (`NTupleNet.snake_decay`)."""
     return float(lib().nt_snake_score(*_lohi(bits), float(decay)))
+
+
+def heuristic_score(bits: int) -> float:
+    """macroxue's hand-written evaluation of the board as it stands (top left anchored; see
+    `NTupleNet.heuristic_late`)."""
+    return float(lib().nt_heur_score(*_lohi(bits)))
+
+
+def heuristic_orient(bits: int) -> tuple[int, int]:
+    """(symmetry, board turned by it): the orientation the heuristic search sees the board in. Cell i of the
+    turned board is cell sym_cell(i, symmetry) of the board."""
+    lo, hi = ctypes.c_uint64(0), ctypes.c_uint64(0)
+    s = lib().nt_heur_orient(*_lohi(bits), ctypes.byref(lo), ctypes.byref(hi))
+    return int(s), lo.value | (hi.value << 64)
 
 
 def stage_of(bits: int, boundaries: list[int]) -> int:
@@ -724,6 +742,33 @@ class NTupleNet:
     @endgame_bonus.setter
     def endgame_bonus(self, v: float) -> None:
         self._lib.nt_set_eg_bonus(self._h, float(v))
+
+    @property
+    def heuristic_late(self) -> bool:
+        """Search late boards (a 32768 and a 16384, or a 65536 or larger) with macroxue's hand-written heuristic
+        (`heuristic_score`) at the leaves instead of the tables: the real board (no downgrading), turned so its
+        largest tile is nearest the top left corner (`heuristic_orient`), the same depth and spawns, no points for
+        merges, a loss worth -2**22, no endgame bonus. Boards the endgame tables hold are still played by them.
+        Set it between searches."""
+        prune = ctypes.c_int(0)
+        return bool(self._lib.nt_get_heur(self._h, ctypes.byref(prune)))
+
+    @heuristic_late.setter
+    def heuristic_late(self, on: bool) -> None:
+        self._lib.nt_set_heur(self._h, int(bool(on)), int(self.heuristic_prune))
+
+    @property
+    def heuristic_prune(self) -> bool:
+        """With `heuristic_late`: macroxue's settings beside his own tables rather than without them. Spawn
+        nodes scoring below twice the largest tile's score (r << r for a tile 2**r) are not searched further,
+        unless the root itself scores below 0, and a loss is worth -max(2**17, twice that score)."""
+        prune = ctypes.c_int(0)
+        self._lib.nt_get_heur(self._h, ctypes.byref(prune))
+        return bool(prune.value)
+
+    @heuristic_prune.setter
+    def heuristic_prune(self, on: bool) -> None:
+        self._lib.nt_set_heur(self._h, int(self.heuristic_late), int(bool(on)))
 
     @property
     def deep(self) -> tuple[int, list[int]]:

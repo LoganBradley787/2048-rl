@@ -5,7 +5,8 @@ for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
 Last updated 2026-10-16, 11:40. No training has run since run 26; the work
-since then has been search and endgame tables, which are not training.
+since then has been search and endgame tables, which are not training; the
+tables' build time is listed under Endgame tables.
 
 ## Totals so far
 
@@ -358,6 +359,31 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   and a 65536 in 0.16% against 0.20%. Too small a gain to switch; v2 stays the
   player.
 
+## Endgame tables
+
+Late in a game the player looks moves up in tables instead of trusting the
+network alone. Each table holds every arrangement of the small tiles around a
+fixed set of large ones, with the exact chance of reaching a goal from it and
+the move that gets the best chance. Nothing in them is learned: they are solved
+backward from the goal, once, and read from disk during play. They are not
+training, but they are built ahead of time and the player needs them, so their
+cost is listed here. All were built on the ThinkPad, 8 to 12 threads.
+
+| Tables | Shape of the large tiles | Built | Positions | On disk | Build time |
+| --- | --- | --- | --- | --- | --- |
+| Snake ladder | five large tiles along the edge in a snake | 14 October | 18.2 billion | 36.3 GB | 32 min |
+| Block ladder | five large tiles packed in the corner | 15 October | 18.2 billion | 36.3 GB | 35 min |
+| Lift, one tile | the snake with one large tile moved off the path | 15 October | 4.6 billion | 9.2 GB | 41 min |
+| Lift, two tiles | the snake with two large tiles moved off the path | 15 October | 1.0 billion | 1.9 GB | 9 min |
+| Corner block, 2 by 3 | six large tiles in a 2 by 3 corner block, one table per smallest tile | 16 October | 2.9 billion | 5.8 GB | 19 min |
+| Block, 3 and 2 | five large tiles, three on the edge and two below | 16 October | 7.1 billion | 14.2 GB | 31 min |
+| **Kept** | | | **52 billion** | **104 GB** | **2.8 h** |
+
+Not kept: the snake ladder was deleted once to free disk and built again
+(36 min), and a set of tables that let one large tile move around was built
+(17 min, 8 GB) and dropped when it played no better. Small trial tables built
+in seconds or minutes while the builder was written are not listed.
+
 ## Not training
 
 - The `snake` agent has no trained weights: it is a search with one
@@ -366,3 +392,5 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
 - Evaluations (playing games with finished weights, with or without search)
   are not counted here, nor is collecting boards for a later stage.
 - The test suite trains small throwaway tables for seconds at a time.
+- The endgame tables above are solved, not learned, so their build time is not
+  in the training totals.

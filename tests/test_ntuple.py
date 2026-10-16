@@ -1975,6 +1975,207 @@ def test_endgame_bonus_steers_a_root_move_into_a_table(tmp_path):
     assert got["bonus"] == 0 and got["get"] == 1e9
 
 
+# --- block-tier tables ----------------------------------------------------------
+
+_BLK_CELLS = {"b6": [0, 1, 2, 4, 5, 6], "b5": [0, 1, 2, 4, 5]}
+_BLK_FREE = {"b6": [3, 7, 8, 9, 10, 11, 12, 13, 14, 15], "b5": [3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]}
+_BLK_CAP = {"b6": dict(zip(_BLK_FREE["b6"], [1, 2, 1, 2, 3, 3, 3, 3, 3, 3])),       # free cell: cap = a - this
+            "b5": dict(zip(_BLK_FREE["b5"], [2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]))}
+
+
+def _blk_anchor(sh, b):
+    """The block's anchor (0: not a regular block), by the rule in block_build.c."""
+    if not b[0] or not b[1] or b[0] == b[1] or b[1] == b[2] or b[0] == b[4] or b[1] == b[5]:
+        return 0
+    if sh == "b6":
+        return 0 if b[4] == b[5] or b[5] == b[6] or b[2] <= b[6] else min(b[4], b[5], b[6])
+    return 0 if b[5] == b[2] or b[4] <= b[5] else min(b[5], b[2])
+
+
+def _blk_goal(sh, b, a):
+    if sh == "b6":
+        x, y, z = a - 1, a - 2, a - 3
+        return ((b[8] == x and b[9] == y and ((b[10] == z and z in (b[14], b[11])) or
+                                               (b[13] == z and z in (b[12], b[14])))) or
+                (b[3] == x and b[7] == y and b[11] == z and z in (b[10], b[15])))
+    t = a - 1
+    return b[6] == t and ((b[7] == t - 1 and t - 1 in (b[3], b[11])) or (b[3] == t - 1 and b[7] == t - 2 == b[11]) or
+                          (b[10] == t - 1 and t - 1 in (b[9], b[14], b[11])))
+
+
+def _blk_move(b, d):
+    """Plain 2048 move on 16 exponents (0 up, 1 right, 2 down, 3 left)."""
+    out = list(b)
+    for i in range(4):
+        cells = [[4 * j + i, 4 * i + 3 - j, 4 * (3 - j) + i, 4 * i + j][d] for j in range(4)]
+        t, line = [b[c] for c in cells if b[c]], []
+        while t:
+            if len(t) > 1 and t[0] == t[1]:
+                line.append(t[0] + 1)
+                t = t[2:]
+            else:
+                line.append(t.pop(0))
+        for c, v in zip(cells, line + [0] * (4 - len(line))):
+            out[c] = v
+    return out
+
+
+def _ref_blk_after(m, sh, a, memo):
+    """Chance of an afterstate m (the block unmoved) on the real board: the rule written out plainly."""
+    if any(m[c] > a - k for c, k in _BLK_CAP[sh].items()):
+        return 0.0
+    if _blk_goal(sh, m, a):
+        return 1.0
+    empty, tot = [c for c in _BLK_FREE[sh] if m[c] == 0], 0.0
+    for c in empty:
+        for v, p in ((1, 0.9), (2, 0.1)):
+            if v <= a - _BLK_CAP[sh][c]:
+                tot += p * _ref_blk(m[:c] + [v] + m[c + 1:], sh, a, memo)
+    return tot / len(empty)
+
+
+def _ref_blk_moves(b, sh, a, memo):
+    """Each move's chance (None: not allowed, the board does not change or the block moves)."""
+    out = []
+    for d in range(4):
+        m = _blk_move(b, d)
+        ok = m != b and all(m[c] == b[c] for c in _BLK_CELLS[sh])
+        out.append(_ref_blk_after(m, sh, a, memo) if ok else None)
+    return out
+
+
+def _ref_blk(b, sh, a, memo):
+    key = (sh, a, tuple(b))
+    if key not in memo:
+        memo[key] = max([v for v in _ref_blk_moves(b, sh, a, memo) if v is not None], default=0.0)
+    return memo[key]
+
+
+def _blk_board(sh, anchor, a, rng, fill=0.6):
+    """A random board of table (sh, a): a regular block with this anchor (its other tiles any size, small ones
+    too), free tiles under the caps of a."""
+    while True:
+        b = [int(rng.integers(1, anchor + 6)) if c in _BLK_CELLS[sh] else 0 for c in range(16)]
+        if _blk_anchor(sh, b) == anchor:
+            break
+    for c, k in _BLK_CAP[sh].items():
+        b[c] = int(rng.integers(0, a - k + 1)) if rng.random() < fill else 0
+    return b
+
+
+_BLOCK_CHECK = r"""
+import json, sys
+import numpy as np
+from game2048 import ntuple as nt
+dirs, boards, turned = sys.argv[1].split(","), json.loads(sys.argv[2]), json.loads(sys.argv[3])
+loaded = [nt.load_block_tables(d) for d in dirs]
+bits = lambda g: nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4))
+values = [nt.block_value(bits(g), sh, a) for g, sh, a in boards]
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+assert not net.block_tier
+net.block_tier = True
+moves = [net.best_move(bits(g), depth=1) for g in turned]
+print(json.dumps({"loaded": loaded, "values": values, "moves": moves, "count": nt.block_tier_moves(),
+                  "tier": net.block_tier}))
+"""
+
+
+def test_block_tables_match_a_plain_python_solution(tmp_path):
+    """Block-tier tables (examples/build_endgame.py --block) give the plain Python values on random boards whose
+    block holds any regular tiles (anchors at and above the table's), the engine reads the same values, and the
+    tier's move, on the board turned any way, is a best move of the table."""
+    import ctypes
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for sh, anchors in (("b6", "4,5"), ("b5", "4")):
+        subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--block", sh, "--anchors",
+                        anchors, "--threads", "2", "--out", str(tmp_path / sh)], check=True, capture_output=True)
+    assert (tmp_path / "b6" / "block.txt").read_text().split() == ["b6", "4,5", "3,7,8,9,10,11,12,13,14,15",
+                                                                  "1,2,1,2,3,3,3,3,3,3"]
+    so = tmp_path / "bb.so"
+    subprocess.run([os.environ.get("CC", "cc"), "-O2", "-shared", "-fPIC", "-o", str(so),
+                    str(root / "game2048" / "native" / "block_build.c")], check=True)
+    L = ctypes.CDLL(str(so))
+    L.tbb_value.restype = ctypes.c_float
+    tables = {("b6", 4): 0, ("b6", 5): 0, ("b5", 4): 1}
+    for (sh, a), i in tables.items():
+        assert L.tbb_load(str(tmp_path / sh).encode(), i, a) == 0
+    rng = np.random.default_rng(41)
+    memo, boards, turned, inside = {}, [], [], 0
+    for (sh, a), i in tables.items():
+        for n in range(16 if a == 4 else 6):
+            b = _blk_board(sh, a + int(rng.integers(0, 3)), a, rng, fill=0.6 if a == 4 else 0.8)
+            got = L.tbb_value((ctypes.c_uint8 * 16)(*b), i, a)
+            want = _ref_blk(b, sh, a, memo)
+            assert got == pytest.approx(want, abs=1e-4)
+            inside += 0.0 < want < 1.0
+            if a == 4:                                  # another block, the same free tiles: the same chance
+                other = _blk_board(sh, a + int(rng.integers(0, 3)), a, rng)
+                other = [other[c] if c in _BLK_CELLS[sh] else b[c] for c in range(16)]
+                assert _ref_blk(other, sh, a, memo) == pytest.approx(want, abs=1e-9)
+            boards.append((b, sh, a, float(got)))
+            # the tier's move (b6 a 5 and b5 a 4 are each the only reading of their boards with these tables)
+            if (sh, a) != ("b6", 4) and not _blk_goal(sh, b, a) and want > 0:
+                s = int(rng.integers(0, 8))
+                real = [0] * 16
+                for j in range(16):
+                    real[nt.sym_cell(j, s)] = b[j]
+                turned.append((real, b, sh, a, s, want))
+    assert inside >= 10 and len(turned) >= 8
+    r = subprocess.run([sys.executable, "-c", _BLOCK_CHECK, f"{tmp_path / 'b6'},{tmp_path / 'b5'}",
+                        json.dumps([(b, sh, a) for b, sh, a, _ in boards]), json.dumps([t[0] for t in turned])],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["loaded"] == [[4, 5], [4]] and got["tier"]
+    assert got["values"] == pytest.approx([v for *_, v in boards], abs=1e-7)    # the same u16 entries
+    assert got["count"] == len(turned)
+    for (real, b, sh, a, s, want), d in zip(turned, got["moves"]):
+        after = nt.from_bits(nt.move(nt.to_bits(np.array(real, dtype=np.uint8).reshape(4, 4)), d)[0]).ravel()
+        m = [int(after[nt.sym_cell(j, s)]) for j in range(16)]             # back in the table's frame
+        assert all(m[c] == b[c] for c in _BLK_CELLS[sh])
+        assert _ref_blk_after(m, sh, a, memo) == pytest.approx(want, abs=1e-3)
+
+
+_BLOCK_OFF_CHECK = r"""
+import json, sys
+from game2048 import ntuple as nt
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+net.train(200, threads=1, seed=1, alpha_plain=0.1)
+play = lambda: net.play(6, depth=1, threads=2, seed=5)["scores"].tolist()
+plain = play()
+net.block_tier = True                             # on, no block tables loaded
+empty = play()
+nt.load_block_tables(sys.argv[1])
+net.block_tier = False                            # tables loaded, tier off
+off = play()
+net.block_tier = True
+on = play()
+print(json.dumps({"plain": plain, "empty": empty, "off": off, "on": on, "count": nt.block_tier_moves()}))
+"""
+
+
+def test_block_tier_off_or_without_tables_leaves_play_unchanged(tmp_path):
+    """Games are the same with the tier off (tables loaded) or on without tables; on with tables, the tier plays."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--block", "b6", "--anchors",
+                    "4,5,6", "--threads", "2", "--out", str(tmp_path / "b6")], check=True, capture_output=True)
+    r = subprocess.run([sys.executable, "-c", _BLOCK_OFF_CHECK, str(tmp_path / "b6")], capture_output=True,
+                       text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["empty"] == got["plain"] and got["off"] == got["plain"]
+    assert got["count"] > 0                       # small blocks turn up early in every game
+
+
 # --- macroxue's heuristic for the late game ------------------------------------
 
 def _ref_heur(bits):

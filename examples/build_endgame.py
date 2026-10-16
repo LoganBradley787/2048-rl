@@ -6,6 +6,13 @@ Compiles game2048/native/endgame_build.c (OpenMP if the compiler has it) and run
 Defaults: caps on the tables with 5 and 6 locked tiles only (drops 0,1,2,3,3,4,4,5,5,5,5),
 every larger table exact. Sizes at 2 bytes a position: 6 locked and up 3.4 GB; 5 locked and
 up another 33 GB. The output is written in place on disk; memory use stays small.
+
+Block-tier tables (game2048/native/block_build.c; play with nt.load_block_tables and net.block_tier):
+
+    uv run python examples/build_endgame.py --block b6 --anchors 9,10 --out tables/b6 --threads 4
+    uv run python examples/build_endgame.py --block b6 --sizes      # the size of every table, no build
+
+writes <out>/<shape>_a<a>.u16 per anchor and <out>/block.txt; the sizes are printed before building.
 """
 import argparse
 import os
@@ -15,12 +22,13 @@ import tempfile
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parent.parent / "game2048" / "native" / "endgame_build.c"
+BLOCK_SRC = SRC.with_name("block_build.c")
 
 
-def compile_builder(out: Path) -> None:
+def compile_builder(out: Path, src: Path = SRC) -> None:
     cc = os.environ.get("CC", "cc")
     # -ffp-contract=off: the same arithmetic on every CPU, so a table built anywhere is the same file
-    base = [cc, "-O3", "-ffp-contract=off", "-DEGB_MAIN", "-o", str(out), str(SRC), "-lm"]
+    base = [cc, "-O3", "-ffp-contract=off", "-DEGB_MAIN", "-o", str(out), str(src), "-lm"]
     try:
         subprocess.run(base[:1] + ["-fopenmp"] + base[1:], check=True, capture_output=True)
     except subprocess.CalledProcessError:
@@ -40,9 +48,28 @@ def main() -> None:
                         "the 5th cell, tiles in play up to it), for the phases where a gap in the ladder is being filled")
     p.add_argument("--wobble", action="store_true",
                    help="the locked tiles after the last full row may slide along their row (snake only)")
+    p.add_argument("--block", choices=["b6", "b5"],
+                   help="block-tier tables of this shape instead (b6: 2x3 block in the corner; b5: 3 + 2 cells)")
+    p.add_argument("--anchors", default="", help="with --block: the anchors (tile ranks) to build, e.g. 9,10")
+    p.add_argument("--sizes", action="store_true", help="with --block: print every table's size and stop")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 1)
-    p.add_argument("--out", required=True)
+    p.add_argument("--out")
     args = p.parse_args()
+    if args.block:
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "block_build"
+            compile_builder(exe, BLOCK_SRC)
+            if args.sizes:
+                subprocess.run([str(exe), "sizes"], check=True)
+                return
+            if not args.out or not args.anchors:
+                p.error("--block needs --anchors and --out")
+            Path(args.out).mkdir(parents=True, exist_ok=True)
+            subprocess.run([str(exe), args.block, args.anchors, args.out, str(args.threads)], check=True)
+        print(f"block tables in {args.out}: " + (Path(args.out) / "block.txt").read_text().strip())
+        return
+    if not args.out:
+        p.error("--out is required")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:

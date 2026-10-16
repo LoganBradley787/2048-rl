@@ -258,6 +258,12 @@ def lib() -> ctypes.CDLL:
     L.nt_get_heur.argtypes, L.nt_get_heur.restype = [vp, P(i32)], i32
     L.nt_heur_score.argtypes, L.nt_heur_score.restype = [u64, u64], f64
     L.nt_heur_orient.argtypes, L.nt_heur_orient.restype = [u64, u64, P(u64), P(u64)], i32
+    L.nt_block_load.argtypes, L.nt_block_load.restype = [ctypes.c_char_p, i32, i32, P(i32), P(i32), i32], i32
+    L.nt_block_value.argtypes, L.nt_block_value.restype = [u64, u64, i32, i32], f32
+    L.nt_block_loaded.argtypes, L.nt_block_loaded.restype = [i32], i32
+    L.nt_block_moves.argtypes, L.nt_block_moves.restype = [i32], ctypes.c_long
+    L.nt_set_block_tier.argtypes = [vp, i32]
+    L.nt_get_block_tier.argtypes, L.nt_get_block_tier.restype = [vp], i32
 
     L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
@@ -357,6 +363,38 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
                                     int(wobble)) < 0:
         raise ValueError(f"no tables for {kmin} locked and up in {d} with caps {drops} (or that formation is loaded)")
     return int(kmin)
+
+
+BLOCK_SHAPES = {"b6": 0, "b5": 1}   # block-tier shapes (game2048/native/block_build.c)
+
+
+def load_block_tables(directory) -> list[int]:
+    """Use the block-tier tables in <directory> (examples/build_endgame.py --block): block.txt reads
+    "<b6|b5> <anchors> <free cells> <drops>" and <shape>_a<a>.u16 holds each table. They play, with
+    `NTupleNet.block_tier` on, the boards no ladder table holds. Returns the anchors loaded. Call before any play."""
+    d = Path(directory)
+    shape, anchors, cells, drops = (d / "block.txt").read_text().split()[:4]
+    sh = BLOCK_SHAPES[shape]
+    cells = [int(x) for x in cells.split(",")]
+    drops = [int(x) for x in drops.split(",")]
+    out = []
+    for a in (int(x) for x in anchors.split(",")):
+        if lib().nt_block_load(str(d).encode(), sh, a, (ctypes.c_int32 * len(cells))(*cells),
+                               (ctypes.c_int32 * len(drops))(*drops), len(cells)) < 0:
+            raise ValueError(f"block table {shape} a {a} in {d}: missing, the wrong size or already loaded")
+        out.append(a)
+    return out
+
+
+def block_value(bits: int, shape: str, a: int) -> float:
+    """Block table (shape, a)'s chance for a board as it stands (the block in the top left), or -1 if the
+    table is not loaded or the board is not one of its positions."""
+    return float(lib().nt_block_value(*_lohi(bits), BLOCK_SHAPES[shape], int(a)))
+
+
+def block_tier_moves(reset: bool = False) -> int:
+    """Moves the block tier has chosen in this process so far (all networks and threads)."""
+    return int(lib().nt_block_moves(int(bool(reset))))
 
 
 def downgrade(bits: int) -> int:
@@ -742,6 +780,18 @@ class NTupleNet:
     @endgame_bonus.setter
     def endgame_bonus(self, v: float) -> None:
         self._lib.nt_set_eg_bonus(self._h, float(v))
+
+    @property
+    def block_tier(self) -> bool:
+        """Block-tier tables (`load_block_tables`) play the boards no ladder table holds: a merge-free block of
+        any tiles in a corner and smaller tiles elsewhere, toward a set-up of the next tile beside the block
+        (largest anchor first, every orientation); then the network search. Off by default. Set it between
+        searches."""
+        return bool(self._lib.nt_get_block_tier(self._h))
+
+    @block_tier.setter
+    def block_tier(self, on: bool) -> None:
+        self._lib.nt_set_block_tier(self._h, int(bool(on)))
 
     @property
     def heuristic_late(self) -> bool:

@@ -233,6 +233,7 @@ typedef struct net {
     unsigned deep_need;      /* bit e: a tile 2^e (before the depth caps; tables still take their boards first) */
     int heur;                /* late boards (see HEUR_FROM) are searched with macroxue's heuristic, not the tables */
     int heur_prune;          /* ... with his pruning and loss value (see heur_best) */
+    int block_tier;          /* block-tier tables (nt_block_load) play boards no ladder table holds (0 = off) */
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -1491,10 +1492,10 @@ static int eg_position(board_t board, int kmin, unsigned fmask) {
  * The corner tile only has to be the largest: a 65536 there with 16384, 8192, ... after it plays exactly like a
  * 32768 there (locked tiles never move or merge in the table), so the same tables serve the game after the first
  * 65536, where winning means making the 32768 beside it. */
-static int eg_choose(board_t board, int kmin) {
+static int eg_choose(board_t board, int kmin, int *held_out) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
-    int best_dir = -1; float best_v = 0.0f;
+    int best_dir = -1, held = 0; float best_v = 0.0f;
     /* every formation, orientation and table the board is a position of: the move with the best chance. A smaller
      * table allows moves a larger one forbids (it may lock the next tile later), but its caps may forbid moves the
      * larger one allows, so neither dominates: all are tried.
@@ -1503,7 +1504,7 @@ static int eg_choose(board_t board, int kmin) {
      * a small tile after it, the lift-1 tables read the ladder as boulders and would play for the next tile alone. */
     int gmax = 0;
     for (int f = 0; f < eg_nfam; f++) if (eg_lift[f] > gmax) gmax = eg_lift[f];
-    for (int g = 0, held = 0; g <= gmax && !held; g++)
+    for (int g = 0; g <= gmax && !held; g++)
     for (int f = 0; f < eg_nfam; f++)
     for (int s = 0; s < 8; s++) {
         if (eg_lift[f] != g) break;
@@ -1564,7 +1565,136 @@ static int eg_choose(board_t board, int kmin) {
         }
         }
     }
+    if (held_out) *held_out = held;
     return best_dir;
+}
+
+/* ------------------------------------------------------------ block tier --- */
+/* Block-tier tables built in advance (block_build.c, examples/build_endgame.py --block; the rules are written out
+ * at the top of block_build.c). Shape b6: the 2x3 block in the corner (r0c0-r0c2, r1c0-r1c2) holds any merge-free
+ * tiles; anchor a = the smallest of its second row; the free cells hold tiles under caps relative to a; the
+ * table's goal is a set-up of a tile of rank a beside the block. Shape b5: three on row 0, two on row 1 at the
+ * left; anchor a = min(r1c1, r0c2); goal: a tile of rank a-1 at r1c2 with material for its twin. One table per
+ * shape and a, indexed by the free cells only (the block's values never matter: nothing merges with it); a table
+ * serves every block whose anchor is a or more (the largest loaded table not above the anchor is used).
+ * The tier (best_move) plays only boards no ladder table holds: of the regular (orientation, shape) readings
+ * whose free tiles fit and which are not already a goal, the one with the largest table anchor (then b6 before
+ * b5, then the first orientation) plays its best move, the move made on the real board; if no move has a chance
+ * above zero the next reading is tried, then the network search. Chances are never compared across readings. */
+#define BLK_AMIN 4
+#define BLK_AMAX 15
+static const int blk_nblock[2] = {6, 5}, blk_nfree[2] = {10, 11};
+static const uint8_t blk_block[2][6] = {{0, 1, 2, 4, 5, 6}, {0, 1, 2, 4, 5}};
+static const uint8_t blk_free[2][11] = {{3, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
+static const uint8_t blk_drop[2][11] = {{1, 2, 1, 2, 3, 3, 3, 3, 3, 3}, {2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3}};
+static const char *blk_name[2] = {"b6", "b5"};
+static uint16_t *blk_map[2][BLK_AMAX + 1];
+static uint64_t *blk_offs[2][BLK_AMAX + 1], *blk_rank[2][BLK_AMAX + 1][11], blk_bytes[2][BLK_AMAX + 1];
+static long blk_count;                                    /* moves the tier chose (all threads) */
+
+/* the anchor of the block on board b (in the shape's frame), or 0 if the block is not regular */
+static int blk_anchor(int sh, const uint8_t *b) {
+    if (!b[0] || !b[1] || b[0] == b[1] || b[1] == b[2] || b[0] == b[4] || b[1] == b[5]) return 0;
+    if (sh == 0) {
+        if (b[4] == b[5] || b[5] == b[6] || b[2] <= b[6]) return 0;
+        int a = b[4] < b[5] ? b[4] : b[5];
+        return a < b[6] ? a : b[6];
+    }
+    if (b[5] == b[2] || b[4] <= b[5]) return 0;
+    return b[5] < b[2] ? b[5] : b[2];
+}
+
+static int blk_goal(int sh, const uint8_t *b, int a) {
+    if (sh == 0) {
+        int x = a - 1, y = a - 2, z = a - 3;
+        return (b[8] == x && b[9] == y && ((b[10] == z && (b[14] == z || b[11] == z)) ||
+                                           (b[13] == z && (b[12] == z || b[14] == z)))) ||
+               (b[3] == x && b[7] == y && b[11] == z && (b[10] == z || b[15] == z));
+    }
+    int t = a - 1;
+    return b[6] == t && ((b[7] == t - 1 && (b[3] == t - 1 || b[11] == t - 1)) ||
+                         (b[3] == t - 1 && b[7] == t - 2 && b[11] == t - 2) ||
+                         (b[10] == t - 1 && (b[9] == t - 1 || b[14] == t - 1 || b[11] == t - 1)));
+}
+
+static inline int blk_fits(int sh, const uint8_t *b, int a) {
+    for (int j = 0; j < blk_nfree[sh]; j++) if (b[blk_free[sh][j]] > a - blk_drop[sh][j]) return 0;
+    return 1;
+}
+
+static inline float blk_get(int sh, int a, const uint8_t *b) {
+    const uint8_t *F = blk_free[sh];
+    int n = blk_nfree[sh], r = 0;
+    for (int j = 0; j < n; j++) r += eg_units(b[F[j]]);
+    uint64_t q = blk_offs[sh][a][r];
+    for (int j = 0; j < n; j++) {
+        int v = b[F[j]];
+        q += blk_rank[sh][a][j][(size_t)r * (a - blk_drop[sh][j] + 1) + v];
+        r -= eg_units(v);
+    }
+    return (float)blk_map[sh][a][q] * (1.0f / 65535.0f);
+}
+
+/* the chance of an afterstate t (shape's frame, free tiles within the caps, not a goal): over the new tile */
+static float blk_after(int sh, int a, uint8_t *t) {
+    double sum = 0.0;
+    int empty = 0;
+    for (int j = 0; j < blk_nfree[sh]; j++) {
+        int c = blk_free[sh][j], cap = a - blk_drop[sh][j];
+        if (t[c]) continue;
+        empty++;
+        t[c] = 1; if (cap >= 1) sum += 0.9 * blk_get(sh, a, t);
+        t[c] = 2; if (cap >= 2) sum += 0.1 * blk_get(sh, a, t);   /* a new tile above its cap: lost */
+        t[c] = 0;
+    }
+    return empty ? (float)(sum / empty) : 0.0f;
+}
+
+static int blk_table(int sh, int a) {                      /* the largest loaded table not above anchor a, or 0 */
+    for (a = a > BLK_AMAX ? BLK_AMAX : a; a >= BLK_AMIN; a--) if (blk_map[sh][a]) return a;
+    return 0;
+}
+
+static int blk_choose(board_t board) {
+    uint8_t c[16];
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
+    int key[16], nc = 0;                                    /* readings, best first: (BLK_AMAX - a, shape, s) */
+    for (int s = 0; s < 8; s++) {
+        uint8_t o[16];
+        for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
+        for (int sh = 0; sh < 2; sh++) {
+            int a = blk_table(sh, blk_anchor(sh, o));
+            if (!a || !blk_fits(sh, o, a) || blk_goal(sh, o, a)) continue;
+            int k = ((BLK_AMAX - a) << 8) | (sh << 4) | s, i = nc++;
+            while (i > 0 && key[i - 1] > k) { key[i] = key[i - 1]; i--; }
+            key[i] = k;
+        }
+    }
+    for (int q = 0; q < nc; q++) {
+        int a = BLK_AMAX - (key[q] >> 8), sh = (key[q] >> 4) & 15, s = key[q] & 15;
+        int best_dir = -1;
+        float best_v = 0.0f;
+        for (int d = 0; d < 4; d++) {                            /* each move, made on the real board */
+            int r;
+            board_t after = do_move(board, d, &r);
+            if (after == board) continue;
+            uint8_t t[16];
+            for (int i = 0; i < 16; i++) t[i] = (uint8_t)cell(after, sym_cell(i, s));
+            int ok = 1;
+            for (int i = 0; i < blk_nblock[sh] && ok; i++) {
+                int b = blk_block[sh][i];
+                if (t[b] != c[sym_cell(b, s)]) ok = 0;          /* the block stays where it is */
+            }
+            if (!ok || !blk_fits(sh, t, a)) continue;
+            float v = blk_goal(sh, t, a) ? 1.0f : blk_after(sh, a, t);
+            if (v > best_v) { best_v = v; best_dir = d; }
+        }
+        if (best_dir >= 0) {
+            __atomic_fetch_add(&blk_count, 1, __ATOMIC_RELAXED);
+            return best_dir;
+        }
+    }
+    return -1;
 }
 
 /* From each start board, play until the board is a table position with k or more locked tiles (reached = 1) or
@@ -1877,6 +2007,89 @@ float nt_endgame_value_family(uint64_t lo, uint64_t hi, int k, int f) {
 }
 float nt_endgame_value(uint64_t lo, uint64_t hi, int k) { return nt_endgame_value_family(lo, hi, k, 0); }
 
+/* Use the block-tier table of shape sh (0 = b6, 1 = b5) and anchor a: <dir>/<b6|b5>_a<a>.u16, built by
+ * block_build.c with the free cells and drops given (they must be the engine's: a check on block.txt). Maps the
+ * file read-only. Returns 0, or -1 (nothing changed) if the file is missing or the wrong size, the cells differ or
+ * that table is already loaded. Call before any play. */
+int nt_block_load(const char *dir, int sh, int a, const int *freec, const int *drops, int nfree) {
+    if (sh < 0 || sh > 1 || a < BLK_AMIN || a > BLK_AMAX || blk_map[sh][a] || nfree != blk_nfree[sh]) return -1;
+    for (int j = 0; j < nfree; j++) if (freec[j] != blk_free[sh][j] || drops[j] != blk_drop[sh][j]) return -1;
+    int n = nfree, caps[11], S = 0;
+    for (int j = 0; j < n; j++) { caps[j] = a - blk_drop[sh][j]; S += eg_units(caps[j]); }
+    uint64_t *cnt = (uint64_t *)calloc((size_t)(n + 1) * (S + 1), sizeof(uint64_t));   /* cells j.. with r units */
+    uint64_t *offs = (uint64_t *)malloc((size_t)(S + 2) * sizeof(uint64_t)), *rank[11] = {0};
+    int ok = cnt && offs;
+    if (ok) {
+        cnt[(size_t)n * (S + 1)] = 1;
+        for (int j = n - 1; j >= 0; j--)
+            for (int r = 0; r <= S; r++) {
+                uint64_t t = 0;
+                for (int e = 0; e <= caps[j] && eg_units(e) <= r; e++) t += cnt[(size_t)(j + 1) * (S + 1) + r - eg_units(e)];
+                cnt[(size_t)j * (S + 1) + r] = t;
+            }
+        offs[0] = 0;
+        for (int r = 0; r <= S; r++) offs[r + 1] = offs[r] + cnt[r];
+        for (int j = 0; j < n && ok; j++) {
+            int C = caps[j] + 1;
+            if (!(rank[j] = (uint64_t *)malloc((size_t)(S + 1) * C * sizeof(uint64_t)))) { ok = 0; break; }
+            for (int r = 0; r <= S; r++) {
+                uint64_t acc = 0;
+                for (int v = 0; v < C; v++) {
+                    rank[j][(size_t)r * C + v] = acc;
+                    if (eg_units(v) <= r) acc += cnt[(size_t)(j + 1) * (S + 1) + r - eg_units(v)];
+                }
+            }
+        }
+    }
+    void *m = MAP_FAILED;
+    uint64_t bytes = ok ? offs[S + 1] * 2 : 0;
+    if (ok) {
+        char file[4096];
+        snprintf(file, sizeof file, "%s/%s_a%d.u16", dir, blk_name[sh], a);
+        FILE *fp = fopen(file, "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            if ((uint64_t)ftell(fp) == bytes) m = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fileno(fp), 0);
+            fclose(fp);
+        }
+    }
+    free(cnt);
+    if (m == MAP_FAILED) {
+        free(offs);
+        for (int j = 0; j < n; j++) free(rank[j]);
+        return -1;
+    }
+    madvise(m, bytes, MADV_RANDOM);
+    blk_offs[sh][a] = offs;
+    for (int j = 0; j < n; j++) blk_rank[sh][a][j] = rank[j];
+    blk_bytes[sh][a] = bytes;
+    blk_map[sh][a] = (uint16_t *)m;                            /* last: a table is used only once all is set */
+    return 0;
+}
+/* Table (sh, a)'s chance for a board as it stands (the block in the shape's place), or -1 if the table is not
+ * loaded or the board is not one of its positions (block not regular, anchor below a, a free tile above its cap).
+ * For tests. */
+float nt_block_value(uint64_t lo, uint64_t hi, int sh, int a) {
+    if (sh < 0 || sh > 1 || a < BLK_AMIN || a > BLK_AMAX || !blk_map[sh][a]) return -1.0f;
+    board_t b = mk(lo, hi);
+    uint8_t c[16];
+    for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
+    if (blk_anchor(sh, c) < a || !blk_fits(sh, c, a)) return -1.0f;
+    return blk_get(sh, a, c);
+}
+/* bit a of the result: table (sh, a) is loaded */
+int nt_block_loaded(int sh) {
+    int m = 0;
+    for (int a = BLK_AMIN; sh >= 0 && sh <= 1 && a <= BLK_AMAX; a++) if (blk_map[sh][a]) m |= 1 << a;
+    return m;
+}
+/* Moves the block tier has chosen so far (every network and thread); reset = 1 sets the count back to 0. */
+long nt_block_moves(int reset) {
+    return reset ? __atomic_exchange_n(&blk_count, 0, __ATOMIC_RELAXED) : __atomic_load_n(&blk_count, __ATOMIC_RELAXED);
+}
+void nt_set_block_tier(void *p, int on) { ((net_t *)p)->block_tier = on != 0; }
+int nt_get_block_tier(void *p) { return ((net_t *)p)->block_tier; }
+
 /* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
  * tile and the stage rule allows. */
 /* The best table chance of an afterstate on the real board (before the new tile), over the formations without lift
@@ -2082,8 +2295,13 @@ void nt_set_heur(void *p, int on, int prune) {
 int nt_get_heur(void *p, int *prune) { *prune = ((net_t *)p)->heur_prune; return ((net_t *)p)->heur; }
 
 static int best_move(search_ctx_t *c, board_t b, int depth) {
+    int held = 0;
     if (c->net->endgame) {                                     /* an exact table, when the board is one of its positions */
-        int d = eg_choose(b, c->net->endgame);
+        int d = eg_choose(b, c->net->endgame, &held);
+        if (d >= 0) return d;
+    }
+    if (c->net->block_tier && !held) {                        /* a block-tier table, when no ladder table holds it */
+        int d = blk_choose(b);
         if (d >= 0) return d;
     }
     board_t real = b;

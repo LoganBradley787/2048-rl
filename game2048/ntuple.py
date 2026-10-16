@@ -268,6 +268,8 @@ def lib() -> ctypes.CDLL:
     L.nt_block_moves.argtypes, L.nt_block_moves.restype = [i32], ctypes.c_long
     L.nt_set_block_tier.argtypes = [vp, i32]
     L.nt_get_block_tier.argtypes, L.nt_get_block_tier.restype = [vp], i32
+    L.nt_set_block_from.argtypes = [vp, ctypes.c_int64]
+    L.nt_get_block_from.argtypes, L.nt_get_block_from.restype = [vp], ctypes.c_int64
 
     L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
@@ -798,6 +800,17 @@ class NTupleNet:
     @block_tier.setter
     def block_tier(self, on: bool) -> None:
         self._lib.nt_set_block_tier(self._h, int(bool(on)))
+
+    @property
+    def block_tier_from(self) -> int:
+        """With `block_tier`: only boards whose tile set reaches this (as in `stage_of`: 49152 = a 32768 and a
+        16384, or larger) go to the block tables; earlier ones are searched. 0 = every board (the default).
+        Set it between searches."""
+        return int(self._lib.nt_get_block_from(self._h))
+
+    @block_tier_from.setter
+    def block_tier_from(self, scale: int) -> None:
+        self._lib.nt_set_block_from(self._h, int(scale))
 
     def _heur_mode(self) -> tuple[int, int]:
         prune = ctypes.c_int(0)

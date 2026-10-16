@@ -56,6 +56,8 @@ def test_evaluate_games_heuristic_and_block_flags(tmp_path):
     (in a process of their own: block tables load once per process)."""
     import os
     import subprocess
+
+    import evaluate_games
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
     script = [sys.executable, str(root / "examples" / "evaluate_games.py")]
@@ -82,6 +84,14 @@ def test_evaluate_games_heuristic_and_block_flags(tmp_path):
     r = subprocess.run([*common[:-1], str(tmp_path / "f.csv"), "--heuristic-prune"], capture_output=True, text=True,
                        env=env)
     assert r.returncode != 0 and "need --heuristic" in r.stderr
+    scores = {}                                   # tables from 32768 + 16384 on: this small network's games unchanged
+    for name, extra in (("plain", []), ("late", ["--block-dir", str(tmp_path / "b6"), "--block-from", "49152"])):
+        r = subprocess.run([*common[:-1], str(tmp_path / f"{name}.csv"), *extra], capture_output=True, text=True,
+                           env=env)
+        assert r.returncode == 0, r.stderr
+        scores[name] = [g["score"] for _, g in sorted(evaluate_games.read_games(tmp_path / f"{name}.csv").items())]
+    assert "block tier: 0 moves" in r.stdout and scores["late"] == scores["plain"]
+    assert json.loads((tmp_path / "late.json").read_text())["block_from"] == 49152
 
 
 def test_average_weights_is_the_mean_of_the_files(tmp_path):

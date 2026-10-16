@@ -238,6 +238,7 @@ typedef struct net {
     int heur_prune;          /* ... with his pruning and loss value (see heur_best) */
     int heur_depth;          /* ... at this depth instead of the game's (0 = the game's; depth caps still apply) */
     int block_tier;          /* block-tier tables (nt_block_load) play boards no ladder table holds (0 = off) */
+    int64_t block_from;      /* ... whose tile set (board_scale) is at least this (0 = every board) */
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -2099,6 +2100,8 @@ long nt_block_moves(int reset) {
 }
 void nt_set_block_tier(void *p, int on) { ((net_t *)p)->block_tier = on != 0; }
 int nt_get_block_tier(void *p) { return ((net_t *)p)->block_tier; }
+void nt_set_block_from(void *p, int64_t scale) { ((net_t *)p)->block_from = scale < 0 ? 0 : scale; }
+int64_t nt_get_block_from(void *p) { return ((net_t *)p)->block_from; }
 
 /* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
  * tile and the stage rule allows. */
@@ -2322,7 +2325,8 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
         int d = eg_choose(b, c->net->endgame, &held);
         if (d >= 0) return d;
     }
-    if (c->net->block_tier && !held) {                        /* a block-tier table, when no ladder table holds it */
+    if (c->net->block_tier && !held &&                        /* a block-tier table, when no ladder table holds it */
+        (!c->net->block_from || board_scale(b) >= c->net->block_from)) {
         int d = blk_choose(b);
         if (d >= 0) return d;
     }

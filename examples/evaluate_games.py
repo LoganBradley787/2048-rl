@@ -30,7 +30,7 @@ from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
 SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5",
-            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "block_tables"]
+            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "block_tables", "block_from"]
 
 
 def weights_md5(path: Path) -> str:
@@ -112,6 +112,9 @@ def main(argv=None) -> None:
     p.add_argument("--block-dir", action="append", default=None,
                    help="block-tier tables (examples/build_endgame.py --block) play the boards no ladder table holds; "
                         "repeat it for several shapes")
+    p.add_argument("--block-from", type=int, default=0,
+                   help="with --block-dir: only boards whose tile set reaches this go to the block tables, e.g. 49152 "
+                        "(a 32768 and a 16384, or larger: the boards --heuristic plays); 0 = every board")
     p.add_argument("--trace-dir", default=None,
                    help="keep every game's history here, one game_<n>.npz each: `boards` (the board before each "
                         "move, then the final one, as exponents) and `dirs` (0 up, 1 right, 2 down, 3 left, -1 at the end)")
@@ -127,6 +130,8 @@ def main(argv=None) -> None:
     caps = [int(x) for x in args.depth_caps.split(",") if x.strip()]
     if args.heuristic == "off" and (args.heuristic_prune or args.heuristic_depth):
         p.error("--heuristic-prune and --heuristic-depth need --heuristic")
+    if args.block_from and not args.block_dir:
+        p.error("--block-from needs --block-dir")
     settings = {"weights_md5": weights_md5(path), "depth": args.depth, "seed": args.seed, "cutoff": args.cutoff,
                 "downgrade": args.downgrade, "depth_caps": caps, "endgame": args.endgame or None,
                 "endgame_bits": args.endgame_bits if args.endgame else None,
@@ -140,7 +145,8 @@ def main(argv=None) -> None:
                 "heuristic_prune": args.heuristic_prune or None, "heuristic_depth": args.heuristic_depth or None,
                 "block_dir": args.block_dir,
                 "block_tables": args.block_dir and " | ".join((Path(d) / "block.txt").read_text().strip()
-                                                              for d in args.block_dir)}
+                                                              for d in args.block_dir),
+                "block_from": args.block_from or None}
     meta = out.with_suffix(".json")
     if meta.exists():
         old = json.loads(meta.read_text())
@@ -174,7 +180,7 @@ def main(argv=None) -> None:
         net.endgame_bonus = args.endgame_bonus
     for d in args.block_dir or []:
         print(f"block-tier tables, anchors {nt.load_block_tables(d)} ({d})", flush=True)
-    net.block_tier = bool(args.block_dir)
+    net.block_tier, net.block_tier_from = bool(args.block_dir), args.block_from
     if args.heuristic != "off":
         net.heuristic_orientation = args.heuristic
         net.heuristic_late, net.heuristic_prune, net.heuristic_depth = True, args.heuristic_prune, args.heuristic_depth

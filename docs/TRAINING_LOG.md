@@ -4,7 +4,7 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-16, 11:40. No training has run since run 26; the work
+Last updated 2026-10-16, 16:45. No training has run since run 26; the work
 since then has been search and endgame tables, which are not training; the
 tables' build time is listed under Endgame tables.
 
@@ -377,7 +377,8 @@ cost is listed here. All were built on the ThinkPad, 8 to 12 threads.
 | Lift, two tiles | the snake with two large tiles moved off the path | 15 October | 1.0 billion | 1.9 GB | 9 min |
 | Corner block, 2 by 3 | six large tiles in a 2 by 3 corner block, one table per smallest tile | 16 October | 2.9 billion | 5.8 GB | 19 min |
 | Block, 3 and 2 | five large tiles, three on the edge and two below | 16 October | 7.1 billion | 14.2 GB | 31 min |
-| **All six** | | | **52 billion** | **104 GB** | **2.8 h** |
+| Block, 3 and 2, one size larger | the same, the small tiles one size larger; each position's best move and a rough chance in one byte | 16 October | 21.8 billion | 21.8 GB | 47 min |
+| **All seven** | | | **74 billion** | **126 GB** | **3.6 h** |
 
 On 16 October the four ladder sets (78 GB) were deleted to free disk: the
 player as it stands, with the heuristic search and the two block sets, scores

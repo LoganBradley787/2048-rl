@@ -1,3 +1,4 @@
+import csv
 import json
 import sys
 from pathlib import Path
@@ -122,3 +123,104 @@ def test_average_weights_is_the_mean_of_the_files(tmp_path):
     n.close()
     with pytest.raises(SystemExit):
         average_weights.main(["--weights", str(tmp_path / "tc.bin"), files[0], "--out", str(tmp_path / "x.bin")])
+
+
+def _small_weights(path):
+    """A small network's weights at `path`; returns the scores of games 0-5 of seed 11 at depth 0."""
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)
+    n.train(games=300, threads=2, seed=1, alpha_plain=0.1)
+    n.save(path, weights_only=True)
+    scores = n.play(games=6, depth=0, threads=2, seed=11)["scores"]
+    n.close()
+    return [int(x) for x in scores]
+
+
+def _games_in(path):
+    with open(path, newline="") as f:
+        return sorted(int(r["game"]) for r in csv.DictReader(f))
+
+
+def test_trace_min_score_keeps_the_high_games_and_verify_game_replays_them(tmp_path, capsys):
+    import evaluate_games
+    import verify_game
+
+    scores = _small_weights(tmp_path / "w.bin")
+    S = sorted(scores)[3]
+    high = {g for g, s in enumerate(scores) if s >= S}
+    assert 0 < len(high) < 6
+    out, td = tmp_path / "e.csv", tmp_path / "traces"
+    common = ["--weights", str(tmp_path / "w.bin"), "--depth", "0", "--seed", "11", "--threads", "2", "--games", "6",
+              "--out", str(out), "--trace-dir", str(td)]
+    evaluate_games.main([*common, "--trace-min-score", str(S), "--report-min-score", str(S)])
+    assert {int(p.stem.split("_")[1]) for p in td.glob("game_*.npz")} == high
+    assert not list(td.glob("*.part"))
+    printed = capsys.readouterr().out
+    assert all(f"game {g}: score {scores[g]}," in printed for g in high)
+    assert not any(f"game {g}: score" in printed for g in set(range(6)) - high)
+    assert json.loads(out.with_suffix(".json").read_text())["trace_min_score"] == S
+    rows = evaluate_games.read_games(out)
+    assert [int(rows[g]["score"]) for g in range(6)] == scores     # traced play is the same play
+
+    settings = str(out.with_suffix(".json"))
+    g = min(high)
+    t = np.load(td / f"game_{g}.npz")
+    assert (int(t["score"]), int(t["game"]), int(t["seed"])) == (scores[g], g, 11)
+    assert evaluate_games.check_rules(t["boards"], t["dirs"], int(t["score"])) is None
+    assert verify_game.main([settings, str(g)]) == 0
+    assert capsys.readouterr().out.startswith("OK ")
+    mid = len(t["boards"]) // 2
+    for name, (key, index, tamper) in {"board": ("boards", (mid, 0, 0), lambda v: v ^ 1),
+                                       "move": ("dirs", 3, lambda v: (v + 1) % 4),
+                                       "score": ("score", (), lambda v: v + 4)}.items():
+        d = {k: t[k].copy() for k in t.files}
+        d[key][index] = tamper(d[key][index])
+        np.savez_compressed(tmp_path / f"{name}.npz", **d)
+        assert verify_game.main([settings, str(g), "--trace", str(tmp_path / f"{name}.npz")]) == 1, name
+        assert capsys.readouterr().out.startswith("FAIL "), name
+
+    with pytest.raises(SystemExit):                              # the traces a file promises do not change
+        evaluate_games.main([*common, "--trace-min-score", str(S + 1)])
+    with pytest.raises(SystemExit):                              # --trace-min-score needs --trace-dir
+        evaluate_games.main([*common[:-2], "--trace-min-score", str(S)])
+
+
+def test_record_hunt_resumes_writes_records_and_notifies(tmp_path, capsys):
+    import itertools
+
+    import record_hunt
+    import verify_game
+
+    scores = _small_weights(tmp_path / "w.bin")
+    assert list(record_hunt.game_order({0, 1, 3}, 6)) == [2, 4, 5]   # an interrupted run's gaps first
+    assert list(itertools.islice(record_hunt.game_order({0, 1}, 0), 3)) == [2, 3, 4]
+    R = sorted(scores[:5])[2]                                    # a low "record" that some of the games beat
+    records = {g for g in range(5) if scores[g] >= R}
+    notify = tmp_path / "notify.sh"
+    notify.write_text('#!/bin/sh\necho "$1|$2" >> "$(dirname "$0")/notified.txt"\n')
+    notify.chmod(0o755)
+    out = tmp_path / "hunt" / "h.csv"
+    common = ["--weights", str(tmp_path / "w.bin"), "--depth", "0", "--seed", "11", "--threads", "2", "--out", str(out),
+              "--record-score", str(R), "--trace-min-score", str(R), "--notify-cmd", str(notify), "--summary-every", "2"]
+    assert record_hunt.main([*common, "--games", "3"]) == 0
+    assert _games_in(out) == [0, 1, 2]
+    capsys.readouterr()
+    assert record_hunt.main([*common, "--games", "5"]) == 0      # started again: from game 3 on
+    printed = capsys.readouterr().out
+    assert "playing from game 3" in printed and "games/hour" in printed
+    assert _games_in(out) == [0, 1, 2, 3, 4]
+
+    found = {int(p.stem.split("game")[1]) for p in out.parent.glob("RECORD_seed11_game*.json")}
+    assert found == records
+    g = min(records)
+    record = out.parent / f"RECORD_seed11_game{g}.json"
+    doc = json.loads(record.read_text())
+    assert (doc["game"], doc["seed"], doc["score"], doc["replay_check"]) == (g, 11, scores[g], "OK")
+    assert doc["settings"]["seed"] == 11 and doc["settings"]["trace_min_score"] == R and doc["engine_md5"]
+    assert doc["trace_sha256"] == record_hunt.file_hash(Path(doc["trace"]))
+    lines = (tmp_path / "notified.txt").read_text().splitlines()
+    assert sum(x.startswith("RECORD? game") and x.endswith("|2048 RECORD") for x in lines) == len(records)
+    assert sum("replay check OK" in x for x in lines) == len(records)
+    assert verify_game.main([str(record)]) == 0
+
+    with pytest.raises(SystemExit):                              # a record must keep its moves
+        record_hunt.main([*common, "--games", "5", "--trace-min-score", str(R + 1)])

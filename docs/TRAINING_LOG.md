@@ -4,8 +4,8 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-14, 15:10. The totals below do not include runs 24
-to 26 yet.
+Last updated 2026-10-16, 11:40. No training has run since run 26; the work
+since then has been search and endgame tables, which are not training.
 
 ## Totals so far
 
@@ -13,9 +13,9 @@ to 26 yet.
 | --- | --- | --- | --- |
 | MacBook (M3 Pro, 12 cores) | 16.2 h | 168 thread-hours, plus 71 min on its GPU | 116 billion |
 | ThinkPad (i5-1240P, 16 threads) | 72.3 h | 1,153 thread-hours | 1,130 billion |
-| Google Colab, CPU runtimes | 43.1 h | 343 vCPU-hours | 526 billion |
+| Google Colab, CPU runtimes | 73.4 h | 585 vCPU-hours | 793 billion |
 | Google Colab, GPU runtimes | 1.2 h | 1.2 GPU-hours | 10 billion |
-| **All** | **134 h** | **1,665 CPU thread-hours** | **about 1,780 billion** |
+| **All** | **164 h** | **1,907 CPU thread-hours** | **about 2,050 billion** |
 
 A thread-hour is one hardware thread busy for an hour. The threads are not
 equal: the ThinkPad's are held to about 20 W by its firmware and a Colab vCPU
@@ -351,8 +351,12 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   37%, against 241,000 and 36% after run 22. Over the same 1,000 games at
   depth 2 with tile downgrading the joined player averaged 569,924 against
   v2's 565,703: 4,221 more a game, well inside the noise (plus or minus
-  14,555), with a 32768 in 60.0% of games against 58.6%. A 10,000-game
-  comparison is running.
+  14,555), with a 32768 in 60.0% of games against 58.6%. Over 10,000 games
+  on the same seeds (depth 2, tile downgrading, the 5-locked endgame tables)
+  it averaged 565,047 against v2's 560,276: 4,770 more a game, plus or minus
+  4,674, so just at the edge of the noise, with a 32768 in 58.1% against 57.7%
+  and a 65536 in 0.16% against 0.20%. Too small a gain to switch; v2 stays the
+  player.
 
 ## Not training
 

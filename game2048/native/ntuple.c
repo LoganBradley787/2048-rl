@@ -339,6 +339,7 @@ static inline int stage_has_bits(const net_t *net, int st) { return net->flags &
 static inline size_t bits_bytes(size_t entries) { return (entries + 7) / 8; }
 
 void nt_free(void *p);
+static void ctx_free(search_ctx_t *c);
 
 /* The tables are gigabytes of random access. Where Linux gives huge pages only on
  * request, ask for them: far fewer TLB misses per lookup. A hint; failure is harmless. */
@@ -440,8 +441,8 @@ void nt_free(void *p) {
         for (int k = 0; k < net->K; k++) {
             free(net->w[st][k]); free(net->bits[st][k]);
         }
-    if (net->main_ctx) { free(net->main_ctx->tt); free(net->main_ctx); }
-    if (net->choose_ctx) { free(net->choose_ctx->tt); free(net->choose_ctx); }
+    ctx_free(net->main_ctx);
+    ctx_free(net->choose_ctx);
     free(net);
 }
 
@@ -1107,7 +1108,7 @@ int nt_get_downgrade(void *p) { return ((net_t *)p)->downgrade; }
  * (0 = no cap), or NULL to clear: crowded boards get the deep search, open ones,
  * where a spawn rarely decides anything, a shallow one. */
 static void drop_ctx(search_ctx_t **c) {
-    if (*c) { free((*c)->tt); free(*c); *c = NULL; }
+    ctx_free(*c); *c = NULL;
 }
 
 void nt_set_tt_bits(void *p, int bits) {

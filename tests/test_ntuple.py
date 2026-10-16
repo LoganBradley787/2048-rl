@@ -2188,7 +2188,7 @@ def _blk_fits(sh, b, a):
     return all(b[c] <= a - k for c, k in _BLK_CAP[sh].items())
 
 
-def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_first=False, far=0):
+def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_first=False, far=0, trace=None):
     """The block tier's rule written out plainly: (move, (shape, table anchor, orientation)) or (-1, None).
     loaded {shape: anchors}; value(sh, a, t): the table's float32 chance of the free tiles of t; after_of(real, d):
     the board after move d or None if it does not change; sym(i, s): the engine's cell map (o[i] = real[sym(i, s)]).
@@ -2197,7 +2197,8 @@ def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_firs
     the table is above the anchor, outside the anchor's caps or at its goal). Order: b5 first if asked, then the
     larger table, then b6, then the orientation. A reading plays its best move (made on the real board, the block
     unmoved, the afterstate under the caps: 1 at a goal, else the mean over new tiles of the table's chance; the
-    first move wins ties) if that chance is above the shape's minimum."""
+    first move wins ties) if that chance is above the shape's minimum. trace (a list): gets (shape, a, s, best move,
+    its chance, each move's chance or None) for every reading tried."""
     readings = []
     for s in range(8):
         o = [real[sym(i, s)] for i in range(16)]
@@ -2213,7 +2214,7 @@ def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_firs
     for _, na, shi, s in sorted(readings):
         sh, a = ("b6", "b5")[shi], -na
         o = [real[sym(i, s)] for i in range(16)]
-        best_d, best_v = -1, np.float32(0.0)
+        best_d, best_v, vals = -1, np.float32(0.0), [None] * 4
         for d in range(4):
             m = after_of(real, d)
             if m is None:
@@ -2233,11 +2234,42 @@ def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_firs
                         if x <= a - k:
                             tot += p * value(sh, a, t[:c] + [x] + t[c + 1:])
                 v = np.float32(tot / empty) if empty else np.float32(0.0)
+            vals[d] = float(v)
             if v > best_v:
                 best_d, best_v = d, v
+        if trace is not None:
+            trace.append((sh, a, s, best_d, float(best_v), vals))
         if best_d >= 0 and best_v > np.float32(mins[shi]):
             return best_d, (sh, a, s)
     return -1, None
+
+
+def _blk_random_boards(rng, loaded, n):
+    """n real boards holding a regular block of either shape (any orientation), its anchor near the loaded
+    tables' ({shape: anchors}), free tiles under the caps of the anchor or one above, at least one empty cell."""
+    CAP = {"b6": [1, 2, 1, 2, 3, 3, 3, 3, 3, 3], "b5": [2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]}
+    lo, hi = min(min(v) for v in loaded.values()), max(max(v) for v in loaded.values())
+    boards = []
+    while len(boards) < n:
+        sh, own = ("b6", "b5")[int(rng.integers(0, 2))], int(rng.integers(lo, hi + 2))
+        down = sh == "b6" and rng.random() < 0.5  # row 1 falling away from the corner: a b5 block as well
+        while True:
+            b = [int(rng.integers(2, own + 6)) if c in _BLK_CELLS[sh] else 0 for c in range(16)]
+            if down:
+                b[4], b[5], b[6] = sorted((b[4], b[5], b[6]), reverse=True)
+            if _blk_anchor(sh, b) == own:
+                break
+        ca = own + int(rng.integers(0, 2)) if sh == "b6" else own   # free tiles under the caps of own or own + 1
+        for c, k in zip(_BLK_FREE[sh], CAP[sh]):
+            if rng.random() < 0.6:
+                b[c] = int(rng.integers(0, max(0, ca - k) + 1))
+        s = int(rng.integers(0, 8))
+        real = [0] * 16
+        for j in range(16):
+            real[nt.sym_cell(j, s)] = b[j]
+        if 0 in real:
+            boards.append(real)
+    return boards
 
 
 _CHOOSER_CHECK = r"""
@@ -2245,7 +2277,7 @@ import json, sys
 import numpy as np
 sys.path.insert(0, sys.argv[3])
 from game2048 import ntuple as nt
-from test_ntuple import _BLK_CELLS, _blk_anchor, _blk_choose_ref
+from test_ntuple import _BLK_CELLS, _blk_choose_ref, _blk_random_boards
 dirs, settings = sys.argv[1].split(","), json.loads(sys.argv[2])
 loaded = {}
 for d in dirs:
@@ -2264,38 +2296,24 @@ def value(sh, a, t):                      # the table's entry for t's free tiles
 def after_of(real, d):
     b = bits(real); m = nt.move(b, d)[0]
     return None if m == b else [int(x) for x in nt.from_bits(m).ravel()]
-rng = np.random.default_rng(int(sys.argv[4]))
-CAP = {"b6": [1, 2, 1, 2, 3, 3, 3, 3, 3, 3], "b5": [2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]}
-FREE = {"b6": [3, 7, 8, 9, 10, 11, 12, 13, 14, 15], "b5": [3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]}
-lo, hi = min(min(v) for v in loaded.values()), max(max(v) for v in loaded.values())
-boards = []
-while len(boards) < int(sys.argv[5]):     # a regular block of either shape, its anchor near the tables'
-    sh, own = ("b6", "b5")[int(rng.integers(0, 2))], int(rng.integers(lo, hi + 2))
-    down = sh == "b6" and rng.random() < 0.5  # row 1 falling away from the corner: a b5 block as well
-    while True:
-        b = [int(rng.integers(2, own + 6)) if c in _BLK_CELLS[sh] else 0 for c in range(16)]
-        if down: b[4], b[5], b[6] = sorted((b[4], b[5], b[6]), reverse=True)
-        if _blk_anchor(sh, b) == own: break
-    ca = own + int(rng.integers(0, 2)) if sh == "b6" else own   # free tiles under the caps of own or own + 1
-    for c, k in zip(FREE[sh], CAP[sh]):
-        if rng.random() < 0.6: b[c] = int(rng.integers(0, max(0, ca - k) + 1))
-    s = int(rng.integers(0, 8)); real = [0] * 16
-    for j in range(16): real[nt.sym_cell(j, s)] = b[j]
-    if 0 in real: boards.append(real)
+boards = _blk_random_boards(np.random.default_rng(int(sys.argv[4])), loaded, int(sys.argv[5]))
 net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
 net.block_tier = True
+mode = sys.argv[6] if len(sys.argv) > 6 else "ref"   # ref, trace (ref and its readings), engine (engine only)
 out = []
 for st in settings:
     net.block_min_b6, net.block_min_b5 = st.get("min_b6", 0), st.get("min_b5", 0)
     net.block_b5_first, net.block_far = st.get("b5_first", 0), st.get("far", 0)
-    eng, ref = [], []
+    eng, ref, traces = [], [], []
     for real in boards:
         c0 = nt.block_tier_moves()
         d = net.best_move(bits(real), depth=1)
         eng.append(d if nt.block_tier_moves() > c0 else -1)
-        ref.append(_blk_choose_ref(real, loaded, value, after_of, nt.sym_cell, (st.get("min_b6", 0), st.get("min_b5", 0)),
-                                   bool(st.get("b5_first", 0)), st.get("far", 0))[0])
-    out.append({"engine": eng, "ref": ref})
+        if mode != "engine":
+            traces.append([])
+            ref.append(_blk_choose_ref(real, loaded, value, after_of, nt.sym_cell, (st.get("min_b6", 0),
+                       st.get("min_b5", 0)), bool(st.get("b5_first", 0)), st.get("far", 0), traces[-1])[0])
+    out.append({"engine": eng, "ref": ref} | ({"trace": traces} if mode == "trace" else {}))
 print(json.dumps(out))
 """
 
@@ -2329,6 +2347,96 @@ def test_block_chooser_options_match_the_rule(tmp_path):
     # block), so b5 first changes nothing; with far a b6 table one above its anchor can tie with b5's.
     assert diff(2, 0) == 0 and diff(6, 4) >= 4
     assert diff(4, 0) >= 40 and diff(5, 0) >= 8 and diff(4, 5) >= 30 and diff(7, 0) >= 20
+
+
+def _code6(u):
+    """mv8's 6-bit value code of u16 values (block_build.c code6): 64 levels of the square root, 0 and 1 exact."""
+    u = np.asarray(u, dtype=np.float64)
+    q = np.clip(np.floor(63.0 * np.sqrt(u / 65535.0) + 0.5), 1, 62).astype(np.int64)
+    return np.where(u == 0, 0, np.where(u == 65535, 63, q))
+
+
+def test_block_one_byte_tables_play_the_u16_moves(tmp_path):
+    """--bytes 1 (mv8: each position's best move and a 6-bit value, half the size): every entry's code is the u16
+    table's value on 64 levels of the square root (a chance that rounds to u16 0 stays at code 1), so the DP is the
+    u16 one; an mv8 table built after a u16 one into the same directory loads beside it; the engine reads the
+    values back; and the tier on random boards, any orientation, plays the u16 tables' moves except where the
+    u16 chances of the two moves are equal (ties: the move order differs) or, with block_min, where a reading's
+    best chance is within one 6-bit step of the minimum."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+
+    def build(sh, anchors, out, nbytes):
+        subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--block", sh, "--anchors",
+                        anchors, "--bytes", str(nbytes), "--threads", "2", "--out", str(tmp_path / out)],
+                       check=True, capture_output=True)
+    build("b6", "4,5,6", "u6", 2)
+    build("b5", "4,5", "u5", 2)
+    build("b6", "4,5,6", "q6", 1)
+    build("b5", "4", "q5", 2)
+    build("b5", "5", "q5", 1)                         # formats mixed in one directory
+    assert len((tmp_path / "u6" / "block.txt").read_text().split()) == 4          # u16 only: as before
+    assert (tmp_path / "q6" / "block.txt").read_text().split()[4] == "mv8,mv8,mv8"
+    assert (tmp_path / "q5" / "block.txt").read_text().split() == ["b5", "4,5", "3,6,7,8,9,10,11,12,13,14,15",
+                                                                  "2,1,2,2,2,2,2,3,3,3,3", "u16,mv8"]
+    tiny = 0
+    for sh, a, d16, d8 in (("b6", 4, "u6", "q6"), ("b6", 5, "u6", "q6"), ("b6", 6, "u6", "q6"), ("b5", 5, "u5", "q5")):
+        u = np.fromfile(tmp_path / d16 / f"{sh}_a{a}.u16", dtype=np.uint16)
+        m = np.fromfile(tmp_path / d8 / f"{sh}_a{a}.mv8", dtype=np.uint8)
+        assert len(m) == len(u)
+        odd = _code6(u) != (m >> 2)
+        assert np.all((u[odd] == 0) & ((m[odd] >> 2) == 1))                   # chances below u16's half step
+        assert np.all((m[(m >> 2) == 0] & 3) == 0)
+        tiny += int(odd.sum())
+    assert tiny > 0
+
+    # values: the 6-bit code of the u16 value, read back as (q / 63)^2
+    rng = np.random.default_rng(23)
+    boards = [(_blk_board(sh, a + int(rng.integers(0, 3)), a, rng, fill=0.7), sh, a)
+              for sh, a in (("b6", 4), ("b6", 5), ("b6", 6), ("b5", 5)) for _ in range(40)]
+    vals = {}
+    for key, dirs in (("u16", "u6,u5"), ("mv8", "q6,q5")):
+        r = subprocess.run([sys.executable, "-c", _BLOCK_CHECK, ",".join(str(tmp_path / d) for d in dirs.split(",")),
+                            json.dumps(boards), "[]"], capture_output=True, text=True, cwd=root)
+        assert r.returncode == 0, r.stderr
+        vals[key] = json.loads(r.stdout.strip().splitlines()[-1])["values"]
+    v16, v8 = np.array(vals["u16"]), np.array(vals["mv8"])
+    assert np.all(v16 >= 0) and np.all(v8 >= 0)
+    q = _code6(np.round(v16 * 65535))
+    six = lambda q: (np.float32(q * q) * np.float32(1.0 / 3969.0)).astype(np.float64)      # as the engine reads it
+    assert np.all((v8 == six(q)) | ((v16 == 0) & (v8 == six(1))))
+    assert np.all(np.abs(np.sqrt(v8) - np.sqrt(v16)) <= 1 / 63 + 1e-6)
+    assert ((v16 > 0) & (v16 < 1)).sum() >= 40
+
+    # moves: the same boards and settings, u16 tables (with the plain rule's readings) against mv8 tables
+    settings = [{}, {"far": 2}, {"min_b6": 0.3, "min_b5": 0.5}]
+    got = {}
+    for key, dirs, mode in (("u16", "u6,u5", "trace"), ("mv8", "q6,q5", "engine")):
+        r = subprocess.run([sys.executable, "-c", _CHOOSER_CHECK, ",".join(str(tmp_path / d) for d in dirs.split(",")),
+                            json.dumps(settings), str(root / "tests"), "11", "600", mode],
+                           capture_output=True, text=True, cwd=root)
+        assert r.returncode == 0, r.stderr
+        got[key] = json.loads(r.stdout.strip().splitlines()[-1])
+    for st, gu, gq in zip(settings, got["u16"], got["mv8"]):
+        assert gu["engine"] == gu["ref"], st
+        mins = {"b6": st.get("min_b6", 0), "b5": st.get("min_b5", 0)}
+        same = ties = near = 0
+        for du, dq, tr in zip(gu["engine"], gq["engine"], gu["trace"]):
+            if du == dq:
+                same += du >= 0
+                continue
+            if any(mins[sh] > 0 and v > 0 and abs(np.sqrt(v) - np.sqrt(mins[sh])) <= 1 / 63 for sh, _, _, _, v, _ in tr):
+                near += 1                                    # a reading's best chance at its minimum
+                continue
+            vs = tr[-1][5]                                   # the reading that played (u16): the same one in mv8
+            assert du >= 0 and dq >= 0 and vs[dq] is not None and vs[dq] == vs[du], (st, du, dq, tr)
+            ties += 1
+        assert same >= 200 and ties + near <= 0.02 * same, (st, same, ties, near)     # 0 and 0 when written
+        if not st.get("min_b6"):
+            assert near == 0
 
 
 # --- macroxue's heuristic for the late game ------------------------------------

@@ -263,6 +263,8 @@ def lib() -> ctypes.CDLL:
     L.nt_heur_score.argtypes, L.nt_heur_score.restype = [u64, u64], f64
     L.nt_heur_orient.argtypes, L.nt_heur_orient.restype = [u64, u64, P(u64), P(u64)], i32
     L.nt_block_load.argtypes, L.nt_block_load.restype = [ctypes.c_char_p, i32, i32, P(i32), P(i32), i32], i32
+    L.nt_block_load_fmt.argtypes = [ctypes.c_char_p, i32, i32, P(i32), P(i32), i32, i32]
+    L.nt_block_load_fmt.restype = i32
     L.nt_block_value.argtypes, L.nt_block_value.restype = [u64, u64, i32, i32], f32
     L.nt_block_loaded.argtypes, L.nt_block_loaded.restype = [i32], i32
     L.nt_block_moves.argtypes, L.nt_block_moves.restype = [i32], ctypes.c_long
@@ -378,6 +380,7 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
 
 
 BLOCK_SHAPES = {"b6": 0, "b5": 1}
+BLOCK_FORMATS = {"u16": 0, "mv8": 1}   # block table files: <shape>_a<a>.<format> (game2048/native/block_build.c)
 # how the late-game heuristic turns the board (NTupleNet.heuristic_orientation), by engine mode (nt_set_heur)
 HEURISTIC_ORIENTATIONS = {"turn": 1, "own": 2, "sticky": 3}   # block-tier shapes (game2048/native/block_build.c)
 
@@ -391,25 +394,30 @@ def _flag(v) -> bool:
 
 def load_block_tables(directory) -> list[int]:
     """Use the block-tier tables in <directory> (examples/build_endgame.py --block): block.txt reads
-    "<b6|b5> <anchors> <free cells> <drops>" and <shape>_a<a>.u16 holds each table. They play, with
-    `NTupleNet.block_tier` on, the boards no ladder table holds. Returns the anchors loaded. Call before any play."""
+    "<b6|b5> <anchors> <free cells> <drops>[ <format per anchor>]" and <shape>_a<a>.<format> holds each table
+    (u16 when no formats are listed; mv8: 1 byte a position, --bytes 1). They play, with `NTupleNet.block_tier`
+    on, the boards no ladder table holds. Returns the anchors loaded. Call before any play."""
     d = Path(directory)
-    shape, anchors, cells, drops = (d / "block.txt").read_text().split()[:4]
+    shape, anchors, cells, drops, *rest = (d / "block.txt").read_text().split()
     sh = BLOCK_SHAPES[shape]
     cells = [int(x) for x in cells.split(",")]
     drops = [int(x) for x in drops.split(",")]
+    anchors = [int(x) for x in anchors.split(",")]
+    formats = rest[0].split(",") if rest else ["u16"] * len(anchors)
+    if len(formats) != len(anchors) or any(f not in BLOCK_FORMATS for f in formats):
+        raise ValueError(f"{d / 'block.txt'}: formats {rest[0]!r} do not match anchors {anchors}")
     out = []
-    for a in (int(x) for x in anchors.split(",")):
-        if lib().nt_block_load(str(d).encode(), sh, a, (ctypes.c_int32 * len(cells))(*cells),
-                               (ctypes.c_int32 * len(drops))(*drops), len(cells)) < 0:
-            raise ValueError(f"block table {shape} a {a} in {d}: missing, the wrong size or already loaded")
+    for a, f in zip(anchors, formats):
+        if lib().nt_block_load_fmt(str(d).encode(), sh, a, (ctypes.c_int32 * len(cells))(*cells),
+                                   (ctypes.c_int32 * len(drops))(*drops), len(cells), BLOCK_FORMATS[f]) < 0:
+            raise ValueError(f"block table {shape} a {a} ({f}) in {d}: missing, the wrong size or already loaded")
         out.append(a)
     return out
 
 
 def block_value(bits: int, shape: str, a: int) -> float:
     """Block table (shape, a)'s chance for a board as it stands (the block in the top left), or -1 if the
-    table is not loaded or the board is not one of its positions."""
+    table is not loaded or the board is not one of its positions. An mv8 table gives its 6-bit value, (q / 63)^2."""
     return float(lib().nt_block_value(*_lohi(bits), BLOCK_SHAPES[shape], int(a)))
 
 

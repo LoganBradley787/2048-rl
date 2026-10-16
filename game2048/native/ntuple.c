@@ -1597,7 +1597,10 @@ static int eg_choose(board_t board, int kmin, int *held_out) {
  * b5, then the first orientation) plays its best move, the move made on the real board; if no move has a chance
  * above the shape's block_min (default 0) the next reading is tried, then the network search. Chances are never
  * compared across readings. Options (net_t, all off by default): block_min per shape; block_b5_first (every b5
- * reading first, then b6; by anchor within a shape); block_far (blk_reach). */
+ * reading first, then b6; by anchor within a shape); block_far (blk_reach).
+ * Formats (block_build.c): u16 tables hold values, the best move is found over the afterstates (blk_after); mv8
+ * tables (1 byte) hold each position's best move and a 6-bit value, read once a reading: the same moves as the
+ * u16 table's (up to the order among equal chances), the value only for block_min. */
 #define BLK_AMIN 4
 #define BLK_AMAX 15
 static const int blk_nblock[2] = {6, 5}, blk_nfree[2] = {10, 11};
@@ -1605,7 +1608,8 @@ static const uint8_t blk_block[2][6] = {{0, 1, 2, 4, 5, 6}, {0, 1, 2, 4, 5}};
 static const uint8_t blk_free[2][11] = {{3, 7, 8, 9, 10, 11, 12, 13, 14, 15}, {3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
 static const uint8_t blk_drop[2][11] = {{1, 2, 1, 2, 3, 3, 3, 3, 3, 3}, {2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3}};
 static const char *blk_name[2] = {"b6", "b5"};
-static uint16_t *blk_map[2][BLK_AMAX + 1];
+static void *blk_map[2][BLK_AMAX + 1];
+static int blk_fmt[2][BLK_AMAX + 1];                      /* 0 u16, 1 mv8 */
 static uint64_t *blk_offs[2][BLK_AMAX + 1], *blk_rank[2][BLK_AMAX + 1][11], blk_bytes[2][BLK_AMAX + 1];
 static long blk_count;                                    /* moves the tier chose (all threads) */
 
@@ -1656,7 +1660,7 @@ static inline int blk_fits(int sh, const uint8_t *b, int a) {
     return 1;
 }
 
-static inline float blk_get(int sh, int a, const uint8_t *b) {
+static inline uint64_t blk_index(int sh, int a, const uint8_t *b) {
     const uint8_t *F = blk_free[sh];
     int n = blk_nfree[sh], r = 0;
     for (int j = 0; j < n; j++) r += eg_units(b[F[j]]);
@@ -1666,7 +1670,21 @@ static inline float blk_get(int sh, int a, const uint8_t *b) {
         q += blk_rank[sh][a][j][(size_t)r * (a - blk_drop[sh][j] + 1) + v];
         r -= eg_units(v);
     }
-    return (float)blk_map[sh][a][q] * (1.0f / 65535.0f);
+    return q;
+}
+
+static inline float blk_get(int sh, int a, const uint8_t *b) {
+    return (float)((const uint16_t *)blk_map[sh][a])[blk_index(sh, a, b)] * (1.0f / 65535.0f);
+}
+
+/* mv8: the 6-bit value code q of an entry, read back as (q / 63)^2 */
+static inline float blk_value6(int q) { return (float)(q * q) * (1.0f / 3969.0f); }
+
+/* the real move of a move d made in orientation s's frame (0 up, 1 right, 2 down, 3 left) */
+static int blk_real_dir(int d, int s) {
+    static const int8_t from[4] = {4, 0, 0, 1}, to[4] = {0, 1, 4, 0};
+    int delta = sym_cell(to[d], s) - sym_cell(from[d], s);
+    return delta == -4 ? 0 : delta == 1 ? 1 : delta == 4 ? 2 : 3;
 }
 
 /* the chance of an afterstate t (shape's frame, free tiles within the caps, not a goal): over the new tile */
@@ -1709,7 +1727,14 @@ static int blk_choose(const net_t *n, board_t board) {
         int a = BLK_AMAX - ((key[q] >> 8) & 15), sh = (key[q] >> 4) & 15, s = key[q] & 15;
         int best_dir = -1;
         float best_v = 0.0f;
-        for (int d = 0; d < 4; d++) {                            /* each move, made on the real board */
+        if (blk_fmt[sh][a]) {                                    /* mv8: the stored move, made on the real board */
+            uint8_t o[16];
+            for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
+            uint8_t e = ((const uint8_t *)blk_map[sh][a])[blk_index(sh, a, o)];
+            int r, d = blk_real_dir(e & 3, s);
+            if (e >> 2 && do_move(board, d, &r) != board) { best_dir = d; best_v = blk_value6(e >> 2); }
+        }
+        for (int d = 0; d < 4 && !blk_fmt[sh][a]; d++) {         /* u16: each move, made on the real board */
             int r;
             board_t after = do_move(board, d, &r);
             if (after == board) continue;
@@ -2044,12 +2069,14 @@ float nt_endgame_value_family(uint64_t lo, uint64_t hi, int k, int f) {
 }
 float nt_endgame_value(uint64_t lo, uint64_t hi, int k) { return nt_endgame_value_family(lo, hi, k, 0); }
 
-/* Use the block-tier table of shape sh (0 = b6, 1 = b5) and anchor a: <dir>/<b6|b5>_a<a>.u16, built by
- * block_build.c with the free cells and drops given (they must be the engine's: a check on block.txt). Maps the
- * file read-only. Returns 0, or -1 (nothing changed) if the file is missing or the wrong size, the cells differ or
- * that table is already loaded. Call before any play. */
-int nt_block_load(const char *dir, int sh, int a, const int *freec, const int *drops, int nfree) {
+/* Use the block-tier table of shape sh (0 = b6, 1 = b5) and anchor a: <dir>/<b6|b5>_a<a>.u16 (fmt 0) or .mv8
+ * (fmt 1, 1 byte a position), built by block_build.c with the free cells and drops given (they must be the
+ * engine's: a check on block.txt). Maps the file read-only. Returns 0, or -1 (nothing changed) if the file is
+ * missing or the wrong size, the cells differ or that table is already loaded. Call before any play.
+ * nt_block_load: fmt 0. */
+int nt_block_load_fmt(const char *dir, int sh, int a, const int *freec, const int *drops, int nfree, int fmt) {
     if (sh < 0 || sh > 1 || a < BLK_AMIN || a > BLK_AMAX || blk_map[sh][a] || nfree != blk_nfree[sh]) return -1;
+    if (fmt < 0 || fmt > 1) return -1;
     for (int j = 0; j < nfree; j++) if (freec[j] != blk_free[sh][j] || drops[j] != blk_drop[sh][j]) return -1;
     int n = nfree, caps[11], S = 0;
     for (int j = 0; j < n; j++) { caps[j] = a - blk_drop[sh][j]; S += eg_units(caps[j]); }
@@ -2079,10 +2106,10 @@ int nt_block_load(const char *dir, int sh, int a, const int *freec, const int *d
         }
     }
     void *m = MAP_FAILED;
-    uint64_t bytes = ok ? offs[S + 1] * 2 : 0;
+    uint64_t bytes = ok ? offs[S + 1] * (fmt ? 1 : 2) : 0;
     if (ok) {
         char file[4096];
-        snprintf(file, sizeof file, "%s/%s_a%d.u16", dir, blk_name[sh], a);
+        snprintf(file, sizeof file, "%s/%s_a%d.%s", dir, blk_name[sh], a, fmt ? "mv8" : "u16");
         FILE *fp = fopen(file, "rb");
         if (fp) {
             fseek(fp, 0, SEEK_END);
@@ -2100,8 +2127,12 @@ int nt_block_load(const char *dir, int sh, int a, const int *freec, const int *d
     blk_offs[sh][a] = offs;
     for (int j = 0; j < n; j++) blk_rank[sh][a][j] = rank[j];
     blk_bytes[sh][a] = bytes;
-    blk_map[sh][a] = (uint16_t *)m;                            /* last: a table is used only once all is set */
+    blk_fmt[sh][a] = fmt;
+    blk_map[sh][a] = m;                                        /* last: a table is used only once all is set */
     return 0;
+}
+int nt_block_load(const char *dir, int sh, int a, const int *freec, const int *drops, int nfree) {
+    return nt_block_load_fmt(dir, sh, a, freec, drops, nfree, 0);
 }
 /* Table (sh, a)'s chance for a board as it stands (the block in the shape's place), or -1 if the table is not
  * loaded or the board is not one of its positions (block not regular, anchor below a, a free tile above its cap).
@@ -2112,6 +2143,7 @@ float nt_block_value(uint64_t lo, uint64_t hi, int sh, int a) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(b, i);
     if (blk_anchor(sh, c) < a || !blk_fits(sh, c, a)) return -1.0f;
+    if (blk_fmt[sh][a]) return blk_value6(((const uint8_t *)blk_map[sh][a])[blk_index(sh, a, c)] >> 2);
     return blk_get(sh, a, c);
 }
 /* bit a of the result: table (sh, a) is loaded */

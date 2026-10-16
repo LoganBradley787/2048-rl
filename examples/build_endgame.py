@@ -13,6 +13,11 @@ Block-tier tables (game2048/native/block_build.c; play with nt.load_block_tables
     uv run python examples/build_endgame.py --block b6 --sizes      # the size of every table, no build
 
 writes <out>/<shape>_a<a>.u16 per anchor and <out>/block.txt; the sizes are printed before building.
+With --bytes 1 a table is <shape>_a<a>.mv8, half the size: each position's best move and a 6-bit value (the
+same moves as the u16 table; block_build.c), built with three layers of u16 values in memory (0.45 GB at b5 a 10)
+and no u16 file:
+
+    uv run python examples/build_endgame.py --block b5 --anchors 10 --bytes 1 --out tables/b5 --threads 12
 """
 import argparse
 import os
@@ -52,6 +57,8 @@ def main() -> None:
                    help="block-tier tables of this shape instead (b6: 2x3 block in the corner; b5: 3 + 2 cells)")
     p.add_argument("--anchors", default="", help="with --block: the anchors (tile ranks) to build, e.g. 9,10")
     p.add_argument("--sizes", action="store_true", help="with --block: print every table's size and stop")
+    p.add_argument("--bytes", type=int, choices=[1, 2], default=2,
+                   help="with --block: 2 = u16 values (default); 1 = mv8, a best move and a 6-bit value a position")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 1)
     p.add_argument("--out")
     args = p.parse_args()
@@ -65,7 +72,8 @@ def main() -> None:
             if not args.out or not args.anchors:
                 p.error("--block needs --anchors and --out")
             Path(args.out).mkdir(parents=True, exist_ok=True)
-            subprocess.run([str(exe), args.block, args.anchors, args.out, str(args.threads)], check=True)
+            subprocess.run([str(exe), args.block, args.anchors, args.out, str(args.threads), str(args.bytes)],
+                           check=True)
         print(f"block tables in {args.out}: " + (Path(args.out) / "block.txt").read_text().strip())
         return
     if not args.out:

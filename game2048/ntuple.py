@@ -270,6 +270,12 @@ def lib() -> ctypes.CDLL:
     L.nt_get_block_tier.argtypes, L.nt_get_block_tier.restype = [vp], i32
     L.nt_set_block_from.argtypes = [vp, ctypes.c_int64]
     L.nt_get_block_from.argtypes, L.nt_get_block_from.restype = [vp], ctypes.c_int64
+    L.nt_set_block_min.argtypes = [vp, i32, f32]
+    L.nt_get_block_min.argtypes, L.nt_get_block_min.restype = [vp, i32], f32
+    L.nt_set_block_b5_first.argtypes = [vp, i32]
+    L.nt_get_block_b5_first.argtypes, L.nt_get_block_b5_first.restype = [vp], i32
+    L.nt_set_block_far.argtypes = [vp, i32]
+    L.nt_get_block_far.argtypes, L.nt_get_block_far.restype = [vp], i32
 
     L.nt_get_deep.argtypes, L.nt_get_deep.restype = [vp, P(ctypes.c_uint)], i32
     L.nt_leaf_snake.argtypes, L.nt_leaf_snake.restype = [vp], f64
@@ -374,6 +380,13 @@ def load_endgame(directory, kmin: int | None = None, drops: list[int] | None = N
 BLOCK_SHAPES = {"b6": 0, "b5": 1}
 # how the late-game heuristic turns the board (NTupleNet.heuristic_orientation), by engine mode (nt_set_heur)
 HEURISTIC_ORIENTATIONS = {"turn": 1, "own": 2, "sticky": 3}   # block-tier shapes (game2048/native/block_build.c)
+
+
+def _flag(v) -> bool:
+    """A switch from Python or from an environment string: "", "0", "false", "off", "no" are off."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "off", "no")
+    return bool(v)
 
 
 def load_block_tables(directory) -> list[int]:
@@ -811,6 +824,53 @@ class NTupleNet:
     @block_tier_from.setter
     def block_tier_from(self, scale: int) -> None:
         self._lib.nt_set_block_from(self._h, int(scale))
+
+    @property
+    def block_min_b6(self) -> float:
+        """With `block_tier`: a b6 reading plays only if its best move's chance is above this; otherwise the next
+        reading is tried, then the search. 0 = any chance above zero (the default). Accepts a string ("0.1")."""
+        return float(self._lib.nt_get_block_min(self._h, 0))
+
+    @block_min_b6.setter
+    def block_min_b6(self, v) -> None:
+        self._lib.nt_set_block_min(self._h, 0, float(v))
+
+    @property
+    def block_min_b5(self) -> float:
+        """As `block_min_b6`, for the b5 readings (macroxue's big build: Tuple11 only above 0.1)."""
+        return float(self._lib.nt_get_block_min(self._h, 1))
+
+    @block_min_b5.setter
+    def block_min_b5(self, v) -> None:
+        self._lib.nt_set_block_min(self._h, 1, float(v))
+
+    @property
+    def block_b5_first(self) -> bool:
+        """With `block_tier`: every b5 reading is tried before any b6 one (macroxue's order: Tuple11, then
+        Tuple10), by table anchor within a shape. Off (the default): by table anchor, b6 before b5 at the same
+        anchor. Without `block_far` this never changes a choice (a b5 reading's table is always above any b6
+        reading's); with it a b6 table one above its anchor can tie with b5's. Accepts "0"/"1"/"true"/"off"..."""
+        return bool(self._lib.nt_get_block_b5_first(self._h))
+
+    @block_b5_first.setter
+    def block_b5_first(self, on) -> None:
+        self._lib.nt_set_block_b5_first(self._h, int(_flag(on)))
+
+    @property
+    def block_far(self) -> int:
+        """With `block_tier`: 1 = a b6 block is read in the largest loaded table that soundly holds it (one above
+        its anchor when the smallest second-row tile is not at r1c0: no free tile under that table's caps can reach
+        a block tile of its size), toward that table's farther goal; 2 = as 1, but such a reading is used only while
+        the board also fits its own anchor's caps and is not at its own goal (macroxue's exits). 0 = the largest
+        table not above the anchor (the default). b5 blocks have no sound larger table. Accepts a string."""
+        return int(self._lib.nt_get_block_far(self._h))
+
+    @block_far.setter
+    def block_far(self, mode) -> None:
+        if isinstance(mode, str):
+            mode = mode.strip().lower()
+            mode = int(mode) if mode.isdigit() else int(_flag(mode))
+        self._lib.nt_set_block_far(self._h, int(mode))
 
     def _heur_mode(self) -> tuple[int, int]:
         prune = ctypes.c_int(0)

@@ -2176,6 +2176,161 @@ def test_block_tier_off_or_without_tables_leaves_play_unchanged(tmp_path):
     assert got["count"] > 0                       # small blocks turn up early in every game
 
 
+def _blk_reach(sh, b):
+    """The largest table anchor that soundly holds the block: every free cap below each block tile it can reach.
+    b6: r0c3 / r2c0 (cap A-1) reach r0c2 / r1c0, r1c3 / r2c1 (A-2) reach r1c2 / r1c1; b5: r1c2 (A-1) touches r1c1
+    and r0c2, which is the anchor itself."""
+    a = _blk_anchor(sh, b)
+    return a if sh == "b5" or not a else min(b[4], b[5] + 1, b[6] + 1)
+
+
+def _blk_fits(sh, b, a):
+    return all(b[c] <= a - k for c, k in _BLK_CAP[sh].items())
+
+
+def _blk_choose_ref(real, loaded, value, after_of, sym, mins=(0.0, 0.0), b5_first=False, far=0):
+    """The block tier's rule written out plainly: (move, (shape, table anchor, orientation)) or (-1, None).
+    loaded {shape: anchors}; value(sh, a, t): the table's float32 chance of the free tiles of t; after_of(real, d):
+    the board after move d or None if it does not change; sym(i, s): the engine's cell map (o[i] = real[sym(i, s)]).
+    Readings: every orientation and shape whose block is regular, read in the largest loaded table not above its
+    anchor (with far: not above _blk_reach), free tiles under the caps, not at the table's goal (far 2: nor, when
+    the table is above the anchor, outside the anchor's caps or at its goal). Order: b5 first if asked, then the
+    larger table, then b6, then the orientation. A reading plays its best move (made on the real board, the block
+    unmoved, the afterstate under the caps: 1 at a goal, else the mean over new tiles of the table's chance; the
+    first move wins ties) if that chance is above the shape's minimum."""
+    readings = []
+    for s in range(8):
+        o = [real[sym(i, s)] for i in range(16)]
+        for shi, sh in enumerate(("b6", "b5")):
+            own = _blk_anchor(sh, o)
+            top = _blk_reach(sh, o) if far else own
+            a = max([x for x in loaded.get(sh, ()) if x <= top], default=0)
+            if not a or not _blk_fits(sh, o, a) or _blk_goal(sh, o, a):
+                continue
+            if far == 2 and a > own and (not _blk_fits(sh, o, own) or _blk_goal(sh, o, own)):
+                continue
+            readings.append(((1 - shi) if b5_first else 0, -a, shi, s))
+    for _, na, shi, s in sorted(readings):
+        sh, a = ("b6", "b5")[shi], -na
+        o = [real[sym(i, s)] for i in range(16)]
+        best_d, best_v = -1, np.float32(0.0)
+        for d in range(4):
+            m = after_of(real, d)
+            if m is None:
+                continue
+            t = [m[sym(i, s)] for i in range(16)]
+            if any(t[c] != o[c] for c in _BLK_CELLS[sh]) or not _blk_fits(sh, t, a):
+                continue
+            if _blk_goal(sh, t, a):
+                v = np.float32(1.0)
+            else:
+                tot, empty = 0.0, 0
+                for c, k in _BLK_CAP[sh].items():
+                    if t[c]:
+                        continue
+                    empty += 1
+                    for x, p in ((1, 0.9), (2, 0.1)):
+                        if x <= a - k:
+                            tot += p * value(sh, a, t[:c] + [x] + t[c + 1:])
+                v = np.float32(tot / empty) if empty else np.float32(0.0)
+            if v > best_v:
+                best_d, best_v = d, v
+        if best_d >= 0 and best_v > np.float32(mins[shi]):
+            return best_d, (sh, a, s)
+    return -1, None
+
+
+_CHOOSER_CHECK = r"""
+import json, sys
+import numpy as np
+sys.path.insert(0, sys.argv[3])
+from game2048 import ntuple as nt
+from test_ntuple import _BLK_CELLS, _blk_anchor, _blk_choose_ref
+dirs, settings = sys.argv[1].split(","), json.loads(sys.argv[2])
+loaded = {}
+for d in dirs:
+    loaded[open(d + "/block.txt").read().split()[0]] = nt.load_block_tables(d)
+bits = lambda g: nt.to_bits(np.array(g, dtype=np.uint8).reshape(4, 4))
+DUMMY = {"b6": [15, 14, 13, 12, 11, 10], "b5": [15, 14, 13, 12, 11]}   # a block that every table holds
+memo = {}
+def value(sh, a, t):                      # the table's entry for t's free tiles (the index ignores the block)
+    key = (sh, a, tuple(t))
+    if key not in memo:
+        u = list(t)
+        for c, x in zip(_BLK_CELLS[sh], DUMMY[sh]): u[c] = x
+        memo[key] = nt.block_value(bits(u), sh, a)
+        assert memo[key] >= 0.0, (sh, a, t)
+    return memo[key]
+def after_of(real, d):
+    b = bits(real); m = nt.move(b, d)[0]
+    return None if m == b else [int(x) for x in nt.from_bits(m).ravel()]
+rng = np.random.default_rng(int(sys.argv[4]))
+CAP = {"b6": [1, 2, 1, 2, 3, 3, 3, 3, 3, 3], "b5": [2, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]}
+FREE = {"b6": [3, 7, 8, 9, 10, 11, 12, 13, 14, 15], "b5": [3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]}
+lo, hi = min(min(v) for v in loaded.values()), max(max(v) for v in loaded.values())
+boards = []
+while len(boards) < int(sys.argv[5]):     # a regular block of either shape, its anchor near the tables'
+    sh, own = ("b6", "b5")[int(rng.integers(0, 2))], int(rng.integers(lo, hi + 2))
+    down = sh == "b6" and rng.random() < 0.5  # row 1 falling away from the corner: a b5 block as well
+    while True:
+        b = [int(rng.integers(2, own + 6)) if c in _BLK_CELLS[sh] else 0 for c in range(16)]
+        if down: b[4], b[5], b[6] = sorted((b[4], b[5], b[6]), reverse=True)
+        if _blk_anchor(sh, b) == own: break
+    ca = own + int(rng.integers(0, 2)) if sh == "b6" else own   # free tiles under the caps of own or own + 1
+    for c, k in zip(FREE[sh], CAP[sh]):
+        if rng.random() < 0.6: b[c] = int(rng.integers(0, max(0, ca - k) + 1))
+    s = int(rng.integers(0, 8)); real = [0] * 16
+    for j in range(16): real[nt.sym_cell(j, s)] = b[j]
+    if 0 in real: boards.append(real)
+net = nt.NTupleNet(patterns=[[0, 1, 2, 3]], tc=False)
+net.block_tier = True
+out = []
+for st in settings:
+    net.block_min_b6, net.block_min_b5 = st.get("min_b6", 0), st.get("min_b5", 0)
+    net.block_b5_first, net.block_far = st.get("b5_first", 0), st.get("far", 0)
+    eng, ref = [], []
+    for real in boards:
+        c0 = nt.block_tier_moves()
+        d = net.best_move(bits(real), depth=1)
+        eng.append(d if nt.block_tier_moves() > c0 else -1)
+        ref.append(_blk_choose_ref(real, loaded, value, after_of, nt.sym_cell, (st.get("min_b6", 0), st.get("min_b5", 0)),
+                                   bool(st.get("b5_first", 0)), st.get("far", 0))[0])
+    out.append({"engine": eng, "ref": ref})
+print(json.dumps(out))
+"""
+
+
+def test_block_chooser_options_match_the_rule(tmp_path):
+    """With per-shape minimum chances, b5 readings first and the far (sound larger table) reading, the tier's choice
+    on random boards holding a block (any orientation) is the plainly written rule's; the defaults choose as
+    before (the same rule with no options), and every option changes some choices."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    for sh, anchors in (("b6", "4,5,6"), ("b5", "4,5")):
+        subprocess.run([sys.executable, str(root / "examples" / "build_endgame.py"), "--block", sh, "--anchors",
+                        anchors, "--threads", "2", "--out", str(tmp_path / sh)], check=True, capture_output=True)
+    settings = [{}, {"min_b6": 0.3, "min_b5": 0.5}, {"b5_first": 1}, {"b5_first": 1, "min_b5": 0.1},
+                {"far": 1}, {"far": 2}, {"far": 1, "b5_first": 1}, {"far": 2, "b5_first": 1, "min_b6": 0.2, "min_b5": 0.1}]
+    r = subprocess.run([sys.executable, "-c", _CHOOSER_CHECK, f"{tmp_path / 'b6'},{tmp_path / 'b5'}",
+                        json.dumps(settings), str(root / "tests"), "7", "1000"],
+                       capture_output=True, text=True, cwd=root)
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    for st, g in zip(settings, got):
+        assert g["engine"] == g["ref"], st
+    diff = lambda i, j: sum(x != y for x, y in zip(got[i]["ref"], got[j]["ref"]))
+    assert sum(d >= 0 for d in got[0]["ref"]) >= 400            # the tier plays most of these boards
+    assert diff(1, 0) >= 50 and diff(3, 0) >= 5                  # the minimum chances turn readings down
+    # Without far, a b5 reading's table is always above any b6 reading's (same orientation: b5 needs r1c2 below
+    # its table, r1c2 >= the b6 anchor; another orientation would need the b6 row 1 and r0c2 inside the b5
+    # block), so b5 first changes nothing; with far a b6 table one above its anchor can tie with b5's.
+    assert diff(2, 0) == 0 and diff(6, 4) >= 4
+    assert diff(4, 0) >= 40 and diff(5, 0) >= 8 and diff(4, 5) >= 30 and diff(7, 0) >= 20
+
+
 # --- macroxue's heuristic for the late game ------------------------------------
 
 def _ref_heur(bits):

@@ -239,6 +239,12 @@ typedef struct net {
     int heur_depth;          /* ... at this depth instead of the game's (0 = the game's; depth caps still apply) */
     int block_tier;          /* block-tier tables (nt_block_load) play boards no ladder table holds (0 = off) */
     int64_t block_from;      /* ... whose tile set (board_scale) is at least this (0 = every board) */
+    float block_min[2];      /* ... a reading of shape sh (0 b6, 1 b5) plays only if its best chance is above this */
+    int block_b5_first;      /* ... 1: every b5 reading before any b6 one (macroxue's order); 0: by table anchor.
+                              * Without block_far the order is the same: a b5 reading's table is always above any
+                              * b6 reading's (b5 needs r1c2 below its table, r1c2 >= the b6 anchor) */
+    int block_far;           /* ... 1: a b6 block reads the largest table that soundly holds it (see blk_reach);
+                              * 2: as 1, but only while it fits its own anchor's caps and is not at its goal */
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -1589,7 +1595,9 @@ static int eg_choose(board_t board, int kmin, int *held_out) {
  * The tier (best_move) plays only boards no ladder table holds: of the regular (orientation, shape) readings
  * whose free tiles fit and which are not already a goal, the one with the largest table anchor (then b6 before
  * b5, then the first orientation) plays its best move, the move made on the real board; if no move has a chance
- * above zero the next reading is tried, then the network search. Chances are never compared across readings. */
+ * above the shape's block_min (default 0) the next reading is tried, then the network search. Chances are never
+ * compared across readings. Options (net_t, all off by default): block_min per shape; block_b5_first (every b5
+ * reading first, then b6; by anchor within a shape); block_far (blk_reach). */
 #define BLK_AMIN 4
 #define BLK_AMAX 15
 static const int blk_nblock[2] = {6, 5}, blk_nfree[2] = {10, 11};
@@ -1611,6 +1619,23 @@ static int blk_anchor(int sh, const uint8_t *b) {
     }
     if (b[5] == b[2] || b[4] <= b[5]) return 0;
     return b[5] < b[2] ? b[5] : b[2];
+}
+
+/* The largest table anchor that soundly holds the block on board b (0: not regular). A table of anchor A assumes
+ * that no free tile ever merges with a block tile: every free cell's cap A - drop must stay below each block tile
+ * the cell can reach (its neighbour, or the first block tile along a row or column through empty free cells).
+ * b6: r0c3 (cap A-1) reaches r0c2, r1c3 (A-2) r1c2, r2c0 (A-1) r1c0, r2c1 (A-2) r1c1, r2c2 (A-3) r1c2; the rest
+ * are dominated (row 3 caps below row 2's), so A <= min(r1c0, r1c1 + 1, r1c2 + 1) (r0c2 > r1c2 already): one
+ * above the anchor when the smallest second-row tile is not at r1c0. b5: r1c2 (cap A-1) touches both r1c1 and
+ * r0c2, so A <= min(r1c1, r0c2) = the anchor: no larger table is ever sound. Under the bound the game on the free
+ * cells is the table's game exactly, so the value read is the true chance of that table's (farther) goal. */
+static int blk_reach(int sh, const uint8_t *b) {
+    int a = blk_anchor(sh, b);
+    if (sh || !a) return a;
+    int r = b[4];
+    if (b[5] + 1 < r) r = b[5] + 1;
+    if (b[6] + 1 < r) r = b[6] + 1;
+    return r;
 }
 
 static int blk_goal(int sh, const uint8_t *b, int a) {
@@ -1664,7 +1689,7 @@ static int blk_table(int sh, int a) {                      /* the largest loaded
     return 0;
 }
 
-static int blk_choose(board_t board) {
+static int blk_choose(const net_t *n, board_t board) {
     uint8_t c[16];
     for (int i = 0; i < 16; i++) c[i] = (uint8_t)cell(board, i);
     int key[16], nc = 0;                                    /* readings, best first: (BLK_AMAX - a, shape, s) */
@@ -1672,15 +1697,16 @@ static int blk_choose(board_t board) {
         uint8_t o[16];
         for (int i = 0; i < 16; i++) o[i] = c[sym_cell(i, s)];
         for (int sh = 0; sh < 2; sh++) {
-            int a = blk_table(sh, blk_anchor(sh, o));
+            int own = blk_anchor(sh, o), a = blk_table(sh, n->block_far ? blk_reach(sh, o) : own);
             if (!a || !blk_fits(sh, o, a) || blk_goal(sh, o, a)) continue;
-            int k = ((BLK_AMAX - a) << 8) | (sh << 4) | s, i = nc++;
+            if (n->block_far == 2 && a > own && (!blk_fits(sh, o, own) || blk_goal(sh, o, own))) continue;
+            int k = ((n->block_b5_first ? 1 - sh : 0) << 12) | ((BLK_AMAX - a) << 8) | (sh << 4) | s, i = nc++;
             while (i > 0 && key[i - 1] > k) { key[i] = key[i - 1]; i--; }
             key[i] = k;
         }
     }
     for (int q = 0; q < nc; q++) {
-        int a = BLK_AMAX - (key[q] >> 8), sh = (key[q] >> 4) & 15, s = key[q] & 15;
+        int a = BLK_AMAX - ((key[q] >> 8) & 15), sh = (key[q] >> 4) & 15, s = key[q] & 15;
         int best_dir = -1;
         float best_v = 0.0f;
         for (int d = 0; d < 4; d++) {                            /* each move, made on the real board */
@@ -1698,7 +1724,7 @@ static int blk_choose(board_t board) {
             float v = blk_goal(sh, t, a) ? 1.0f : blk_after(sh, a, t);
             if (v > best_v) { best_v = v; best_dir = d; }
         }
-        if (best_dir >= 0) {
+        if (best_dir >= 0 && best_v > n->block_min[sh]) {
             __atomic_fetch_add(&blk_count, 1, __ATOMIC_RELAXED);
             return best_dir;
         }
@@ -2102,6 +2128,13 @@ void nt_set_block_tier(void *p, int on) { ((net_t *)p)->block_tier = on != 0; }
 int nt_get_block_tier(void *p) { return ((net_t *)p)->block_tier; }
 void nt_set_block_from(void *p, int64_t scale) { ((net_t *)p)->block_from = scale < 0 ? 0 : scale; }
 int64_t nt_get_block_from(void *p) { return ((net_t *)p)->block_from; }
+/* Chooser options (see the block tier): set between searches. */
+void nt_set_block_min(void *p, int sh, float v) { if (sh >= 0 && sh <= 1) ((net_t *)p)->block_min[sh] = v > 0.0f ? v : 0.0f; }
+float nt_get_block_min(void *p, int sh) { return sh >= 0 && sh <= 1 ? ((net_t *)p)->block_min[sh] : -1.0f; }
+void nt_set_block_b5_first(void *p, int on) { ((net_t *)p)->block_b5_first = on != 0; }
+int nt_get_block_b5_first(void *p) { return ((net_t *)p)->block_b5_first; }
+void nt_set_block_far(void *p, int mode) { ((net_t *)p)->block_far = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+int nt_get_block_far(void *p) { return ((net_t *)p)->block_far; }
 
 /* The board the search evaluates for the root b: downgraded (see downgrade) while it holds the network's threshold
  * tile and the stage rule allows. */
@@ -2340,7 +2373,7 @@ static int best_move(search_ctx_t *c, board_t b, int depth) {
     }
     if (c->net->block_tier && !held &&                        /* a block-tier table, when no ladder table holds it */
         (!c->net->block_from || board_scale(b) >= c->net->block_from)) {
-        int d = blk_choose(b);
+        int d = blk_choose(c->net, b);
         if (d >= 0) return d;
     }
     board_t real = b;

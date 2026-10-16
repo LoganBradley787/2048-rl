@@ -2210,14 +2210,23 @@ def _turn(bits, s):
 
 def _ref_heur_move(bits, depth, prune=False):
     """The heuristic search by its definition: oriented afterstates, no merge points, a loss at -2**22 (or, with
-    prune, macroxue's pass score and loss value beside his tables)."""
+    prune, macroxue's pass score and loss value beside his tables; prune="big": his big build's rules, pruning only
+    when the root scores at least twice the largest tile's score, and an unpruned search again when the best move
+    scores below 0)."""
     s = _ref_orient(bits)
     top = max(nt.cell(bits, i) for i in range(16))
     ts = top << top
     pass_, lost = -np.inf, -float(1 << 22)
     if prune:
-        pass_ = -np.inf if _ref_heur(_turn(bits, s)) < 0 else 2.0 * ts
+        pass_ = -np.inf if _ref_heur(_turn(bits, s)) < (2.0 * ts if prune == "big" else 0) else 2.0 * ts
         lost = -float(max(1 << 17, 2 * ts))
+    best, best_v = _ref_heur_root(bits, s, depth, pass_, lost)
+    if prune == "big" and best >= 0 and best_v < 0:
+        best, best_v = _ref_heur_root(bits, s, depth, -np.inf, -float(1 << 22))
+    return best
+
+
+def _ref_heur_root(bits, s, depth, pass_, lost):
 
     def chance(after, depth):
         v = float(_ref_heur(after))
@@ -2241,7 +2250,7 @@ def _ref_heur_move(bits, depth, prune=False):
             v = chance(_turn(nb, s), depth)
             if best_v is None or v > best_v:
                 best, best_v = d, v
-    return best
+    return best, best_v
 
 
 def _late_boards(rng, count, empties=4, ordered=False):
@@ -2288,16 +2297,34 @@ def test_heuristic_orientation_puts_the_largest_tile_at_the_top_left():
     assert nt.cell(o, 0) == 15 and nt.cell(o, 1) == 14     # the 16384 along the first row, not down the column
 
 
-@pytest.mark.parametrize("prune", [False, True])
+@pytest.mark.parametrize("prune", [False, True, "big"])
 def test_heuristic_late_search_is_the_plain_expectimax_over_the_heuristic(prune):
     n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)
-    n.heuristic_late, n.heuristic_prune = True, prune
-    assert n.heuristic_late and n.heuristic_prune == prune
+    n.heuristic_late, n.heuristic_prune = True, bool(prune)
+    if prune == "big":
+        nt.lib().nt_set_heur(n._h, 1, 2)               # his big build's rules, orientation turned per move
     rng = np.random.default_rng(33)
     for b in _late_boards(rng, 24) + _late_boards(rng, 24, ordered=True):
         assert n.best_move(b, depth=1) == _ref_heur_move(b, 1, prune)
     for b in _late_boards(rng, 2, empties=3) + _late_boards(rng, 2, empties=3, ordered=True):
         assert n.best_move(b, depth=2) == _ref_heur_move(b, 2, prune)
+    n.close()
+
+
+def test_heuristic_big_rules_differ_from_the_small_ones_where_they_should():
+    """His big build's rules (prune mode 2) match the reference on crowded late boards, and on some of them choose
+    another move than the small build's rules (the root is not healthy enough to prune, or the search is redone)."""
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7]], tc=False)
+    n.heuristic_late = True
+    nt.lib().nt_set_heur(n._h, 1, 2)
+    differ = 0
+    for seed in (41, 43, 44, 50):
+        rng = np.random.default_rng(seed)
+        for b in _late_boards(rng, 30, empties=2) + _late_boards(rng, 30, empties=2, ordered=True):
+            m = n.best_move(b, depth=1)
+            assert m == _ref_heur_move(b, 1, "big")
+            differ += m != _ref_heur_move(b, 1, True)
+    assert differ > 0
     n.close()
 
 

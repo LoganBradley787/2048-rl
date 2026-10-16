@@ -2293,7 +2293,9 @@ static int heur_best(search_ctx_t *c, board_t b, int depth) {
     heur_t h = {(board_t)0x80 << 120, -HUGE_VAL, -(double)(1 << 22)};
     if (c->net->heur_prune) {
         double ts = (double)((int64_t)top << top);
-        int open = heur_score(sym_board(b, s)) < 0.0;
+        /* 1: his small build's rule (prune unless the root scores below 0); 2: his big build's (prune only when the
+         * root scores at least twice the largest tile's score) */
+        int open = heur_score(sym_board(b, s)) < (c->net->heur_prune == 2 ? 2.0 * ts : 0.0);
         h.pass = open ? -HUGE_VAL : 2.0 * ts;
         h.lost = -fmax((double)(1 << 17), 2.0 * ts);
         h.tag = (board_t)(0xC0 | (open ? 0x20 : 0) | top) << 120;
@@ -2307,13 +2309,24 @@ static int heur_best(search_ctx_t *c, board_t b, int depth) {
         double v = heur_chance(c, &h, sym_board(a, s), depth, 1.0);
         if (best < 0 || v > bestv) { bestv = v; best = d; }
     }
+    if (c->net->heur_prune == 2 && best >= 0 && bestv < 0.0) {   /* big build: in trouble, search again unpruned */
+        heur_t h0 = {(board_t)0x80 << 120, -HUGE_VAL, -(double)(1 << 22)};
+        best = -1;
+        for (int d = 0; d < 4; d++) {
+            int r;
+            board_t a = do_move(b, d, &r);
+            if (a == b) continue;
+            double v = heur_chance(c, &h0, sym_board(a, s), depth, 1.0);
+            if (best < 0 || v > bestv) { bestv = v; best = d; }
+        }
+    }
     return best;
 }
 
 /* Not for use while games are being played on other threads. */
 void nt_set_heur(void *p, int on, int prune) {
     ((net_t *)p)->heur = on < 0 ? 0 : on > 3 ? 3 : on;   /* 1: turned per move, 2: as given, 3: turned once a game */
-    ((net_t *)p)->heur_prune = prune != 0;
+    ((net_t *)p)->heur_prune = prune < 0 ? 0 : prune > 2 ? 2 : prune;   /* 2: his big build's rules */
 }
 int nt_get_heur(void *p, int *prune) { *prune = ((net_t *)p)->heur_prune; return ((net_t *)p)->heur; }
 void nt_set_heur_depth(void *p, int depth) { ((net_t *)p)->heur_depth = depth < 0 ? 0 : depth; }

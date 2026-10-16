@@ -876,17 +876,19 @@ class NTupleNet:
         self._lib.nt_set_heur_depth(self._h, int(depth))
 
     @property
-    def heuristic_prune(self) -> bool:
+    def heuristic_prune(self):
         """With `heuristic_late`: macroxue's settings beside his own tables rather than without them. Spawn
         nodes scoring below twice the largest tile's score (r << r for a tile 2**r) are not searched further,
-        unless the root itself scores below 0, and a loss is worth -max(2**17, twice that score)."""
+        unless the root itself scores below 0, and a loss is worth -max(2**17, twice that score). "big": his big
+        build's rules: prune only when the root scores at least twice that score, and when the best move scores
+        below 0, search again without pruning. False, True or "big"."""
         prune = ctypes.c_int(0)
         self._lib.nt_get_heur(self._h, ctypes.byref(prune))
-        return bool(prune.value)
+        return {0: False, 1: True, 2: "big"}[prune.value]
 
     @heuristic_prune.setter
-    def heuristic_prune(self, on: bool) -> None:
-        self._lib.nt_set_heur(self._h, self._heur_mode()[0], int(bool(on)))
+    def heuristic_prune(self, on) -> None:
+        self._lib.nt_set_heur(self._h, self._heur_mode()[0], 2 if on == "big" else int(bool(on)))
 
     @property
     def deep(self) -> tuple[int, list[int]]:

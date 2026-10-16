@@ -105,8 +105,9 @@ def main(argv=None) -> None:
     p.add_argument("--heuristic", choices=["off", *nt.HEURISTIC_ORIENTATIONS], default="off",
                    help="late boards (a 32768 and a 16384, or a 65536 and up) searched with macroxue's hand-written "
                         "heuristic, the board turned per move (turn), as it stands (own) or once per game (sticky)")
-    p.add_argument("--heuristic-prune", action="store_true",
-                   help="with --heuristic: macroxue's pruning and loss value (his settings beside his tables)")
+    p.add_argument("--heuristic-prune", nargs="?", const="small", choices=["small", "big"], default=None,
+                   help="macroxue's pruning beside his tables; 'big': his big build's rules (prune only from a healthy "
+                        "root, search again unpruned when the best move scores below 0)")
     p.add_argument("--heuristic-depth", type=int, default=0,
                    help="with --heuristic: search the late boards this deep (0 = --depth; --depth-caps still apply)")
     p.add_argument("--block-dir", action="append", default=None,
@@ -142,7 +143,7 @@ def main(argv=None) -> None:
                                                                 for d in args.endgame_dir), "weights": str(path), "games": args.games,
                 # off = absent, so files written before these options existed still match
                 "heuristic": None if args.heuristic == "off" else args.heuristic,
-                "heuristic_prune": args.heuristic_prune or None, "heuristic_depth": args.heuristic_depth or None,
+                "heuristic_prune": {"small": True, "big": "big"}.get(args.heuristic_prune), "heuristic_depth": args.heuristic_depth or None,
                 "block_dir": args.block_dir,
                 "block_tables": args.block_dir and " | ".join((Path(d) / "block.txt").read_text().strip()
                                                               for d in args.block_dir),
@@ -183,7 +184,8 @@ def main(argv=None) -> None:
     net.block_tier, net.block_tier_from = bool(args.block_dir), args.block_from
     if args.heuristic != "off":
         net.heuristic_orientation = args.heuristic
-        net.heuristic_late, net.heuristic_prune, net.heuristic_depth = True, args.heuristic_prune, args.heuristic_depth
+        net.heuristic_late, net.heuristic_depth = True, args.heuristic_depth
+        net.heuristic_prune = {"small": True, "big": "big"}.get(args.heuristic_prune, False)
     net.depth_caps = caps
     if args.tt_bits:
         net.tt_bits = args.tt_bits

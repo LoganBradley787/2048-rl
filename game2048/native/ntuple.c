@@ -2053,7 +2053,7 @@ static double heur_max(search_ctx_t *c, const heur_t *h, board_t b, int depth, d
  * twice the largest tile's score are not searched further, unless the root itself scores below 0. */
 static int heur_best(search_ctx_t *c, board_t b, int depth) {
     pthread_once(&heur_once, heur_init);
-    int s = heur_orient(b), top = max_exp(b);
+    int s = c->net->heur == 2 ? 0 : heur_orient(b), top = max_exp(b);   /* 2: the board's own orientation */
     heur_t h = {(board_t)0x80 << 120, -HUGE_VAL, -(double)(1 << 22)};
     if (c->net->heur_prune) {
         double ts = (double)((int64_t)top << top);
@@ -2075,7 +2075,10 @@ static int heur_best(search_ctx_t *c, board_t b, int depth) {
 }
 
 /* Not for use while games are being played on other threads. */
-void nt_set_heur(void *p, int on, int prune) { ((net_t *)p)->heur = on != 0; ((net_t *)p)->heur_prune = prune != 0; }
+void nt_set_heur(void *p, int on, int prune) {
+    ((net_t *)p)->heur = on < 0 ? 0 : on > 2 ? 2 : on;             /* 1: turned per move (heur_orient), 2: as given */
+    ((net_t *)p)->heur_prune = prune != 0;
+}
 int nt_get_heur(void *p, int *prune) { *prune = ((net_t *)p)->heur_prune; return ((net_t *)p)->heur; }
 
 static int best_move(search_ctx_t *c, board_t b, int depth) {

@@ -24,6 +24,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evaluate_games as eg  # noqa: E402
+import rules2048  # noqa: E402
 
 from game2048 import ntuple as nt  # noqa: E402
 
@@ -62,6 +63,9 @@ def verify(settings: dict, game: int, trace_path: Path, net: nt.NTupleNet | None
     rules = eg.check_rules(trace["boards"], trace["dirs"], int(trace["score"]))
     if rules:
         problems.append(f"against the rules: {rules}")
+    own_rules = rules2048.check_trace(trace["boards"], trace["dirs"], int(trace["score"]))   # shares no engine code
+    if own_rules:
+        problems.append(f"against the rules (independent check): {own_rules}")
     p = argparse.ArgumentParser()
     eg.add_play_args(p)
     args = p.parse_args(eg.args_from_settings(settings))
@@ -90,7 +94,7 @@ def verify(settings: dict, game: int, trace_path: Path, net: nt.NTupleNet | None
             f"{len(trace['boards']) - 1} moves ({trace_path}; played again in {time.time() - t:.0f} s)")
     if problems:
         return False, "FAIL " + head + "\n  " + "\n  ".join(problems)
-    return True, "OK " + head + ": every board and move the same, and every move legal"
+    return True, "OK " + head + ": every board and move the same, and every move legal (two independent rule checks)"
 
 
 def main(argv=None) -> int:

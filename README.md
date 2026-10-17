@@ -10,7 +10,7 @@ Three results:
 
 - **A record game: 1,714,564 points.** One game, played start to finish by the
   player here, ended with 65536, 32768, 16384 and 4096 on the board. The best
-  single game we know of before it is macroxue's 1,704,908. The player uses
+  single game I know of before it is macroxue's 1,704,908. The player uses
   the v2 networks below until late in the game, then a hand-written search
   and exact endgame tables. The game can be [checked and played
   again](#the-record-player-v3) move for move.
@@ -175,8 +175,8 @@ replace them.
   a board by how steadily the tiles fall away from one corner along rows and
   columns, with a heavy penalty for a large tile behind a smaller one. The
   scoring, the block shapes and the idea of tables for them come from
-  [macroxue/2048-ai](https://github.com/macroxue/2048-ai); the code here is
-  written from scratch.
+  [macroxue/2048-ai](https://github.com/macroxue/2048-ai); I wrote the code
+  here from scratch.
 
 ### Cool mode
 

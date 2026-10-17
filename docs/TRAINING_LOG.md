@@ -223,7 +223,7 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
 ### 19. Rehearsal of stage 2 (10 October, Colab)
 
 - **What:** the whole second-stage pipeline, with the network released with
-  TDL2048 (Guei's own single-stage network) standing in for our stage 1, which
+  TDL2048 (Guei's own single-stage network) standing in for my stage 1, which
   is not finished: 200,000 boards collected where it first makes a 16384, a
   second network trained from those boards with its own optimistic start, the
   two joined, and the result evaluated.

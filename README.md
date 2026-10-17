@@ -28,6 +28,11 @@ Three results:
 
 For scale: a person who reaches the 2048 tile once has about 20,000 points.
 
+<img src="docs/images/record-board.png" alt="The last board of the record game on the web page: 65536, 32768, 16384, 4096, 2048 and 1024 among smaller tiles, with 1,714,564 points" width="380">
+
+*The last board of the record game, game 3049, on the web page: 1,714,564
+points after 55,903 moves.*
+
 ![The snake agent playing a whole cool-mode game, sped up](docs/images/snake-cool-mode.gif)
 
 *The `snake` agent playing one cool-mode game from the first tile to the

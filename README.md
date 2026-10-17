@@ -6,8 +6,14 @@ AI players for 2048, written from scratch: the game, a C engine that learns
 it by playing against itself, the searches that go with it, and a web page
 where you can watch them or play yourself.
 
-Two results:
+Three results:
 
+- **A record game: 1,714,564 points.** One game, played start to finish by the
+  player here, ended with 65536, 32768, 16384 and 4096 on the board. The best
+  single game we know of before it is macroxue's 1,704,908. The player uses
+  the v2 networks below until late in the game, then a hand-written search
+  and exact endgame tables. The game can be [checked and played
+  again](#the-record-player-v3) move for move.
 - **The normal game.** Two networks of lookup tables trained by self-play
   average **589,335 points** over 1,000 games and reach the 32768 tile in 62%
   of them. That is level with the best published player that learns the game
@@ -150,6 +156,28 @@ When it plays, the search also uses *tile downgrading* once the board holds a
 tile above it, and chooses its move on that smaller, more familiar board. The
 two boards allow exactly the same merges.
 
+### The late game
+
+Once the board holds a 32768 and a 16384, the networks hand over, because
+they have seen too few such boards to tell good ones from bad. Two things
+replace them.
+
+- **Endgame tables for a block of large tiles.** Strong play keeps the
+  largest tiles packed in a corner and builds the next one beside them. For
+  two shapes of block (two rows of three in the corner, and three along the
+  edge with two below), `examples/build_endgame.py --block` solves exactly,
+  for every arrangement of the small tiles around the block, the chance of
+  building the next tile and the move that gives the best chance. The largest
+  tables hold 21.8 billion positions at one byte each. When the board matches
+  a table in any of its eight orientations, the player plays the table's
+  move. That covers about 70% of the late moves.
+- **A hand-written search** for every other board, four moves deep. It scores
+  a board by how steadily the tiles fall away from one corner along rows and
+  columns, with a heavy penalty for a large tile behind a smaller one. The
+  scoring, the block shapes and the idea of tables for them come from
+  [macroxue/2048-ai](https://github.com/macroxue/2048-ai); the code here is
+  written from scratch.
+
 ### Cool mode
 
 When you place the tiles yourself there is no luck left, and the game becomes
@@ -225,14 +253,45 @@ downgrading they report 563,316 over 10,000 games where this table has
 search, inside the error bars on both lines. Their best figure, 625,377 over
 100 games, is at a search three levels deeper than any run here.
 
-No game here has made a 65536. The best ones end near 840,000 points, which
-is a board holding every tile from 32768 down. Programs built on search and
-exact endgame tables instead of learning do get there:
+Alone, these networks never made a 65536. Their best games end near 840,000
+points, a board holding every tile from 32768 down. Programs built on search
+and exact endgame tables do get there:
 [macroxue/2048-ai](https://github.com/macroxue/2048-ai) averages 711,769 at
-its deepest search and reports a single game of 1,704,908.
+its deepest search and reports a single game of 1,704,908. The record player
+below adds that kind of late game to these networks.
 
 The two networks took four training runs and 107 hours:
 [docs/TRAINING_LOG.md](docs/TRAINING_LOG.md), runs 14 and 20 to 22.
+
+### The record player (v3)
+
+The v2 networks at depth 2 with tile downgrading, and [the late
+game](#the-late-game) from the first board holding a 32768 and a 16384.
+20,000 games (seed 6300):
+
+| Mean score | Median | Best game | Reach 16384 | Reach 32768 | Reach 65536 |
+| --- | --- | --- | --- | --- | --- |
+| 574,188 ± 2,986 | 620,860 | **1,714,564** | 96.9% | 57.8% | 1.5% |
+
+The best game is game 3049, 55,903 moves:
+
+```
+    16      4      2      4
+   512    256    128     32
+ 16384   4096   1024     64
+ 65536  32768   2048      2
+```
+
+Its moves, its settings and the checksums of the tables are attached to the
+[v3.0 release](https://github.com/LoganBradley787/2048-rl/releases/tag/v3.0).
+`examples/rules2048.py`, which shares no code with the engine, checks the
+game against the rules. `examples/verify_game.py` plays it again from its
+seed with the v2 weights and the tables (about 1.5 hours to build, 42 GB).
+It has been played again on an Intel laptop and an AMD server and came out
+the same, move for move.
+
+Measured over many games, about one in 100,000 should beat 1,704,908. This
+one came early.
 
 ### Download the trained player
 

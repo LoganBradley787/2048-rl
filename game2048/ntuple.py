@@ -202,6 +202,9 @@ def lib() -> ctypes.CDLL:
     L.nt_train.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(i64), P(i32), P(i32)]
     L.nt_train_from.argtypes = [vp, ctypes.c_long, i32, f32, f32, u64, P(u64), ctypes.c_long, P(i64), P(i32), P(i32)]
     L.nt_collect.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, i64, P(ctypes.c_uint8), P(i64)]
+    L.nt_collect_from.argtypes = [vp, P(u64), ctypes.c_long, i32, f64, i32, u64, i64, P(ctypes.c_uint8), P(i64)]
+    L.nt_set_stop.argtypes = [vp, i64, f32, vp]
+    L.nt_get_stop_scale.argtypes, L.nt_get_stop_scale.restype = [vp], i64
     L.nt_stack.argtypes, L.nt_stack.restype = [P(vp), i32, P(i64)], vp
     L.nt_best_move.argtypes, L.nt_best_move.restype = [vp, u64, u64, i32, f64], i32
     L.nt_search_value.argtypes, L.nt_search_value.restype = [vp, u64, u64, i32, f64], f64
@@ -711,6 +714,30 @@ class NTupleNet:
                              int(tile), cells.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), scores)
         reached = cells.any(axis=1)
         return cells[reached].reshape(-1, 4, 4), np.ctypeslib.as_array(scores).copy()[reached]
+
+    def collect_from(self, boards, tile: int, depth: int = 0, cutoff: float = 0.0, threads: int = 1,
+                     seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """As `collect_starts`, but game i continues from boards[i] (bitboards, or (n, 4, 4) exponent grids).
+        Returns (grids, reached): the first board holding `tile` of each game that got there, and which did."""
+        packed, n = boards if isinstance(boards, tuple) else pack_starts(boards)
+        cells = np.zeros((n, 16), dtype=np.uint8)
+        scores = (ctypes.c_int64 * max(n, 1))()
+        self._lib.nt_collect_from(self._h, packed, n, int(depth), float(cutoff), threads, seed & 0xFFFFFFFFFFFFFFFF,
+                                  int(tile), cells.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), scores)
+        reached = cells.any(axis=1)
+        return cells[reached].reshape(-1, 4, 4), reached
+
+    def set_stop(self, scale: int, bonus: float = 0.0, frozen: "NTupleNet | None" = None) -> None:
+        """Training (single stage, not with `expect_target`): every game ends at its first afterstate whose
+        tile set reaches `scale` (read as a stage boundary is; 0 = never), and that afterstate is worth
+        `bonus` plus `frozen`'s value of it after tile downgrading. The frozen network must outlive training.
+        Set it between calls."""
+        self._stop_net = frozen
+        self._lib.nt_set_stop(self._h, int(scale), float(bonus), frozen._h if frozen is not None else None)
+
+    @property
+    def stop_scale(self) -> int:
+        return int(self._lib.nt_get_stop_scale(self._h))
 
     @property
     def snake_decay(self) -> float:

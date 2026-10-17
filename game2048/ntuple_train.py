@@ -112,6 +112,13 @@ def main(argv=None) -> None:
                    help="with --starts: weights of the earlier stage, so evaluations play whole games (implied on resume)")
     p.add_argument("--stage-tile", type=int, default=16384,
                    help="with --base: the tile from which this network takes over")
+    p.add_argument("--stop-scale", type=int, default=0,
+                   help="end every training game at its first afterstate whose tile set reaches this (read as a stage "
+                        "boundary: 49152 = a 32768 and a 16384); 0 = play games to the end")
+    p.add_argument("--stop-bonus", type=float, default=0.0, help="with --stop-scale: worth added to the stopping afterstate")
+    p.add_argument("--stop-net", default=None,
+                   help="with --stop-scale: frozen weights whose value (after tile downgrading) the stopping afterstate "
+                        "is worth, so this stage's values stay on the scale of the stages around it")
     p.add_argument("--eval-prefix", type=int, default=0,
                    help="choose-mode evaluations: kind random spawns for this many moves first (games still "
                         "funnel into one line, so 2 eval games are enough)")
@@ -145,6 +152,15 @@ def main(argv=None) -> None:
     if packed:
         print(f"{packed[1]} saved boards; every game begins from one and its score counts from there", flush=True)
     base = nt.NTupleNet.load(args.base, keep_tc=False) if args.base and not choose else None
+    if args.resume and not args.stop_scale and state.get("stop_scale"):   # a stopping run keeps its stop when resumed
+        args.stop_scale, args.stop_bonus, args.stop_net = state["stop_scale"], state["stop_bonus"], state["stop_net"]
+    stop_net = None
+    if args.stop_scale:
+        if choose or net.boundaries or args.expect_target:
+            p.error("--stop-scale is for single-stage runs without --expect-target")
+        stop_net = nt.NTupleNet.load(args.stop_net, keep_tc=False) if args.stop_net else None
+        net.set_stop(args.stop_scale, args.stop_bonus, stop_net)
+        print(f"games stop at tile set {args.stop_scale}, worth {args.stop_bonus:g} + {args.stop_net or 'nothing'}", flush=True)
     if args.expect_target:
         if choose or net.boundaries:
             p.error("--expect-target is for single-stage runs on the normal game")
@@ -185,7 +201,9 @@ def main(argv=None) -> None:
                                           "eval_prefix": args.eval_prefix, "explore": args.explore,
                                           "starts": args.starts, "start_frac": args.start_frac if starts else 0.0,
                                           "base": args.base, "stage_tile": args.stage_tile if base else 0,
-                                          "expect_target": bool(args.expect_target)}))
+                                          "expect_target": bool(args.expect_target),
+                                          "stop_scale": args.stop_scale, "stop_bonus": args.stop_bonus,
+                                          "stop_net": args.stop_net}))
         os.replace(state_tmp, state_path)
 
     def evaluate() -> None:

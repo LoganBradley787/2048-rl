@@ -2744,3 +2744,32 @@ def test_heuristic_from_moves_where_the_heuristic_takes_over():
     n.heuristic_from = 0
     assert [n.best_move(b, depth=1) for b in mid] == net_mid
     n.close()
+
+
+def test_collect_from_continues_each_saved_board():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(300, threads=1, seed=1, alpha_plain=0.1)
+    starts, _ = n.collect_starts(40, tile=32, depth=0, threads=2, seed=5)
+    got, reached = n.collect_from(starts, tile=64, threads=2, seed=3)
+    assert len(reached) == len(starts) and reached.sum() == len(got) > 0
+    assert all(g.max() == 6 for g in got)
+    again, _ = n.collect_from(starts, tile=64, threads=1, seed=3)
+    assert (again == got).all()                                  # the seed fixes the games, not the thread count
+    there, r2 = n.collect_from(starts, tile=32, threads=1, seed=3)
+    assert r2.all() and (there == starts).all()                  # already at the tile: the board itself
+    n.close()
+
+
+def test_set_stop_ends_training_games_at_the_scale_worth_the_bonus():
+    pats = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]]
+    free, stop = nt.NTupleNet(patterns=pats, tc=False), nt.NTupleNet(patterns=pats, tc=False)
+    whole = free.train(200, threads=1, seed=2, alpha_plain=0.1)
+    stop.set_stop(64, bonus=5000.0)
+    assert stop.stop_scale == 64
+    short = stop.train(200, threads=1, seed=2, alpha_plain=0.1)
+    assert short["max_tiles"].max() <= 64 and short["moves"].mean() < whole["moves"].mean()
+    stop.train(3000, threads=1, seed=3, alpha_plain=0.1)
+    assert stop.value(nt.to_bits(board_with([32, 16, 8, 4]))) > 1000      # the bonus flows back from the stop
+    stop.set_stop(0)
+    assert stop.stop_scale == 0
+    free.close(); stop.close()

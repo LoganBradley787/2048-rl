@@ -4,8 +4,8 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-16, 16:45. No training has run since run 26; the work
-since then has been search and endgame tables, which are not training; the
+Last updated 2026-10-17, 16:40. Runs 27 to 29 are running. Between run 26 and
+them the work was search and endgame tables, which are not training; the
 tables' build time is listed under Endgame tables.
 
 ## Totals so far
@@ -358,6 +358,24 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   4,674, so just at the edge of the noise, with a 32768 in 58.1% against 57.7%
   and a 65536 in 0.16% against 0.20%. Too small a gain to switch; v2 stays the
   player.
+
+### 27, 28 and 29. Stage 3, from the first 32768 to the hand-over (17 October, Colab, running)
+
+- **What:** a third network for boards that hold a 32768 but not yet a
+  16384, the stretch where the record player's games are most often lost
+  before the late game takes over. Until now the second network played these
+  boards through tile downgrading, as if the 32768 were a 16384. The new
+  network starts as an exact copy of that: every table entry for a 32768 is
+  set to the entry for a 16384, and on 300 test boards the three-stage player
+  made the same move as v2 on every one. It then learns with plain TD (step
+  0.025) from boards where a game of v2 without search first made a 32768.
+  Each training game ends at the first board holding a 32768 and a 16384,
+  which is worth v2's own value for it plus a bonus: 0 in run 27, 500,000 in
+  run 28 and 2,000,000 in run 29. The bonus rewards reaching that board for
+  its own sake, since the late game, not the network, plays from there.
+- **On:** three Colab high-RAM CPU machines (8 vCPUs), one run each. Each
+  collects its own starting boards for an hour, then trains for 2.5 hours.
+- **Outcome:** to come.
 
 ## Endgame tables
 

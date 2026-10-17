@@ -249,6 +249,10 @@ typedef struct net {
                               * 2: as 1, but only while it fits its own anchor's caps and is not at its goal */
     int block_loose;         /* ... 1: a b6 block may have r0c2 below r1c2 (not equal, and at least the anchor so
                               * that r0c3, cap anchor-1, cannot merge into it): macroxue's big build's rule */
+    int64_t stop_scale;      /* training: a game ends at the first afterstate whose tile set (board_scale) is at least
+                              * this (0 = never), worth stop_bonus + stop_net's value of it (tile-downgraded) */
+    float stop_bonus;
+    const struct net *stop_net;
 } net_t;
 
 static inline size_t tt_hash(const search_ctx_t *c, board_t b) { return (size_t)(hash128(b) >> (64 - c->bits)); }
@@ -779,11 +783,24 @@ static float expected_target(const net_t *net, board_t after) {
 
 float nt_expected_target(void *p, uint64_t lo, uint64_t hi) { return expected_target((net_t *)p, mk(lo, hi)); }
 
+/* Not for use while games are being played on other threads. Single-stage training only; not with expect.
+ * frozen: a network (any stages) whose value, after tile downgrading, the stopping afterstate is worth; or NULL. */
+void nt_set_stop(void *p, int64_t scale, float bonus, void *frozen) {
+    net_t *net = (net_t *)p;
+    net->stop_scale = scale < 0 ? 0 : scale;
+    net->stop_bonus = bonus;
+    net->stop_net = (const net_t *)frozen;
+}
+int64_t nt_get_stop_scale(void *p) { return ((net_t *)p)->stop_scale; }
+
 /* Not for use while games are being played on other threads. Single-stage networks only. */
 void nt_set_expect(void *p, int on) { ((net_t *)p)->expect = on != 0; }
 int nt_get_expect(void *p) { return ((net_t *)p)->expect; }
 
-/* start: the board a game begins from, or 0 for a new game (two random tiles). */
+static board_t downgrade(board_t b);
+
+/* start: the board a game begins from, or 0 for a new game (two random tiles). With stop_scale, the game ends
+ * at the first afterstate that reaches it: that afterstate and the one before learn its fixed worth instead. */
 static void learn_game_single(net_t *net, board_t start, float alpha, float alpha_plain, uint64_t *rng, int64_t *score, int32_t *maxtile, int32_t *nmoves) {
     const size_t fbytes = sizeof(uint32_t) * (size_t)net->K * 8;
     uint32_t idx[4][MAX_FEATS], pidx[MAX_FEATS];
@@ -806,6 +823,15 @@ static void learn_game_single(net_t *net, board_t start, float alpha, float alph
             float va = feat_value(net, idx[d]);
             float v = (float)r[d] + va;
             if (best < 0 || v > bestv) { bestv = v; best = d; bestval = va; }
+        }
+        if (best >= 0 && net->stop_scale && board_scale(after[best]) >= net->stop_scale) {
+            float worth = net->stop_bonus + (net->stop_net ? net_value(net->stop_net, downgrade(after[best])) : 0.0f);
+            if (have_prev) feat_update(net, pidx, (float)r[best] + worth - feat_value(net, pidx), alpha, alpha_plain);
+            feat_update(net, idx[best], worth - feat_value(net, idx[best]), alpha, alpha_plain);
+            sc += r[best];
+            mv++;
+            b = after[best];
+            break;
         }
         if (have_prev && net->expect) {          /* every outcome of the previous afterstate, this one included */
             float target = expected_target(net, pafter);
@@ -2698,6 +2724,7 @@ typedef struct {
     uint64_t seed;
     uint8_t *cells;
     int64_t *scores;
+    const board_t *starts;   /* game g begins from starts[g] instead of two random tiles (NULL = new games) */
 } collect_job_t;
 
 static void *collect_worker(void *arg) {
@@ -2707,7 +2734,7 @@ static void *collect_worker(void *arg) {
         long g = __atomic_fetch_add(j->next, 1, __ATOMIC_RELAXED);
         if (g >= j->n) break;
         uint64_t rng = game_seed(j->seed, g);
-        board_t b = spawn(spawn(0, &rng), &rng);
+        board_t b = j->starts ? j->starts[g] : spawn(spawn(0, &rng), &rng);
         int64_t sc = 0;
         ctx_new_game(c);
         while (board_scale(b) < j->scale) {
@@ -2731,8 +2758,20 @@ void nt_collect(void *p, long games, int depth, double cutoff, int threads, uint
                 uint8_t *cells, int64_t *scores) {
     long next = 0;
     memset(cells, 0, (size_t)games * 16);
-    collect_job_t job = {(net_t *)p, depth, scale, cutoff, &next, games, seed, cells, scores};
+    collect_job_t job = {(net_t *)p, depth, scale, cutoff, &next, games, seed, cells, scores, NULL};
     run_workers(collect_worker, &job, threads);
+}
+
+/* As nt_collect, but game g continues from saved board g (starts_lohi: (lo, hi) pairs). */
+void nt_collect_from(void *p, const uint64_t *starts_lohi, long games, int depth, double cutoff, int threads,
+                     uint64_t seed, int64_t scale, uint8_t *cells, int64_t *scores) {
+    long next = 0, n = games;
+    board_t *starts = unpack_boards(starts_lohi, &n);
+    memset(cells, 0, (size_t)games * 16);
+    if (n != games) { free(starts); return; }
+    collect_job_t job = {(net_t *)p, depth, scale, cutoff, &next, games, seed, cells, scores, starts};
+    run_workers(collect_worker, &job, threads);
+    free(starts);
 }
 
 /* A random spawn that never ends the game when it can be avoided: uniform over

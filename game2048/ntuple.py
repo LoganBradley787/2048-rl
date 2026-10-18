@@ -204,6 +204,9 @@ def lib() -> ctypes.CDLL:
     L.nt_collect.argtypes = [vp, ctypes.c_long, i32, f64, i32, u64, i64, P(ctypes.c_uint8), P(i64)]
     L.nt_collect_from.argtypes = [vp, P(u64), ctypes.c_long, i32, f64, i32, u64, i64, P(ctypes.c_uint8), P(i64)]
     L.nt_set_stop.argtypes = [vp, i64, f32, vp]
+    L.nt_evil_best.argtypes, L.nt_evil_best.restype = [vp, u64, u64, i32, i32, P(f64)], i32
+    L.nt_best_move_mt.argtypes, L.nt_best_move_mt.restype = [vp, u64, u64, i32, f64, i32], i32
+    L.nt_evil_model_best.argtypes, L.nt_evil_model_best.restype = [vp, u64, u64, i32, i32, i32, P(f64)], i32
     L.nt_get_stop_scale.argtypes, L.nt_get_stop_scale.restype = [vp], i64
     L.nt_stack.argtypes, L.nt_stack.restype = [P(vp), i32, P(i64)], vp
     L.nt_best_move.argtypes, L.nt_best_move.restype = [vp, u64, u64, i32, f64], i32
@@ -726,6 +729,27 @@ class NTupleNet:
                                   int(tile), cells.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), scores)
         reached = cells.any(axis=1)
         return cells[reached].reshape(-1, 4, 4), reached
+
+    def best_move_mt(self, bits: int, depth: int = 1, cutoff: float = 0.0, new_game: bool = False) -> int:
+        """As `best_move`, safe to call from several threads at once (each thread keeps its own search context);
+        new_game=True at a game's first move."""
+        return int(self._lib.nt_best_move_mt(self._h, *_lohi(bits), int(depth), float(cutoff), int(bool(new_game))))
+
+    def evil_best(self, bits: int, depth: int, leaf: str = "net") -> tuple[int, float]:
+        """The move against evil spawns (core.Game spawn_mode="evil"): minimax with alpha-beta over every
+        placement, `depth` placements deep; leaves scored by this network ("net") or core.heuristic_value
+        ("heuristic"). Returns (move, value); move -1 when none is left. Threads may call it at once."""
+        v = ctypes.c_double(0.0)
+        d = self._lib.nt_evil_best(self._h, *_lohi(bits), int(depth), 0 if leaf == "net" else 1, ctypes.byref(v))
+        return int(d), float(v.value)
+
+    def evil_model_best(self, bits: int, depth: int, leaf: str = "net", adversary: str = "heuristic") -> tuple[int, float]:
+        """As `evil_best`, but with the evil placer modelled exactly (its evaluator: core.heuristic_value or this
+        network), so only the player's moves branch; placements tied for the placer count at their worst."""
+        v = ctypes.c_double(0.0)
+        d = self._lib.nt_evil_model_best(self._h, *_lohi(bits), int(depth), 0 if leaf == "net" else 1,
+                                         0 if adversary == "heuristic" else 1, ctypes.byref(v))
+        return int(d), float(v.value)
 
     def set_stop(self, scale: int, bonus: float = 0.0, frozen: "NTupleNet | None" = None) -> None:
         """Training (single stage, not with `expect_target`): every game ends at its first afterstate whose

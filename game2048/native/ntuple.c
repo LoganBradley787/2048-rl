@@ -2609,6 +2609,190 @@ int nt_best_move(void *p, uint64_t lo, uint64_t hi, int depth, double cutoff) {
     return best_move(main_ctx(net, cutoff), mk(lo, hi), depth);
 }
 
+/* As nt_best_move, but each calling thread keeps its own search context for this network, so games may be played
+ * on several threads at once (nt_best_move shares one). new_game: start a new game first (the sticky heuristic
+ * orientation is chosen afresh and the tables of the last game are dropped). The context lives until the thread ends. */
+static __thread search_ctx_t *tl_ctx;
+static __thread const net_t *tl_net;
+int nt_best_move_mt(void *p, uint64_t lo, uint64_t hi, int depth, double cutoff, int new_game) {
+    net_t *net = (net_t *)p;
+    if (tl_ctx && tl_net != net) { ctx_free(tl_ctx); tl_ctx = NULL; }
+    if (!tl_ctx) { tl_ctx = ctx_create(net, cutoff); tl_net = net; }
+    ctx_sync(tl_ctx, cutoff);
+    if (new_game) ctx_new_game(tl_ctx);
+    return best_move(tl_ctx, mk(lo, hi), depth);
+}
+
+/* Evil mode (game2048/core.py "evil": the new tile goes wherever the player's best reply is worst). A minimax
+ * search with alpha-beta: max over the player's moves, min over every placement (each empty cell, 2 or 4), to
+ * `depth` placements; a placement after which no move is left is a loss, worse the sooner it comes. Leaves are
+ * afterstates, scored by `leaf`: 0 the network's value, 1 core.heuristic_value (128 per empty cell plus the value
+ * of every pair of equal neighbours). Each thread keeps its own transposition table (afterstate, depth, bound). */
+#define EVIL_LOSS (-1e15)
+#define EVIL_TT_BITS 21
+typedef struct { board_t key; double val; int8_t depth, bound; } evil_tt_t;    /* bound: 0 exact, 1 lower, 2 upper */
+static __thread evil_tt_t *evil_tt;
+
+static double evil_leaf(const net_t *net, board_t a, int leaf) {
+    if (leaf == 0) return (double)net_value(net, a);
+    double v = 0.0;
+    for (int i = 0; i < 16; i++) {
+        int e = cell(a, i);
+        if (!e) { v += 128.0; continue; }
+        if ((i & 3) < 3 && cell(a, i + 1) == e) v += (double)(1 << e);
+        if (i < 12 && cell(a, i + 4) == e) v += (double)(1 << e);
+    }
+    return v;
+}
+
+static double evil_min(const net_t *net, board_t a, int depth, double alpha, double beta, int leaf);
+
+static double evil_max(const net_t *net, board_t s, int depth, double alpha, double beta, int leaf) {
+    double best = 0.0;
+    int any = 0;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(s, d, &r);
+        if (a == s) continue;
+        double v = (double)r + evil_min(net, a, depth, alpha - r, beta - r, leaf);
+        if (!any || v > best) { best = v; any = 1; }
+        if (best > alpha) alpha = best;
+        if (alpha >= beta) break;
+    }
+    return any ? best : EVIL_LOSS * (1.0 + depth);     /* no move left: lost, and sooner is worse */
+}
+
+static double evil_min(const net_t *net, board_t a, int depth, double alpha, double beta, int leaf) {
+    if (depth == 0) return evil_leaf(net, a, leaf);
+    evil_tt_t *e = &evil_tt[hash128(a) >> (64 - EVIL_TT_BITS)];
+    if (e->key == a && e->depth == depth) {
+        if (e->bound == 0) return e->val;
+        if (e->bound == 1 && e->val >= beta) return e->val;
+        if (e->bound == 2 && e->val <= alpha) return e->val;
+    }
+    double a0 = alpha, b0 = beta, worst = HUGE_VAL;
+    for (int i = 0; i < 16 && worst > alpha; i++) {
+        if (cell(a, i)) continue;
+        for (int v = 1; v <= 2; v++) {
+            double x = evil_max(net, a | put(v, i), depth - 1, alpha, beta, leaf);
+            if (x < worst) worst = x;
+            if (worst < beta) beta = worst;
+            if (worst <= alpha) break;
+        }
+    }
+    if (worst == HUGE_VAL) worst = evil_leaf(net, a, leaf);     /* no empty cell: cannot happen after a move */
+    e->key = a; e->depth = (int8_t)depth; e->val = worst;
+    e->bound = worst <= a0 ? 2 : worst >= b0 ? 1 : 0;
+    return worst;
+}
+
+/* Evil mode with the placer modelled exactly: core.Game puts the tile at the placement (cell, 2 or 4) whose best
+ * reply (reward + evaluator(afterstate)) is lowest, and any placement that leaves no move ends the game. Its
+ * evaluator: adv 0 core.heuristic_value (the leaf-1 score above), 1 the network. Placements tied at the lowest
+ * value are drawn at random there; here the worst of them for the player counts. So the search branches only on
+ * the player's moves: `depth` placements deep, with an exact transposition table (spawned board, depth). */
+#define EVIL_MODEL_TT_BITS 22
+typedef struct { board_t key; double val; int depth; } evil_mtt_t;
+static __thread evil_mtt_t *evil_mtt;
+
+static double evil_reply(const net_t *net, board_t s, int adv) {          /* -HUGE_VAL: no move after s */
+    double best = -HUGE_VAL;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(s, d, &r);
+        if (a == s) continue;
+        double v = (double)r + evil_leaf(net, a, adv == 0 ? 1 : 0);
+        if (v > best) best = v;
+    }
+    return best;
+}
+
+/* The placer's choices on afterstate a: up to 32 boards tied at the lowest reply value; 0 when the board is full. */
+static int evil_placements(const net_t *net, board_t a, int adv, board_t *out, int *dead) {
+    double low = HUGE_VAL;
+    int n = 0;
+    *dead = 0;
+    for (int i = 0; i < 16; i++) {
+        if (cell(a, i)) continue;
+        for (int v = 1; v <= 2; v++) {
+            board_t s = a | put(v, i);
+            double x = evil_reply(net, s, adv);
+            if (x == -HUGE_VAL) { *dead = 1; return 0; }     /* it ends the game whenever it can */
+            if (x < low) { low = x; n = 0; }
+            if (x == low) out[n++] = s;
+        }
+    }
+    return n;
+}
+
+static double evil_model_after(const net_t *net, board_t a, int depth, int leaf, int adv);
+
+static double evil_model_max(const net_t *net, board_t s, int depth, int leaf, int adv) {
+    evil_mtt_t *e = &evil_mtt[hash128(s) >> (64 - EVIL_MODEL_TT_BITS)];
+    if (e->key == s && e->depth == depth) return e->val;
+    double best = 0.0;
+    int any = 0;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(s, d, &r);
+        if (a == s) continue;
+        double v = (double)r + evil_model_after(net, a, depth, leaf, adv);
+        if (!any || v > best) { best = v; any = 1; }
+    }
+    if (!any) best = EVIL_LOSS * (1.0 + depth);
+    e->key = s; e->depth = depth; e->val = best;
+    return best;
+}
+
+static double evil_model_after(const net_t *net, board_t a, int depth, int leaf, int adv) {
+    if (depth == 0) return evil_leaf(net, a, leaf);
+    board_t kids[32];
+    int dead, n = evil_placements(net, a, adv, kids, &dead);
+    if (dead) return EVIL_LOSS * (1.0 + depth);
+    if (n == 0) return evil_leaf(net, a, leaf);
+    double worst = HUGE_VAL;
+    for (int k = 0; k < n; k++) {
+        double x = evil_model_max(net, kids[k], depth - 1, leaf, adv);
+        if (x < worst) worst = x;
+    }
+    return worst;
+}
+
+int nt_evil_model_best(void *p, uint64_t lo, uint64_t hi, int depth, int leaf, int adv, double *value) {
+    const net_t *net = (const net_t *)p;
+    if (!evil_mtt && !(evil_mtt = (evil_mtt_t *)calloc((size_t)1 << EVIL_MODEL_TT_BITS, sizeof(evil_mtt_t)))) return -1;
+    board_t b = mk(lo, hi);
+    int best = -1;
+    double bestv = 0.0;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(b, d, &r);
+        if (a == b) continue;
+        double v = (double)r + evil_model_after(net, a, depth, leaf, adv);
+        if (best < 0 || v > bestv) { bestv = v; best = d; }
+    }
+    if (value) *value = bestv;
+    return best;
+}
+
+/* The player's move against evil spawns, searched `depth` placements deep (-1: no move); *value its worth. */
+int nt_evil_best(void *p, uint64_t lo, uint64_t hi, int depth, int leaf, double *value) {
+    const net_t *net = (const net_t *)p;
+    if (!evil_tt && !(evil_tt = (evil_tt_t *)calloc((size_t)1 << EVIL_TT_BITS, sizeof(evil_tt_t)))) return -1;
+    board_t b = mk(lo, hi);
+    int best = -1;
+    double bestv = 0.0;
+    for (int d = 0; d < 4; d++) {
+        int r;
+        board_t a = do_move(b, d, &r);
+        if (a == b) continue;
+        double v = (double)r + evil_min(net, a, depth, best < 0 ? -HUGE_VAL : bestv - r, HUGE_VAL, leaf);
+        if (best < 0 || v > bestv) { bestv = v; best = d; }
+    }
+    if (value) *value = bestv;
+    return best;
+}
+
 /* nt_best_move's games: nt_heur_new_game starts a new one (the sticky heuristic orientation is chosen afresh);
  * nt_heur_game_sym is the orientation chosen in the current one (-1: none yet). */
 void nt_heur_new_game(void *p) {

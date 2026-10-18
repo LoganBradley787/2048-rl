@@ -2773,3 +2773,33 @@ def test_set_stop_ends_training_games_at_the_scale_worth_the_bonus():
     stop.set_stop(0)
     assert stop.stop_scale == 0
     free.close(); stop.close()
+
+
+def test_best_move_mt_matches_best_move_and_runs_on_threads():
+    from concurrent.futures import ThreadPoolExecutor
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(300, threads=1, seed=1, alpha_plain=0.1)
+    grids, _ = n.collect_starts(30, tile=64, depth=0, threads=2, seed=4)
+    boards = [nt.to_bits(g) for g in grids]
+    want = [n.best_move(b, depth=2) for b in boards]
+    assert [n.best_move_mt(b, depth=2, new_game=True) for b in boards] == want
+    with ThreadPoolExecutor(4) as pool:
+        got = list(pool.map(lambda b: n.best_move_mt(b, depth=2, new_game=True), boards))
+    assert got == want
+    n.close()
+
+
+def test_evil_searches_pick_legal_moves_and_model_beats_minimax_value():
+    n = nt.NTupleNet(patterns=[[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 4, 5]], tc=False)
+    n.train(300, threads=1, seed=1, alpha_plain=0.1)
+    b = nt.to_bits(board_with([64, 32, 16, 8, 4, 2]))
+    legal = {d for d in range(4) if nt.move(b, d)[0] != b}
+    for depth in (1, 2, 3):
+        for leaf in ("net", "heuristic"):
+            d, v = n.evil_best(b, depth, leaf)
+            dm, vm = n.evil_model_best(b, depth, leaf, "heuristic")
+            assert d in legal and dm in legal
+            assert vm >= v - 1e-6          # the real placer is one of the placements minimax assumes the worst of
+    full = nt.to_bits(np.array([[1, 2, 1, 2], [2, 1, 2, 1], [1, 2, 1, 2], [2, 1, 2, 1]]))
+    assert n.evil_best(full, 2)[0] == -1 and n.evil_model_best(full, 2)[0] == -1
+    n.close()

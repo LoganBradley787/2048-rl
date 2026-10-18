@@ -4,8 +4,7 @@ Every training run behind this repository, in order: what was trained, on what,
 for how long, and what came of it. All of it is self-play. No player here has
 seen a game it did not play itself.
 
-Last updated 2026-10-17, 16:40. Runs 27 to 29 are running. Between run 26 and
-them the work was search and endgame tables, which are not training; the
+Last updated 2026-10-18, 00:20. Between run 26 and runs 27 to 29 the work was search and endgame tables, which are not training; the
 tables' build time is listed under Endgame tables.
 
 ## Totals so far
@@ -14,9 +13,9 @@ tables' build time is listed under Endgame tables.
 | --- | --- | --- | --- |
 | MacBook (M3 Pro, 12 cores) | 16.2 h | 168 thread-hours, plus 71 min on its GPU | 116 billion |
 | ThinkPad (i5-1240P, 16 threads) | 72.3 h | 1,153 thread-hours | 1,130 billion |
-| Google Colab, CPU runtimes | 73.4 h | 585 vCPU-hours | 793 billion |
+| Google Colab, CPU runtimes | 80.9 h | 645 vCPU-hours | 900 billion |
 | Google Colab, GPU runtimes | 1.2 h | 1.2 GPU-hours | 10 billion |
-| **All** | **164 h** | **1,907 CPU thread-hours** | **about 2,050 billion** |
+| **All** | **172 h** | **1,967 CPU thread-hours** | **about 2,160 billion** |
 
 A thread-hour is one hardware thread busy for an hour. The threads are not
 equal: the ThinkPad's are held to about 20 W by its firmware and a Colab vCPU
@@ -359,7 +358,7 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   and a 65536 in 0.16% against 0.20%. Too small a gain to switch; v2 stays the
   player.
 
-### 27, 28 and 29. Stage 3, from the first 32768 to the hand-over (17 October, Colab, running)
+### 27, 28 and 29. Stage 3, from the first 32768 to the hand-over (17 October, Colab)
 
 - **What:** a third network for boards that hold a 32768 but not yet a
   16384, the stretch where the record player's games are most often lost
@@ -374,8 +373,20 @@ and Wu, 2022) and then pass it. Their recipe is in [TRAINING.md](TRAINING.md).
   run 28 and 2,000,000 in run 29. The bonus rewards reaching that board for
   its own sake, since the late game, not the network, plays from there.
 - **On:** three Colab high-RAM CPU machines (8 vCPUs), one run each. Each
-  collects its own starting boards for an hour, then trains for 2.5 hours.
-- **Outcome:** to come.
+  collected its own starting boards for an hour (300,000 to 500,000 of them),
+  then trained.
+- **Time:** 2.5 hours of training each, ending around 19:45 on 17 October.
+  Run 27: 5.94M games, 35.8B moves. Run 28: 5.70M games, 33.9B moves.
+  Run 29: 7.28M games, 37.7B moves. 3.4M to 4.2M moves a second.
+- **Outcome:** none of them was kept. From the same 6,309 boards where v2 at
+  depth 2 had just made its first 32768, with the same luck for each, v2
+  reached the hand-over board in 59.1% of games, run 27 in 54.0%, run 28 in
+  51.5% and run 29 in 44.7%: the bigger the bonus, the worse. The late game
+  turned their hand-over boards into a 65536 about as often as v2's (4.4% to
+  4.5% against 4.1%, inside the noise). Starting from an exact copy, the
+  fixed-step training made the network worse at this stretch, most likely
+  because steps of a fixed size undo weights that temporal coherence had
+  settled, and the bonus taught it to take risks.
 
 ## Endgame tables
 

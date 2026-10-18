@@ -34,7 +34,7 @@ from game2048 import ntuple as nt
 
 FIELDS = ["game", "score", "max_tile", "moves", "seconds"]
 SETTINGS = ["weights_md5", "depth", "seed", "cutoff", "downgrade", "depth_caps", "endgame", "endgame_caps", "engine_md5",
-            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "heuristic_from", "block_tables", "block_from"]
+            "endgame_bonus", "heuristic", "heuristic_prune", "heuristic_depth", "heuristic_from", "block_tables", "block_from", "deep"]
 TRACE_CAP = 200_000                                    # boards kept during play; a longer game is played again
 
 
@@ -114,6 +114,9 @@ def add_play_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--heuristic-from", type=int, default=0,
                    help="with --heuristic: it plays boards whose tile set is at least this (0 = 49152, a 32768 and "
                         "a 16384; 32768: from the first 32768)")
+    p.add_argument("--deep", default="",
+                   help="D:T: search at least D deep once the board holds a tile T (e.g. 2:8192 with --depth 1: depth 1 "
+                        "until the first 8192, then 2); several tiles as D:T1,T2 (all of them on the board)")
     p.add_argument("--block-dir", action="append", default=None,
                    help="block-tier tables (examples/build_endgame.py --block) play the boards no ladder table holds; "
                         "repeat it for several shapes")
@@ -164,6 +167,7 @@ def play_settings(args, path: Path, caps: list[int]) -> dict:
             "block_tables": args.block_dir and " | ".join((Path(d) / "block.txt").read_text().strip()
                                                           for d in args.block_dir),
             "block_from": args.block_from or None,
+            "deep": args.deep or None,
             # not compared between files (they do not change the games); kept so that a game can be played again
             "tt_bits": args.tt_bits or None, "cwd": os.getcwd(), "trace_dir": trace_dir,
             "trace_min_score": getattr(args, "trace_min_score", 0) if trace_dir else None}
@@ -208,6 +212,8 @@ def args_from_settings(s: dict) -> list[str]:
     argv += [a for d in s.get("block_dir") or [] for a in ("--block-dir", at(d))]
     if s.get("block_from"):
         argv += ["--block-from", str(s["block_from"])]
+    if s.get("deep"):
+        argv += ["--deep", s["deep"]]
     return argv
 
 
@@ -235,6 +241,9 @@ def load_net(args, path: Path, caps: list[int]) -> nt.NTupleNet:
         net.heuristic_late, net.heuristic_depth = True, args.heuristic_depth
         net.heuristic_from = args.heuristic_from
         net.heuristic_prune = {"small": True, "big": "big"}.get(args.heuristic_prune, False)
+    if args.deep:
+        d, tiles = args.deep.split(":")
+        net.deep = (int(d), [int(t) for t in tiles.split(",")])
     net.depth_caps = caps
     if args.tt_bits:
         net.tt_bits = args.tt_bits

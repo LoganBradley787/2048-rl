@@ -8,9 +8,11 @@ where you can watch them or play yourself.
 
 Three results:
 
-- **A record game: 1,714,564 points.** One game, played start to finish by the
-  player here, ended with 65536, 32768, 16384 and 4096 on the board. The best
-  single game I know of before it is macroxue's 1,704,908. The player uses
+- **A record game: 1,762,868 points.** One game, played start to finish by the
+  player here, ended with 65536, 32768, 16384 and 8192 on the board. The best
+  single game I know of by another program is 1,712,092, by the AI of
+  [2048EndgameTablebase](https://github.com/game-difficulty/2048EndgameTablebase),
+  and before it macroxue's 1,704,908. The player uses
   the v2 networks below until late in the game, then a hand-written search
   and exact endgame tables. The game can be [checked and played
   again](#the-record-player-v3) move for move.
@@ -28,14 +30,14 @@ Three results:
 
 For scale: a person who reaches the 2048 tile once has about 20,000 points.
 
-<img src="docs/images/record-board.png" alt="The last board of the record game on the web page: 65536, 32768, 16384, 4096, 2048 and 1024 among smaller tiles, with 1,714,564 points" width="380">
+<img src="docs/images/record-board.png" alt="The last board of the record game on the web page: 65536, 32768, 16384, 8192, 2048 and 1024 among smaller tiles, with 1,762,868 points" width="380">
 
-*The last board of the record game, game 3049, on the web page: 1,714,564
-points after 55,903 moves.*
+*The last board of the record game, game 470406, on the web page: 1,762,868
+points after 57,482 moves.*
 
-![The record game, game 3049, from the first tile to the last, sped up](docs/images/record-game.gif)
+![The record game, game 470406, from the first tile to the last, sped up](docs/images/record-game.gif)
 
-*Game 3049 from the first tile to the last: 91 moments out of 55,903 moves,
+*Game 470406 from the first tile to the last: 91 moments out of 57,482 moves,
 spaced closer early on, when the board changes fastest, and over the last
 thousand moves, as the board fills up and the game ends.*
 
@@ -262,7 +264,9 @@ Alone, these networks never made a 65536. Their best games end near 840,000
 points, a board holding every tile from 32768 down. Programs built on search
 and exact endgame tables do get there:
 [macroxue/2048-ai](https://github.com/macroxue/2048-ai) averages 711,769 at
-its deepest search and reports a single game of 1,704,908. The record player
+its deepest search and reports a single game of 1,704,908, and the AI of
+[2048EndgameTablebase](https://github.com/game-difficulty/2048EndgameTablebase)
+reaches 65536 in about 9% of games, with a best game of 1,712,092. The record player
 below adds that kind of late game to these networks.
 
 The two networks took four training runs and 107 hours:
@@ -278,25 +282,33 @@ game](#the-late-game) from the first board holding a 32768 and a 16384.
 | --- | --- | --- | --- | --- | --- |
 | 574,188 ± 2,986 | 620,860 | **1,714,564** | 96.9% | 57.8% | 1.5% |
 
-The best game is game 3049, 55,903 moves:
+Its best game, game 3049 (55,903 moves, 1,714,564 points), was the first
+here to pass 1,704,908; it is attached to the
+[v3.0 release](https://github.com/LoganBradley787/2048-rl/releases/tag/v3.0).
+
+**Hunting for records.** From a board holding a 32768 and a 16384, about 4%
+of games go on to make a 65536, whichever player built that board. So a
+faster player makes more 65536s per hour even if it reaches the hand-over
+less often. With no search before the hand-over (depth 0) and the same late
+game, the player reaches 65536 in 0.47% of games instead of 1.5%, but plays
+about 17 times as many games an hour: about 358 65536s per hour on an 8-core
+machine against 63 at depth 2. Over 2,200,000 games at that setting (seed
+8000, about 26 hours on a laptop), it averaged 422,630, and ten games beat
+1,704,908. The best is game 470406, 57,482 moves, **1,762,868** points:
 
 ```
-    16      4      2      4
-   512    256    128     32
- 16384   4096   1024     64
- 65536  32768   2048      2
+ 65536  16384    256      8
+ 32768   8192    128     16
+  2048   1024     64      4
+     2     32      8      2
 ```
 
 Its moves, its settings and the checksums of the tables are attached to the
-[v3.0 release](https://github.com/LoganBradley787/2048-rl/releases/tag/v3.0).
+[v3.1 release](https://github.com/LoganBradley787/2048-rl/releases/tag/v3.1).
 `examples/rules2048.py`, which shares no code with the engine, checks the
 game against the rules. `examples/verify_game.py` plays it again from its
-seed with the v2 weights and the tables (about 1.5 hours to build, 42 GB).
-It has been played again on an Intel laptop and an AMD server and came out
-the same, move for move.
-
-Measured over many games, about one in 100,000 should beat 1,704,908. This
-one came early.
+seed with the v2 weights and the tables (about 1.5 hours to build, 42 GB),
+move for move.
 
 ### Download the trained player
 
